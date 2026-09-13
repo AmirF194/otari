@@ -66,7 +66,10 @@ class GatewayUsage(CompletionUsage):
             cache_write_1h_tokens = cache_write_1h_tokens_of(usage)
         if cache_tokens_in_prompt is None:
             cache_tokens_in_prompt = cache_tokens_in_prompt_of(usage)
-        return cls(
+        # Forward any-llm's own extras (otari#337) so provider_latency_ms_of can
+        # still read them; explicit fields below always win over a same-named one.
+        fields = dict(usage.model_extra or {})
+        fields.update(
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             total_tokens=usage.total_tokens,
@@ -77,6 +80,7 @@ class GatewayUsage(CompletionUsage):
             cache_write_1h_tokens=cache_write_1h_tokens,
             cache_tokens_in_prompt=cache_tokens_in_prompt,
         )
+        return cls(**fields)
 
 
 def cache_read_tokens_of(usage: CompletionUsage) -> int:
@@ -116,3 +120,32 @@ def cache_tokens_in_prompt_of(usage: CompletionUsage) -> bool:
     if isinstance(usage, GatewayUsage):
         return usage.cache_tokens_in_prompt
     return True
+
+
+# Provider-specific field any-llm leaves in ``usage.model_extra``, and the
+# multiplier that converts its unit to milliseconds (otari#337). Absent here
+# means "not reported": most providers expose no server-side timing in the
+# response body at all.
+_PROVIDER_LATENCY_FIELDS: dict[str, tuple[str, float]] = {
+    "groq": ("total_time", 1_000.0),  # seconds
+    "ollama": ("total_duration", 1e-6),  # nanoseconds
+}
+
+
+def provider_latency_ms_of(usage: CompletionUsage, provider: str | None) -> int | None:
+    """Best-effort provider-reported compute time for ``provider``, in ms.
+
+    ``None`` when the provider is not in the table, the field is absent, or
+    the value is not a plain number: this only enriches a row and must never
+    raise or affect billing.
+    """
+    if provider is None:
+        return None
+    field = _PROVIDER_LATENCY_FIELDS.get(provider)
+    if field is None:
+        return None
+    key, to_ms = field
+    raw = (usage.model_extra or {}).get(key)
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    return round(raw * to_ms)

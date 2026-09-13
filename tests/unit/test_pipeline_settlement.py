@@ -603,6 +603,31 @@ async def test_log_usage_still_resolves_the_workspace_when_not_given_one(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_log_usage_writes_provider_latency_ms_onto_the_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one call site that actually populates the column (otari#337): a
+    unit test on ``provider_latency_ms_of`` alone never exercises this line."""
+    monkeypatch.setattr(pipeline, "organization_for_workspace_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(pipeline, "find_model_pricing", AsyncMock(return_value=None))
+    workspace_id = uuid.uuid4()
+    log_writer = _FakeLogWriter()
+
+    await log_usage(
+        db=cast(Any, object()),
+        log_writer=cast(Any, log_writer),
+        api_key_id=None,
+        model="llama-3.1-8b-instant",
+        provider="groq",
+        endpoint="/v1/chat/completions",
+        workspace_id=workspace_id,
+        usage_override=CompletionUsage.model_construct(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15, total_time=0.25
+        ),
+    )
+
+    assert log_writer.put_rows[0].provider_latency_ms == 250
+
+
+@pytest.mark.asyncio
 async def test_stream_settlement_forwards_the_contexts_workspace_id(monkeypatch: pytest.MonkeyPatch) -> None:
     """``ctx.workspace_id``, already resolved once in the preamble, reaches
     ``log_usage`` rather than being silently dropped and re-derived there
