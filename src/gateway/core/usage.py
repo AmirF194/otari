@@ -148,6 +148,9 @@ def provider_latency_ms_of(usage: CompletionUsage, provider: str | None) -> int 
         return None
     key, to_ms = field
     raw = (usage.model_extra or {}).get(key)
-    if isinstance(raw, bool) or not isinstance(raw, int | float) or not math.isfinite(raw):
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
         return None
-    return round(raw * to_ms)
+    scaled = raw * to_ms
+    if not math.isfinite(scaled):
+        return None
+    return round(scaled)
