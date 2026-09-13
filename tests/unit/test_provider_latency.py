@@ -57,6 +57,18 @@ def test_provider_latency_ms_of_none_on_malformed_value() -> None:
     assert provider_latency_ms_of(boolean, "groq") is None
 
 
+def test_provider_latency_ms_of_none_on_non_finite_value() -> None:
+    """inf/nan pass isinstance(float) and used to reach round(), which raises on both."""
+    inf_usage = CompletionUsage.model_construct(
+        prompt_tokens=1, completion_tokens=1, total_tokens=2, total_time=float("inf")
+    )
+    assert provider_latency_ms_of(inf_usage, "groq") is None
+    nan_usage = CompletionUsage.model_construct(
+        prompt_tokens=1, completion_tokens=1, total_tokens=2, total_duration=float("nan")
+    )
+    assert provider_latency_ms_of(nan_usage, "ollama") is None
+
+
 def test_from_completion_usage_forwards_provider_extras() -> None:
     base = CompletionUsage.model_construct(
         prompt_tokens=100,
