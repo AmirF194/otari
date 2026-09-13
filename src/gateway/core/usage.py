@@ -12,6 +12,8 @@ as plain integers (rather than relying on ``prompt_tokens_details``) lets the re
 builder forward them uniformly across providers, including Anthropic cache writes.
 """
 
+import math
+
 from any_llm.types.completion import CompletionUsage
 
 
@@ -136,8 +138,8 @@ def provider_latency_ms_of(usage: CompletionUsage, provider: str | None) -> int 
     """Best-effort provider-reported compute time for ``provider``, in ms.
 
     ``None`` when the provider is not in the table, the field is absent, or
-    the value is not a plain number: this only enriches a row and must never
-    raise or affect billing.
+    the value is not a plain finite number: this only enriches a row and must
+    never raise or affect billing.
     """
     if provider is None:
         return None
@@ -146,6 +148,6 @@ def provider_latency_ms_of(usage: CompletionUsage, provider: str | None) -> int 
         return None
     key, to_ms = field
     raw = (usage.model_extra or {}).get(key)
-    if isinstance(raw, bool) or not isinstance(raw, int | float):
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or not math.isfinite(raw):
         return None
     return round(raw * to_ms)
