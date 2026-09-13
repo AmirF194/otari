@@ -181,8 +181,13 @@ def test_the_revision_round_trips(sqlite_at_head: tuple[Config, Engine]) -> None
 
     columns = _columns(engine)
     assert set(_EXPECTED_TYPES) <= set(columns)
-    with Session(engine) as session:
-        row = session.get(UsageLog, "settled-1")
-    assert row is not None
+    # Raw SQL again: this database is pinned to _PROVENANCE_REVISION, and the
+    # mapped class now also carries columns from later revisions (e.g.
+    # provider_latency_ms) that do not exist here yet.
+    select_expected = ", ".join(_EXPECTED_TYPES)
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(f"SELECT {select_expected} FROM usage_logs WHERE id = 'settled-1'")
+        ).mappings().one()
     # The provenance went with the columns; nothing backfills it.
-    assert all(getattr(row, name) is None for name in _EXPECTED_TYPES)
+    assert all(row[name] is None for name in _EXPECTED_TYPES)

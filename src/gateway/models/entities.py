@@ -819,6 +819,11 @@ class UsageLog(Base):
     # provider-never-reached rejections) have no meaningful request duration.
     latency_ms: Mapped[int | None] = mapped_column()
 
+    # Provider-reported server-side compute time, in milliseconds, best-effort
+    # (otari#337). Nullable: most providers report nothing here, and an
+    # extraction failure must never block a write.
+    provider_latency_ms: Mapped[int | None] = mapped_column()
+
     api_key = relationship("APIKey", back_populates="usage_logs")
     user = relationship("User", back_populates="usage_logs")
 
@@ -848,6 +853,7 @@ class UsageLog(Base):
             "error_message": self.error_message,
             "status_code": self.status_code,
             "latency_ms": self.latency_ms,
+            "provider_latency_ms": self.provider_latency_ms,
             "policy_name": self.policy_name,
             "selection_reason": self.selection_reason,
             "attempt_position": self.attempt_position,

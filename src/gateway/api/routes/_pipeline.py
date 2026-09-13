@@ -114,6 +114,7 @@ from gateway.core.usage import (
     cache_tokens_in_prompt_of,
     cache_write_1h_tokens_of,
     cache_write_tokens_of,
+    provider_latency_ms_of,
 )
 from gateway.inflight import track_request
 from gateway.log_config import logger
@@ -3029,6 +3030,7 @@ async def log_usage(
         # Which convention those cache counts were reported under, recorded rather
         # than left to be inferred from the numbers later (mozilla-ai/otari#690).
         usage_log.cache_tokens_in_prompt = cache_tokens_in_prompt_of(usage_data)
+        usage_log.provider_latency_ms = provider_latency_ms_of(usage_data, provider)
 
         record_tokens(
             str(provider or ""),
