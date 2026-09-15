@@ -167,8 +167,8 @@ def provider_latency_ms_of(usage: CompletionUsage, provider: str | None) -> int 
     """Best-effort provider-reported compute time for ``provider``, in ms.
 
     ``None`` when the provider is not in the table, any of its fields is
-    absent, or any of its values is not a plain finite number: this only
-    enriches a row and must never raise or affect billing.
+    absent, negative, or not a plain finite number: this only enriches a
+    row and must never raise or affect billing.
     """
     if provider is None:
         return None
@@ -180,10 +180,13 @@ def provider_latency_ms_of(usage: CompletionUsage, provider: str | None) -> int 
     raw_values: list[int | float] = []
     for key in keys:
         raw = extras.get(key)
-        if isinstance(raw, bool) or not isinstance(raw, int | float):
+        if isinstance(raw, bool) or not isinstance(raw, int | float) or raw < 0:
             return None
         raw_values.append(raw)
-    scaled = sum(raw_values) * to_ms
+    try:
+        scaled = sum(raw_values) * to_ms
+    except OverflowError:
+        return None
     if not math.isfinite(scaled):
         return None
     return round(scaled)
