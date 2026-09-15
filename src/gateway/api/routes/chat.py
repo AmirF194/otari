@@ -204,7 +204,10 @@ class _ChatAdapter:
         details = chunk.usage.prompt_tokens_details
         # Same forwarding as GatewayUsage.from_completion_usage (otari#337):
         # provider timing on a streamed response lands in the final chunk's usage.
-        fields = dict(chunk.usage.model_extra or {})
+        # external_extras drops any key that names a GatewayUsage field, so a
+        # provider-supplied extra can never set one of our own accounting fields
+        # (e.g. cache_write_tokens) that this update() does not already pin below.
+        fields = GatewayUsage.external_extras(chunk.usage)
         fields.update(
             prompt_tokens=chunk.usage.prompt_tokens or 0,
             completion_tokens=chunk.usage.completion_tokens or 0,
