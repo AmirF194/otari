@@ -475,6 +475,45 @@ async def verify_catalog_reader(
     return await verify_api_key_or_master_key(request, db, config)
 
 
+async def verify_catalog_reader_or_public(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    config: Annotated[GatewayConfig, Depends(get_config)],
+    session_identity: Annotated[TenancyUser | None, Depends(get_session_identity)],
+) -> tuple[APIKey | None, bool] | None:
+    """As :func:`verify_catalog_reader`, and a visitor reads too while the catalog is public.
+
+    ``None`` is the anonymous caller, admitted only while ``public_catalog`` is on
+    and only when the request carries no credential at all: a credential that is
+    present and wrong is refused as it always was, never downgraded to a visitor.
+    The route is what narrows an anonymous read (the configured instances, the
+    deployment price list, no tenant rows); this only decides who is asking.
+
+    Throttled per client address on its own budget,
+    ``public_catalog_rate_limit_per_minute``, the way the public auth routes
+    are on theirs: ``rate_limit_rpm`` keys on an authenticated user and covers
+    no anonymous path, so it is not what stands between an open catalog and a
+    scraper.
+
+    Two things that throttle is not, both documented beside the setting in
+    ``docs/configuration.md``. The address is the socket's, and the CLI starts
+    uvicorn without proxy headers, so behind a reverse proxy every visitor
+    shares one bucket; a deployment that terminates TLS elsewhere throttles
+    there. And the counter is per process, so N workers serve N times the
+    configured number.
+    """
+    if session_identity is not None:
+        return None, True
+    if _header_credentials_present(request) or not config.public_catalog:
+        return await verify_api_key_or_master_key(request, db, config)
+    limiter = getattr(request.app.state, "public_catalog_rate_limiter", None)
+    if limiter is not None:
+        # The limiter raises its own 429; the key is the address, since a
+        # visitor has no other identity.
+        limiter.check(request.client.host if request.client is not None else "unknown")
+    return None
+
+
 async def get_db_if_needed(
     config: Annotated[GatewayConfig, Depends(get_config)],
 ) -> AsyncGenerator[AsyncSession | None, None]:

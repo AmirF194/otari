@@ -16,6 +16,7 @@ from gateway.api.routes import (
     batches,
     bootstrap,
     budgets,
+    catalog,
     chat,
     embeddings,
     files,
@@ -179,6 +180,10 @@ def _register_core_routers(api: APIRouter, config: GatewayConfig) -> None:
     # /api/v1/models/{model_id:path} catch-all the catalog router ends with.
     api.include_router(models.operator_router)
     api.include_router(models.catalog_router)
+    # The same merged catalog, folded by model for a chooser rather than listed
+    # flat for an SDK. Same reader gate as /v1/models.
+    api.include_router(catalog.router)
+    api.include_router(catalog.operator_router)
     if serves_data_plane:
         # Both planes at once, which is why it is mounted here rather than with
         # the data plane above: the Playground page reads the management surface

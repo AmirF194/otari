@@ -183,7 +183,8 @@ def test_the_revision_round_trips(sqlite_at_head: tuple[Config, Engine]) -> None
     assert set(_EXPECTED_TYPES) <= set(columns)
     # Raw SQL again: this database is pinned to _PROVENANCE_REVISION, and the
     # mapped class now also carries columns from later revisions (e.g.
-    # provider_latency_ms) that do not exist here yet.
+    # provider_latency_ms, ttft_ms) that do not exist here yet, so
+    # session.get(UsageLog, ...) would select ones that are not there.
     select_expected = ", ".join(_EXPECTED_TYPES)
     with engine.connect() as connection:
         row = connection.execute(
