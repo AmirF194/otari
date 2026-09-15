@@ -109,6 +109,24 @@ def test_provider_latency_ms_of_none_when_scaling_overflows() -> None:
     assert provider_latency_ms_of(huge_usage, "groq") is None
 
 
+def test_provider_latency_ms_of_none_on_negative_value() -> None:
+    """A negative duration is malformed, not a fast response; zero stays valid."""
+    negative_usage = CompletionUsage.model_construct(
+        prompt_tokens=1, completion_tokens=1, total_tokens=2, total_time=-0.01
+    )
+    assert provider_latency_ms_of(negative_usage, "groq") is None
+    zero_usage = CompletionUsage.model_construct(prompt_tokens=1, completion_tokens=1, total_tokens=2, total_time=0)
+    assert provider_latency_ms_of(zero_usage, "groq") == 0
+
+
+def test_provider_latency_ms_of_none_when_int_multiply_overflows() -> None:
+    """An oversized int raw value raises OverflowError on int*float, not caught by isfinite on a float."""
+    oversized_usage = CompletionUsage.model_construct(
+        prompt_tokens=1, completion_tokens=1, total_tokens=2, total_time=10**400
+    )
+    assert provider_latency_ms_of(oversized_usage, "groq") is None
+
+
 def test_from_completion_usage_forwards_provider_extras() -> None:
     base = CompletionUsage.model_construct(
         prompt_tokens=100,
