@@ -820,7 +820,9 @@ class UsageLog(Base):
     latency_ms: Mapped[int | None] = mapped_column()
 
     # Provider-reported server-side compute time, in milliseconds, best-effort
-    # (otari#337). Nullable: most providers report nothing here, and an
+    # (otari#337): prompt + generation time, excluding model load time where the
+    # provider reports load separately (see _PROVIDER_LATENCY_FIELDS in
+    # gateway.core.usage). Nullable: most providers report nothing here, and an
     # extraction failure must never block a write.
     provider_latency_ms: Mapped[int | None] = mapped_column()
 
