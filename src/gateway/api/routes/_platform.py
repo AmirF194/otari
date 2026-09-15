@@ -486,6 +486,12 @@ def _platform_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
+# Bumped when the resolve/usage wire shapes in docs/hybrid-mode-protocol.md
+# change in a way the platform needs to branch on. Sent as X-Otari-Protocol-
+# Version on every resolve and usage call; unread by this gateway itself.
+_PLATFORM_PROTOCOL_VERSION = 1
+
+
 def _safe_detail_from_platform(response: httpx.Response, fallback: str) -> str:
     try:
         payload = response.json()
@@ -540,6 +546,7 @@ async def _post_resolve(
     headers = {
         "X-Gateway-Token": config.platform_token or "",
         "X-User-Token": user_token,
+        "X-Otari-Protocol-Version": str(_PLATFORM_PROTOCOL_VERSION),
     }
 
     try:
@@ -1078,7 +1085,10 @@ async def _report_platform_usage(
     timeout_ms = int(config.platform.get("usage_timeout_ms", 5000))
     max_retries = int(config.platform.get("usage_max_retries", 3))
     usage_url = _platform_url(platform_base_url, "/gateway/usage")
-    headers = {"X-Gateway-Token": config.platform_token or ""}
+    headers = {
+        "X-Gateway-Token": config.platform_token or "",
+        "X-Otari-Protocol-Version": str(_PLATFORM_PROTOCOL_VERSION),
+    }
 
     payload: dict[str, Any] = {
         "correlation_id": correlation_id,
