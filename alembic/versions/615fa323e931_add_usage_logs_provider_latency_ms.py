@@ -1,7 +1,7 @@
 """Add usage_logs provider_latency_ms column.
 
 Revision ID: 615fa323e931
-Revises: f1c4a8e2d6b9
+Revises: c4e7a9b2d6f8
 Create Date: 2026-09-11 23:06:18.336380
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "615fa323e931"
-down_revision: str | Sequence[str] | None = "f1c4a8e2d6b9"
+down_revision: str | Sequence[str] | None = "c4e7a9b2d6f8"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
