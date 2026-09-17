@@ -137,7 +137,7 @@ from gateway.model_labeling import relabel_model
 from gateway.models.api_keys import APIKey
 from gateway.models.guardrails import GuardrailConfig
 from gateway.models.mcp import McpServerConfig
-from gateway.models.money import as_float, to_usd
+from gateway.models.money import to_usd
 from gateway.models.pricing import ModelPricing, PriceSource
 from gateway.models.tools import CodeExecutor
 from gateway.models.usage import UsageLog
@@ -5617,8 +5617,8 @@ async def run_standalone_non_stream(
                     tool_tally=tool_ctx.tally,
                     workspace_id=ctx.workspace_id,
                 )
-            if actual_cost is not None:
-                response.headers["x-otari-response-cost"] = str(as_float(actual_cost))
+            if logged.cost is not None:
+                response.headers["x-otari-response-cost"] = str(logged.cost)
             if ctx.reservation is not None:
                 await reconcile_reservation(
                     ctx.db, ctx.reservation, logged.cost or Decimal(0), actual_tokens=_settled_tokens(usage_data)
