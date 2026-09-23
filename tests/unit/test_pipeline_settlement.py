@@ -721,7 +721,7 @@ async def test_log_usage_writes_provider_latency_ms_onto_the_row(monkeypatch: py
     """The one call site that actually populates the column (otari#337): a
     unit test on ``provider_latency_ms_of`` alone never exercises this line."""
     monkeypatch.setattr(pipeline, "organization_for_workspace_id", AsyncMock(return_value=None))
-    monkeypatch.setattr(pipeline, "find_model_pricing", AsyncMock(return_value=None))
+    monkeypatch.setattr(pipeline, "resolve_model_pricing", AsyncMock(return_value=None))
     workspace_id = uuid.uuid4()
     log_writer = _FakeLogWriter()
 
@@ -750,7 +750,7 @@ async def test_log_usage_provider_latency_lookup_uses_provider_type_not_instance
     the lookup misses and the column stays NULL even though the field is
     present, which is the bug coderabbitai flagged on PR #1117."""
     monkeypatch.setattr(pipeline, "organization_for_workspace_id", AsyncMock(return_value=None))
-    monkeypatch.setattr(pipeline, "find_model_pricing", AsyncMock(return_value=None))
+    monkeypatch.setattr(pipeline, "resolve_model_pricing", AsyncMock(return_value=None))
     log_writer = _FakeLogWriter()
 
     await log_usage(
@@ -781,7 +781,7 @@ async def test_log_usage_provider_latency_lookup_falls_back_to_provider_without_
     """A caller with no resolved provider_type (none exists yet) keeps the
     prior behavior: latency capture is a no-op rather than wrong."""
     monkeypatch.setattr(pipeline, "organization_for_workspace_id", AsyncMock(return_value=None))
-    monkeypatch.setattr(pipeline, "find_model_pricing", AsyncMock(return_value=None))
+    monkeypatch.setattr(pipeline, "resolve_model_pricing", AsyncMock(return_value=None))
     log_writer = _FakeLogWriter()
 
     await log_usage(
