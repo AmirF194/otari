@@ -2466,9 +2466,9 @@ async def test_standalone_non_stream_sets_routing_and_cost_headers(monkeypatch: 
 
     _, response = await _run_standalone(monkeypatch, result=_completion(usage=_usage()), reservation=_reservation())
 
-    assert response.headers["x-otari-backend"] == str(LLMProvider.OPENAI)
-    assert response.headers["x-otari-response-cost"] == "0.25"
-    assert response.headers["x-otari-attempted-fallbacks"] == "0"
+    assert response.headers["otari-backend"] == str(LLMProvider.OPENAI)
+    assert response.headers["otari-response-cost"] == "0.25"
+    assert response.headers["otari-attempted-fallbacks"] == "0"
 
 
 @pytest.mark.asyncio
@@ -2483,8 +2483,8 @@ async def test_standalone_non_stream_omits_cost_header_when_nothing_settled(
 
     _, response = await _run_standalone(monkeypatch, result=_completion(usage=None), reservation=_reservation())
 
-    assert "x-otari-response-cost" not in response.headers
-    assert response.headers["x-otari-backend"] == str(LLMProvider.OPENAI)
+    assert "otari-response-cost" not in response.headers
+    assert response.headers["otari-backend"] == str(LLMProvider.OPENAI)
 
 
 @pytest.mark.asyncio
@@ -2512,7 +2512,7 @@ async def test_standalone_non_stream_reports_fallback_count_from_attribution(
         monkeypatch, result=_completion(usage=_usage()), reservation=_reservation(), plan=plan
     )
 
-    assert response.headers["x-otari-attempted-fallbacks"] == "2"
+    assert response.headers["otari-attempted-fallbacks"] == "2"
 
 
 @pytest.mark.asyncio
