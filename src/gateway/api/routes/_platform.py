@@ -946,7 +946,7 @@ async def _report_platform_usage(
     usage_url = transport.control_plane_url(platform_base_url, "/gateway/usage")
     headers = {
         "X-Gateway-Token": config.platform_token or "",
-        "X-Otari-Protocol-Version": str(transport.PLATFORM_PROTOCOL_VERSION),
+        "Otari-Protocol-Version": str(transport.PLATFORM_PROTOCOL_VERSION),
     }
 
     payload: dict[str, Any] = {

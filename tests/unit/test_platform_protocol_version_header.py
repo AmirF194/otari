@@ -1,4 +1,4 @@
-"""Unit tests for the ``X-Otari-Protocol-Version`` header (issue #148).
+"""Unit tests for the ``Otari-Protocol-Version`` header (issue #148).
 
 ``_parse_resolve_payload`` distinguishes the multi-attempt resolve shape from
 the legacy single-attempt shape purely by the presence of an ``attempts`` key,
@@ -56,7 +56,7 @@ async def test_resolve_credentials_sends_protocol_version_header(
 
     await _resolve_platform_credentials(_config(), user_token="tk_user", model_selector="openai/gpt-4o-mini")
 
-    assert captured["headers"]["X-Otari-Protocol-Version"] == "1"
+    assert captured["headers"]["Otari-Protocol-Version"] == "1"
     assert captured["headers"]["X-Gateway-Token"] == "gw_test_token"
     assert captured["headers"]["X-User-Token"] == "tk_user"
 
@@ -82,5 +82,5 @@ async def test_usage_report_sends_protocol_version_header(monkeypatch: pytest.Mo
         is_final_attempt=True,
     )
 
-    assert captured["headers"]["X-Otari-Protocol-Version"] == "1"
+    assert captured["headers"]["Otari-Protocol-Version"] == "1"
     assert captured["headers"]["X-Gateway-Token"] == "gw_test_token"

@@ -98,7 +98,7 @@ async def resolve(config: GatewayConfig, *, user_token: str, endpoint: ResolveEn
     headers = {
         "X-Gateway-Token": config.platform_token or "",
         "X-User-Token": user_token,
-        "X-Otari-Protocol-Version": str(transport.PLATFORM_PROTOCOL_VERSION),
+        "Otari-Protocol-Version": str(transport.PLATFORM_PROTOCOL_VERSION),
     }
 
     try:

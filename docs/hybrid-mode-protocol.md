@@ -29,7 +29,7 @@ deployment. The three resolve endpoints additionally require `X-User-Token:
 <tk_...>`, which is the workspace API token forwarded opaquely from the end
 user's credential header (`Authorization: Bearer`, `Otari-Key`, or
 `x-api-key`). The usage endpoint sends only the gateway token. Every endpoint
-also carries `X-Otari-Protocol-Version: <int>` (see [Versions](#versions)); a
+also carries `Otari-Protocol-Version: <int>` (see [Versions](#versions)); a
 peer that does not care about it can ignore it like any other unrecognized
 header.
 
@@ -627,7 +627,7 @@ flag.
 
 ## Versions
 
-`X-Otari-Protocol-Version` (see [Authentication](#authentication)) is a single
+`Otari-Protocol-Version` (see [Authentication](#authentication)) is a single
 integer, bumped when a change below needs the peer to branch on it. One line
 per version, oldest first:
 
