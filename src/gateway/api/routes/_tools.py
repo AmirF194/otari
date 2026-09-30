@@ -8,8 +8,12 @@ handling regardless of wire shape.
 
 The explicit ``otari_*`` tool types always trigger gateway-side execution.
 A provider-native web-search keyword (``web_search`` / ``web_search_<date>``)
-is left untouched in ``tools[]`` and forwarded to the upstream provider unless
-``web_search_intercept`` is on. It is off by default because turning it on
+is forwarded to the upstream provider unless ``web_search_intercept`` is on or
+:data:`WEB_SEARCH_HEADER` asks otherwise. The header takes ``CodeExecutor``'s
+vocabulary: ``auto`` claims the keyword only when a provider in the chain cannot
+run it (Anthropic's dated keyword on Messages, OpenAI's on Responses are the
+native pairings), ``otari`` always, ``provider`` never, and none of them can
+undo interception. Interception is off by default because turning it on
 silently takes a search away from a provider that would have run it (see
 ``docs/tools.md``). An OpenAI ``function`` named ``web_search`` is deliberately
 *not* claimed even then: that is a caller's own tool, and hijacking it means the
@@ -29,19 +33,18 @@ chooses per request where the workspace has not.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Sequence
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING, Any
 
 from gateway.api.routes._schema_derive import SENSITIVE_PARAM_FIELDS
 from gateway.core.config import parse_bool_env
 from gateway.core.env import otari_env
-from gateway.log_config import logger
 from gateway.models.tools import CodeExecutor
 from gateway.services.tool_usage import ToolUsageTally
-from gateway.services.tools import Dialect
+from gateway.services.tools import Dialect, web_search_max_results_baseline
 from gateway.services.web_retrieval_backend import (
-    DEFAULT_MAX_RESULTS,
     WEB_SEARCH_NATIVE_TYPE_PREFIX,
     WEB_SEARCH_TOOL_NAME,
     WebRetrievalBackend,
@@ -57,6 +60,11 @@ if TYPE_CHECKING:
 # provider's own SDK sends; every SDK can add a default header without a code
 # change. One of ``CodeExecutor``'s values, case-insensitive.
 CODE_EXECUTION_HEADER = "Otari-Code-Execution"
+
+# Per-request choice of who runs a provider-named web-search declaration, in the
+# same vocabulary and for the same reason as ``CODE_EXECUTION_HEADER``. It can
+# add a claim but never remove one ``web_search_intercept`` makes.
+WEB_SEARCH_HEADER = "Otari-Web-Search"
 
 
 class Tool(StrEnum):
@@ -111,6 +119,101 @@ def _is_provider_web_search_tool_type(type_value: Any) -> bool:
 def _is_any_web_search_tool_type(type_value: Any) -> bool:
     """The gateway-managed type or a provider-named keyword."""
     return _is_web_search_tool_type(type_value) or _is_provider_web_search_tool_type(type_value)
+
+
+# Where a provider-named web-search keyword is the provider's own: Anthropic's
+# dated keyword on Messages, OpenAI's bare and preview keywords on Responses.
+# Every other pairing, a keyword in the other provider's words included, names a
+# search the dispatched provider cannot run.
+_ANTHROPIC_WEB_SEARCH_TYPE = re.compile(r"web_search_\d{8}")
+_OPENAI_WEB_SEARCH_PREVIEW_PREFIX = "web_search_preview"
+
+
+def _native_web_search_pairing(type_value: Any) -> tuple[str, Dialect] | None:
+    """The ``(provider, dialect)`` a provider-named web-search keyword is native to."""
+    if not isinstance(type_value, str):
+        return None
+    if type_value == _BARE_WEB_SEARCH_TYPE or type_value.startswith(_OPENAI_WEB_SEARCH_PREVIEW_PREFIX):
+        return ("openai", Dialect.RESPONSES)
+    if _ANTHROPIC_WEB_SEARCH_TYPE.fullmatch(type_value):
+        return ("anthropic", Dialect.MESSAGES)
+    return None
+
+
+def first_provider_web_search_tool(tools: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """The first provider-named web-search declaration in ``tools``, if any."""
+    for entry in tools or []:
+        if isinstance(entry, dict) and _is_provider_web_search_tool_type(entry.get("type")):
+            return entry
+    return None
+
+
+def provider_runs_web_search_natively(
+    tool_entry: dict[str, Any] | None, *, provider: str | None, dialect: Dialect
+) -> bool:
+    """Whether the dispatched provider would run this web-search declaration itself.
+
+    The web-search counterpart of :func:`provider_runs_code_natively`. ``None``
+    for the provider reads as not native, as it does there.
+    """
+    if provider is None or tool_entry is None:
+        return False
+    native = _native_web_search_pairing(tool_entry.get("type"))
+    return native is not None and native == (provider.lower(), dialect)
+
+
+def parse_web_search_header(value: str | None) -> CodeExecutor | None:
+    """Who a request asked to run its web search, ``None`` when it asked for no one.
+
+    Raises ``ValueError`` for a value outside the vocabulary, as
+    :func:`parse_code_execution_header` does.
+    """
+    if value is None or not value.strip():
+        return None
+    executor = CodeExecutor.parse(value)
+    if executor is None:
+        msg = f"{WEB_SEARCH_HEADER} must be one of {', '.join(e.value for e in CodeExecutor)}"
+        raise ValueError(msg)
+    return executor
+
+
+def claims_provider_web_search(
+    tool_entry: dict[str, Any] | None,
+    *,
+    requested: CodeExecutor | None,
+    intercept: bool,
+    backend_configured: bool,
+    providers: Sequence[str | None],
+    dialect: Dialect,
+) -> bool:
+    """Whether the gateway runs a provider-named web-search declaration itself.
+
+    Only with a backend to run it on. Interception claims every keyword, and the
+    request's :data:`WEB_SEARCH_HEADER` cannot take that back (see
+    :func:`web_search_header_conflicts`); without interception the header decides,
+    and without either nothing is claimed. ``auto`` claims a keyword unless every
+    candidate in ``providers`` (the fallback chain, head first) runs it natively,
+    so a chain that falls back to a model with no search of its own never
+    forwards it a search nobody will run.
+    """
+    if tool_entry is None or not backend_configured:
+        return False
+    if intercept:
+        return True
+    if requested is CodeExecutor.AUTO:
+        return not providers or not all(
+            provider_runs_web_search_natively(tool_entry, provider=provider, dialect=dialect) for provider in providers
+        )
+    return requested is CodeExecutor.OTARI
+
+
+def web_search_header_conflicts(requested: CodeExecutor | None, *, intercept: bool) -> bool:
+    """Whether the request asked the provider to run a search the deployment claims.
+
+    ``web_search_intercept`` is what puts every search under the workspace's
+    web-search policy and tool pricing, so a caller's header may not opt out of it.
+    """
+    return intercept and requested is CodeExecutor.PROVIDER
 
 
 def _is_code_execution_tool_type(type_value: Any) -> bool:
@@ -502,35 +605,6 @@ def _resolve_web_search_purpose_hint(
         or otari_env("WEB_SEARCH_PURPOSE_HINT")
         or None
     )
-
-
-def web_search_max_results_baseline(config: GatewayConfig | None) -> int:
-    """How many results a request that names no ceiling of its own gets.
-
-    The deployment's own setting (dashboard override / env / YAML), or the
-    backend's built-in default when it has none. Public because a workspace
-    ceiling is floored against it at admission
-    (`services/tenancy/workspace_web_search_service.py`): a workspace value is
-    only ever allowed to *lower* what the request would otherwise get, so
-    without this it could write a number above the operator's own and raise it.
-
-    A per-request ``max_results`` still wins over this, which is how it has
-    always behaved and is not the workspace layer's business to change.
-    """
-    config_max = config.web_search_max_results if config is not None else None
-    if config_max is not None:
-        return config_max
-    max_env = otari_env("WEB_SEARCH_MAX_RESULTS")
-    if max_env:
-        try:
-            parsed_max = int(max_env)
-        except ValueError:
-            logger.warning("OTARI_WEB_SEARCH_MAX_RESULTS=%r is not an int; ignoring", max_env)
-        else:
-            if parsed_max >= 1:
-                return parsed_max
-            logger.warning("OTARI_WEB_SEARCH_MAX_RESULTS=%r is not >= 1; ignoring", max_env)
-    return DEFAULT_MAX_RESULTS
 
 
 def _build_web_retrieval_backend(
