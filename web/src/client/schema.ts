@@ -2281,6 +2281,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/organizations/me/member-invitations/bulk": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Bulk Invite Active Organization Members
+         * @description Invite several addresses to the caller's active organization at once.
+         *
+         *     Organization owners and admins only. Every address gets the same role and
+         *     workspace assignments. Each one is checked as ``POST /me/member-invitations``
+         *     would check it, and an address that is refused lands in ``failed`` with the
+         *     reason rather than failing the request, so the answer is 200 even when some
+         *     or all were refused. Each invited entry carries its own ``mail_sent`` and
+         *     accept link.
+         */
+        post: operations["organizations-bulk_invite_active_organization_members"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/organizations/me/member-invitations/{invitation_id}": {
         parameters: {
             query?: never;
@@ -6439,6 +6466,42 @@ export interface components {
             vendor: string;
         };
         /**
+         * BulkInvitationFailurePublic
+         * @description An address the bulk invite could not invite, and why.
+         */
+        BulkInvitationFailurePublic: {
+            /** Detail */
+            detail: string;
+            /** Email */
+            email: string;
+        };
+        /**
+         * BulkInviteOrganizationMembersRequest
+         * @description Invite several addresses at once, all with the same role and workspace assignments.
+         */
+        BulkInviteOrganizationMembersRequest: {
+            /** Emails */
+            emails: string[];
+            /**
+             * Role
+             * @default member
+             * @enum {string}
+             */
+            role: "owner" | "admin" | "member" | "viewer";
+            /** Workspace Assignments */
+            workspace_assignments?: components["schemas"]["WorkspaceAssignmentRequest"][] | null;
+        };
+        /**
+         * BulkInviteOrganizationMembersResultPublic
+         * @description What a bulk invite produced: one entry per submitted address, repeats included, in one of the two lists.
+         */
+        BulkInviteOrganizationMembersResultPublic: {
+            /** Failed */
+            failed: components["schemas"]["BulkInvitationFailurePublic"][];
+            /** Invited */
+            invited: components["schemas"]["InviteOrganizationMemberResultPublic"][];
+        };
+        /**
          * CallToolResult
          * @description The server's response to a tool call.
          */
@@ -6609,7 +6672,7 @@ export interface components {
         };
         /**
          * CatalogCredential
-         * @description Who may price a catalog offering.
+         * @description Whose key serves a catalog offering, which also says who may price it.
          * @enum {string}
          */
         CatalogCredential: "deployment" | "organization" | "hosted";
@@ -6835,7 +6898,7 @@ export interface components {
         CatalogOffering: {
             /** Context Window */
             context_window?: number | null;
-            /** @description Who may price it: `deployment` for a `providers:` instance the operator configured, `hosted` for a provider the deployment pays for in any workspace of the viewer's organization, `organization` for one the viewer's organization may set its own rate for. A workspace can still call a `hosted` provider with the organization's own key. */
+            /** @description Whose key serves it: `deployment` for a `providers:` instance the operator configured, `hosted` for a provider the deployment pays for in any workspace of the viewer's organization, `organization` for one on the organization's own key, which it may set its own rate for. A workspace can still call a `hosted` provider with the organization's own key. */
             credential: components["schemas"]["CatalogCredential"];
             /**
              * Discovered
@@ -15424,7 +15487,10 @@ export interface operations {
     "chat-chat_completions": {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description A unique value, such as a UUID, that makes a non-streaming request safe to retry. A retry with the same key and body returns the original response, request ID and cost without calling the provider or billing again. A retry while the original is still running is answered 409 with Retry-After. Reusing a key for a different body is refused with 422. Ignored for streaming requests, in hybrid mode, and on a deployment without OTARI_SECRET_KEY, which encrypts the stored response. */
+                "Idempotency-Key"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -16356,7 +16422,10 @@ export interface operations {
     "messages-create_message": {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description A unique value, such as a UUID, that makes a non-streaming request safe to retry. A retry with the same key and body returns the original response, request ID and cost without calling the provider or billing again. A retry while the original is still running is answered 409 with Retry-After. Reusing a key for a different body is refused with 422. Ignored for streaming requests, in hybrid mode, and on a deployment without OTARI_SECRET_KEY, which encrypts the stored response. */
+                "Idempotency-Key"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
@@ -17555,6 +17624,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InviteOrganizationMemberResultPublic"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    "organizations-bulk_invite_active_organization_members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkInviteOrganizationMembersRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkInviteOrganizationMembersResultPublic"];
                 };
             };
             /** @description Validation Error */
@@ -20089,7 +20191,10 @@ export interface operations {
     "responses-create_response": {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description A unique value, such as a UUID, that makes a non-streaming request safe to retry. A retry with the same key and body returns the original response, request ID and cost without calling the provider or billing again. A retry while the original is still running is answered 409 with Retry-After. Reusing a key for a different body is refused with 422. Ignored for streaming requests, in hybrid mode, and on a deployment without OTARI_SECRET_KEY, which encrypts the stored response. */
+                "Idempotency-Key"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };
