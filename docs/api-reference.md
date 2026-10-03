@@ -83,11 +83,56 @@ rate that priced the model: `organization` (an organization's override),
 genai-prices dataset). Hybrid mode attaches the platform's settlement instead;
 see [Hybrid mode protocol](hybrid-mode-protocol.md#inline-response-fields).
 
+### Cost of a failed or interrupted request
+
+A stream that fails mid-response ends in an error event, and one the client
+disconnects from ends with nothing, so neither delivers `usage.cost_usd`. The
+provider may still have charged for the tokens it reported before the stream
+ended (an Anthropic stream reports its input tokens in `message_start`), and a
+standalone gateway records and bills those tokens rather than treating the
+request as free.
+
+To recover that amount, look the request up by its `Otari-Request-ID`:
+
+```
+GET /api/v1/usage/requests/{request_id}
+```
+
+```json
+{
+  "request_id": "5f0c…",
+  "status": "error",
+  "cost_usd": "0.012400",
+  "prompt_tokens": 4100,
+  "completion_tokens": 0,
+  "total_tokens": 4100,
+  "row_count": 1
+}
+```
+
+The response sums every usage row the request wrote: a request routed through a
+policy writes one per attempt, all sharing that id as their `request_group_id`,
+so the total covers the attempts it fell over from as well as the one that
+served. `cost_usd` uses the inline format and is `null` when nothing was priced.
+An API key sees only its own requests and the master key sees any. The endpoint
+answers 404 until the request has settled, since usage rows are written in the
+background, and for an id that is unknown or belongs to another key. A stream the
+client abandoned before the provider reported any usage, and that ran no gateway
+tools, has nothing to bill and writes no row, so its id stays 404.
+
+This lookup is standalone only. In hybrid mode the platform owns settlement, and
+a failed stream reports no usage to it; see
+[Hybrid mode protocol](hybrid-mode-protocol.md).
+
 ### Retrying safely
 
 A request the provider or the gateway refused (a 429, a 529, any other error) is
-not billed: its budget hold is refunded, so a client can retry it as it is. So is
-a stream the client disconnected from. The case that does bill twice is a
+not billed: its budget hold is refunded, so a client can retry it as it is. A
+stream that fails or that the client disconnects from is billed for the tokens
+the provider reported before it ended, and nothing more (see
+[Cost of a failed or interrupted request](#cost-of-a-failed-or-interrupted-request));
+a retry of it is a new request, billed on its own. The case that does bill twice
+is a
 non-streaming request that succeeded while its response was lost on the way
 back, through a dropped connection or a client timeout, because the retry calls
 the provider again.
