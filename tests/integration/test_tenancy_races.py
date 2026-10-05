@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
 import pytest
-from fastapi import HTTPException, status
+from fastapi import BackgroundTasks, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -969,6 +969,7 @@ async def test_a_signup_racing_a_password_accept_never_overwrites_the_winner(
                 return await user_service.create_user_for_signup(
                     session,
                     config,
+                    background_tasks=BackgroundTasks(),
                     email="iris@example.com",
                     password=f"signup-password-{index}",
                     membership_listener=WorkspaceBudgetDefaultService(session),

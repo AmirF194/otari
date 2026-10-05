@@ -293,14 +293,10 @@ async def create_user_for_signup(
     Refuses before writing anything if this deployment cannot mail the
     verification link: a signup that could never be verified would strand the
     caller in the unverified, hard-blocked state #650's sign-in gate enforces.
-    The mail send is handed to ``background_tasks`` rather than awaited here,
-    the same reason ``GrowthSignalPort`` is: an unauthenticated caller can
-    measure how long this call takes, and an awaited SMTP round-trip on the
-    claim branch alone would let them tell it apart from the enumeration-safe
-    early return above by wall-clock time even though both answer the caller
-    identically. Scheduling after the commit keeps the account durable
-    whether or not the message actually goes out, the same guarantee the
-    previous inline, unguarded ``await`` gave (``Mailer.send`` never raises).
+    The mail send is scheduled on ``background_tasks`` after the commit rather
+    than awaited: an SMTP round trip on the claim branch alone would let a
+    caller tell it from the early return by response time. The account is
+    durable whether or not the message goes out.
     """
     mailer = Mailer(config)
     mailer.require_ready()
@@ -443,10 +439,8 @@ async def resend_verification_email(
     one for an address with no stored hash: without it, the ineligible path
     returns after one SELECT while the eligible one goes on to a commit, and
     that gap is measurable enough to narrow down which case a given address
-    fell into. The mail send itself is handed to ``background_tasks`` rather
-    than awaited, for the same reason: an awaited SMTP round-trip on the
-    eligible path alone would reopen the gap the bcrypt-equivalent cost above
-    exists to close.
+    fell into. The mail send is scheduled on ``background_tasks`` for the same
+    reason: awaiting it would reopen that gap.
     """
     mailer = Mailer(config)
     mailer.require_ready()
