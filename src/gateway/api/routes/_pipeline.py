@@ -132,6 +132,7 @@ from gateway.core.usage import (
     cache_tokens_in_prompt_of,
     cache_write_1h_tokens_of,
     cache_write_tokens_of,
+    provider_latency_ms_of,
     reasoning_tokens_of,
 )
 from gateway.exceptions import TenancyError
@@ -214,7 +215,12 @@ from gateway.services.pricing_service import (
     pricing_required_but_missing,
     resolve_model_pricing,
 )
-from gateway.services.provider_kwargs import ResolvedProvider, credential_ladder_exhausted, resolve_provider_selector
+from gateway.services.provider_kwargs import (
+    ResolvedProvider,
+    credential_ladder_exhausted,
+    provider_key,
+    resolve_provider_selector,
+)
 from gateway.services.routing import (
     BudgetState,
     CompiledPlan,
@@ -1453,6 +1459,7 @@ async def _bill_vision_side_call(
         api_key_id=api_key_id,
         model=resolved.model,
         provider=resolved.instance,
+        provider_type=resolved.provider.value,
         endpoint=endpoint,
         user_id=user_id,
         usage_override=usage,
@@ -3753,6 +3760,7 @@ async def record_usage(
     user_id: str | None = None,
     response: ChatCompletion | AsyncIterator[ChatCompletionChunk] | None = None,
     usage_override: CompletionUsage | None = None,
+    provider_type: str | None = None,
     error: str | None = None,
     status_code: int | None = None,
     cost_override: Decimal | float | None = None,
@@ -3794,6 +3802,8 @@ async def record_usage(
         user_id: User identifier for tracking
         response: Response object (if successful)
         usage_override: Usage data for streaming requests
+        provider_type: any-llm implementation backing ``provider``, which keys
+            the provider-reported latency lookup; falls back to ``provider``.
         error: Error message (if failed)
         status_code: HTTP status classifying the failure (see
             ``UsageLog.status_code``), or None when nothing was rejected over HTTP
@@ -3861,6 +3871,7 @@ async def record_usage(
         # Which convention those cache counts were reported under, recorded rather
         # than left to be inferred from the numbers later (mozilla-ai/otari#690).
         usage_log.cache_tokens_in_prompt = cache_tokens_in_prompt_of(usage_data)
+        usage_log.provider_latency_ms = provider_latency_ms_of(usage_data, provider_type or provider)
 
         record_tokens(
             str(provider or ""),
@@ -4639,6 +4650,9 @@ def build_streaming_response(
     # Both modes settle before the terminal suffix so its usage object can carry
     # the cost: hybrid from the platform's report, standalone from its own row.
     settles_inline = platform_active or (db is not None and log_writer is not None)
+    # Provider-latency lookup is keyed by implementation, not instance name.
+    provider_type = config.provider_instance_type(provider_key(provider))
+
     first_chunk_at: float | None = None
     # Usage the provider reported before the stream ended, whether or not it ended
     # cleanly. The generator hands only a completed stream's usage to a callback.
@@ -4681,6 +4695,7 @@ def build_streaming_response(
             api_key_id=api_key_id,
             model=model,
             provider=provider,
+            provider_type=provider_type,
             endpoint=adapter.endpoint,
             user_id=user_id,
             usage_override=usage_data,
@@ -5789,6 +5804,7 @@ async def run_standalone_non_stream(
                     api_key_id=ctx.api_key_id,
                     model=model,
                     provider=provider,
+                    provider_type=ctx.config.provider_instance_type(provider_key(provider)),
                     endpoint=adapter.endpoint,
                     user_id=ctx.user_id,
                     usage_override=usage_data,

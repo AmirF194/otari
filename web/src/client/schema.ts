@@ -13476,6 +13476,8 @@ export interface components {
             prompt_tokens: number | null;
             /** Provider */
             provider: string | null;
+            /** Provider Latency Ms */
+            provider_latency_ms: number | null;
             /** Reasoning Tokens */
             reasoning_tokens?: number | null;
             /** Request Group Id */
@@ -13627,6 +13629,8 @@ export interface components {
             prompt_tokens: number | null;
             /** Provider */
             provider: string | null;
+            /** Provider Latency Ms */
+            provider_latency_ms: number | null;
             /** Status */
             status: string;
             /** Timestamp */
