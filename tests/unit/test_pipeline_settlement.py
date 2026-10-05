@@ -46,6 +46,7 @@ import gateway.api.routes._pipeline as pipeline
 import gateway.streaming as streaming
 from conftest import InstallControlPlane
 from gateway.adapters.web_search_policy_adapter import RemoteWebSearchPolicy
+from gateway.api.deps import ToolPorts
 from gateway.api.routes import chat, messages, responses
 from gateway.api.routes._pipeline import (
     DeclaredTools,
@@ -65,6 +66,7 @@ from gateway.api.routes._pipeline import (
 from gateway.api.routes._platform import ResolvedAttempt, ResolvedRoute, SettledCost
 from gateway.core.config import GatewayConfig
 from gateway.exceptions.tools_exceptions import (
+    CodeExecutionPolicyResolutionFailure,
     WebAccessToolNotAuthorizedError,
     WebSearchNotEnabledError,
     WebSearchPolicyResolutionFailure,
@@ -72,8 +74,9 @@ from gateway.exceptions.tools_exceptions import (
 )
 from gateway.models.mcp import McpServerConfig, ResolvedMcpServer
 from gateway.models.pricing import ModelPricing, PriceSource
-from gateway.models.tools import ResolvedWebSearchConfig
+from gateway.models.tools import ResolvedCodeExecutionPolicy, ResolvedWebSearchConfig
 from gateway.models.usage import PRICING_REFERENCE_MAX_LENGTH
+from gateway.ports.code_execution_policy_port import CodeExecutionPolicyScope
 from gateway.ports.mcp_server_port import McpServerPort, McpServerScope
 from gateway.ports.web_search_policy_port import WebSearchPolicyPort, WebSearchPolicyScope
 from gateway.rate_limit import RateLimitInfo
@@ -1739,7 +1742,15 @@ def _chunk_id(part: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+class _NoCodeExecutionPolicy:
+    """A workspace with no code execution policy, which narrows nothing."""
+
+    async def resolve(self, scope: CodeExecutionPolicyScope) -> ResolvedCodeExecutionPolicy | None:
+        return None
+
+
 _BACKEND_FIELDS = frozenset(field.name for field in dataclasses.fields(ToolBackends))
+_PORT_FIELDS = frozenset(field.name for field in dataclasses.fields(ToolPorts))
 _DECLARED_FIELDS = frozenset(field.name for field in dataclasses.fields(DeclaredTools))
 
 
@@ -1756,10 +1767,14 @@ async def _call_prepare_gateway_tools(ctx: RequestContext, **overrides: Any) -> 
         "tools_header": None,
     }
     declared.update({name: overrides.pop(name) for name in list(overrides) if name in _DECLARED_FIELDS})
-    backends: dict[str, Any] = {
-        "mcp_server_port": _Servers(_resolves_to_nothing),
-        "web_search_policy_port": _Policy(),
+    ports: dict[str, Any] = {
+        "code_execution": None,
+        "code_execution_policy": _NoCodeExecutionPolicy(),
+        "mcp_server": _Servers(_resolves_to_nothing),
+        "web_search_policy": _Policy(),
     }
+    ports.update({name: overrides.pop(name) for name in list(overrides) if name in _PORT_FIELDS})
+    backends: dict[str, Any] = {"ports": ToolPorts(**ports)}
     backends.update({name: overrides.pop(name) for name in list(overrides) if name in _BACKEND_FIELDS})
     kwargs: dict[str, Any] = {
         "adapter": chat._ADAPTER,
@@ -1845,7 +1860,7 @@ async def test_disabled_fetch_releases_reservation_before_workspace_policy_io(
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await _call_prepare_gateway_tools(ctx, tools=[{"type": "otari_web_fetch"}], web_search_policy_port=policy)
+        await _call_prepare_gateway_tools(ctx, tools=[{"type": "otari_web_fetch"}], web_search_policy=policy)
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == pipeline.WEB_FETCH_NOT_ENABLED_DETAIL
@@ -2001,7 +2016,7 @@ async def test_combined_standalone_policy_narrows_fetch_domains() -> None:
             {"type": "otari_web_search", "allowed_domains": ["docs.example.com"]},
             {"type": "otari_web_fetch"},
         ],
-        web_search_policy_port=_Policy(workspace),
+        web_search_policy=_Policy(workspace),
     )
 
     assert [rule.value for rule in tool_ctx.web_fetch_policy.allowed] == ["docs.example.com"]
@@ -2027,7 +2042,7 @@ async def test_hybrid_legacy_policy_preserves_search(
 
     if enabled:
         tool_ctx = await _call_prepare_gateway_tools(
-            ctx, tools=[{"type": "otari_web_search"}], web_search_policy_port=RemoteWebSearchPolicy(ctx.config)
+            ctx, tools=[{"type": "otari_web_search"}], web_search_policy=RemoteWebSearchPolicy(ctx.config)
         )
         assert tool_ctx.use_web_search is True
         assert tool_ctx.use_web_fetch is False
@@ -2036,7 +2051,7 @@ async def test_hybrid_legacy_policy_preserves_search(
     else:
         with pytest.raises(HTTPException) as exc_info:
             await _call_prepare_gateway_tools(
-                ctx, tools=[{"type": "otari_web_search"}], web_search_policy_port=RemoteWebSearchPolicy(ctx.config)
+                ctx, tools=[{"type": "otari_web_search"}], web_search_policy=RemoteWebSearchPolicy(ctx.config)
             )
         assert exc_info.value.status_code == 403
         assert exc_info.value.detail == WebSearchNotEnabledError().message
@@ -2079,7 +2094,7 @@ async def test_hybrid_fetch_requires_explicit_authorization(
         requested_tools.insert(0, "web_search")
 
     with pytest.raises(HTTPException) as exc_info:
-        await _call_prepare_gateway_tools(ctx, tools=tools, web_search_policy_port=RemoteWebSearchPolicy(ctx.config))
+        await _call_prepare_gateway_tools(ctx, tools=tools, web_search_policy=RemoteWebSearchPolicy(ctx.config))
 
     assert exc_info.value.status_code == 403
     assert exc_info.value.detail == WebAccessToolNotAuthorizedError().message
@@ -2108,7 +2123,7 @@ async def test_hybrid_fetch_only_needs_no_search_backend(control_plane_transport
     )
 
     tool_ctx = await _call_prepare_gateway_tools(
-        ctx, tools=[{"type": "otari_web_fetch"}], web_search_policy_port=RemoteWebSearchPolicy(ctx.config)
+        ctx, tools=[{"type": "otari_web_fetch"}], web_search_policy=RemoteWebSearchPolicy(ctx.config)
     )
 
     assert tool_ctx.use_web_fetch is True
@@ -2150,7 +2165,7 @@ async def test_hybrid_web_tools_fail_closed_on_malformed_policy(
     ctx.config.web_search_url = "https://search.example"
     with pytest.raises(HTTPException) as exc_info:
         await _call_prepare_gateway_tools(
-            ctx, tools=[{"type": tool_type}], web_search_policy_port=RemoteWebSearchPolicy(ctx.config)
+            ctx, tools=[{"type": tool_type}], web_search_policy=RemoteWebSearchPolicy(ctx.config)
         )
 
     assert exc_info.value.status_code == 502
@@ -2199,7 +2214,7 @@ async def test_unknown_mcp_server_id_releases_reservation(monkeypatch: pytest.Mo
     with pytest.raises(HTTPException) as exc_info:
         await _call_prepare_gateway_tools(
             ctx,
-            mcp_server_port=_Servers(missing),
+            mcp_server=_Servers(missing),
             mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
 
@@ -2247,7 +2262,7 @@ async def test_duplicate_mcp_server_name_against_a_stored_server_releases_reserv
     with pytest.raises(HTTPException) as exc_info:
         await _call_prepare_gateway_tools(
             ctx,
-            mcp_server_port=_Servers(stored),
+            mcp_server=_Servers(stored),
             mcp_servers=[McpServerConfig(name="tools", url="https://93.184.216.34/mcp")],
             mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
@@ -2348,7 +2363,7 @@ async def test_stored_mcp_servers_sharing_a_name_are_an_operator_error(
     with pytest.raises(HTTPException) as exc_info:
         await _call_prepare_gateway_tools(
             ctx,
-            mcp_server_port=_Servers(stored),
+            mcp_server=_Servers(stored),
             mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
 
@@ -2384,7 +2399,7 @@ async def test_a_database_failure_releases_the_reservation(monkeypatch: pytest.M
     with pytest.raises(SQLAlchemyError):
         await _call_prepare_gateway_tools(
             ctx,
-            mcp_server_port=_Servers(failing),
+            mcp_server=_Servers(failing),
             mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
 
@@ -2417,7 +2432,7 @@ async def test_a_release_that_also_fails_reraises_the_original(monkeypatch: pyte
     with pytest.raises(SQLAlchemyError, match="connection reset"):
         await _call_prepare_gateway_tools(
             ctx,
-            mcp_server_port=_Servers(failing),
+            mcp_server=_Servers(failing),
             mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
 
@@ -2809,3 +2824,17 @@ async def test_standalone_stream_has_no_first_chunk_deadline(monkeypatch: pytest
 
     assert chunks, "the slow first chunk was dropped: a first-chunk deadline is being applied"
     assert settlement.reconciled == [0.25]
+
+
+@pytest.mark.parametrize(
+    ("reason", "status_code"),
+    [
+        (CodeExecutionPolicyResolutionFailure.ANSWER_UNREADABLE, 502),
+        (CodeExecutionPolicyResolutionFailure.NO_CALLER_CREDENTIAL, 500),
+        (CodeExecutionPolicyResolutionFailure.NO_WORKSPACE, 500),
+    ],
+)
+def test_a_code_execution_policy_failure_renders_its_status(
+    reason: CodeExecutionPolicyResolutionFailure, status_code: int
+) -> None:
+    assert pipeline._code_execution_policy_failure_status(reason) == status_code

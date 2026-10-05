@@ -64,7 +64,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gateway.api.deps import extract_credential_token, get_budget_service, verify_api_key_or_master_key
+from gateway.api.deps import ToolPorts, extract_credential_token, get_budget_service, verify_api_key_or_master_key
 from gateway.api.routes._attempts import CandidateCannotServe, PrepareKwargs, walk_attempts
 from gateway.api.routes._helpers import apply_input_guardrails, resolve_user_id
 from gateway.api.routes._idempotency import (
@@ -86,7 +86,6 @@ from gateway.api.routes._platform import (
     SettledCost,
     _classify_upstream_error,
     _report_platform_usage,
-    _resolve_platform_code_execution,
     _resolve_platform_credentials,
     is_provider_billing_error,
     record_abandoned_attempt,
@@ -138,6 +137,8 @@ from gateway.core.usage import (
 from gateway.exceptions import TenancyError
 from gateway.exceptions.control_plane_exceptions import ControlPlaneError
 from gateway.exceptions.tools_exceptions import (
+    CodeExecutionPolicyResolutionFailedError,
+    CodeExecutionPolicyResolutionFailure,
     McpServerResolutionFailedError,
     WebAccessRefusedError,
     WebSearchPolicyResolutionFailedError,
@@ -155,8 +156,9 @@ from gateway.models.guardrails import GuardrailConfig
 from gateway.models.mcp import McpServerConfig
 from gateway.models.money import to_usd
 from gateway.models.pricing import ModelPricing, PriceSource
-from gateway.models.tools import CodeExecutor
+from gateway.models.tools import CodeExecutor, ResolvedCodeExecutionPolicy
 from gateway.models.usage import PRICING_REFERENCE_MAX_LENGTH, UsageLog
+from gateway.ports.code_execution_policy_port import CodeExecutionPolicyPort, CodeExecutionPolicyScope
 from gateway.ports.code_execution_port import CodeExecutionPort
 from gateway.ports.mcp_server_port import McpServerPort, McpServerScope
 from gateway.ports.model_provider_port import HostedAccessDeniedError, ModelProviderPort
@@ -239,8 +241,6 @@ from gateway.services.tenancy.organization_guardrail_service import (
 )
 from gateway.services.tenancy.workspace_code_execution_policy_service import (
     SERVED_TOOL_NAMES,
-    ResolvedCodeExecutionPolicy,
-    read_code_execution_policy,
     resolve_workspace_code_execution_policy,
 )
 from gateway.services.tenancy.workspace_web_search_service import MAX_WEB_SEARCH_DOMAINS
@@ -414,8 +414,6 @@ SANDBOX_TOOLS_EXCLUDED_DETAIL = (
 # it here would send an operator instruction to a data-plane caller, which is the
 # boundary ``SANDBOX_NOT_ENABLED_DETAIL`` next door already respects.
 SANDBOX_IMAGE_NOT_ALLOWED_DETAIL = "this workspace's code-execution policy pins a sandbox image that is not allowed"
-MALFORMED_CODE_EXEC_POLICY_DETAIL = "Authorization service returned a malformed code-execution policy"
-CODE_EXEC_POLICY_UNRESOLVABLE_DETAIL = "Code execution policy could not be resolved for this request"
 WEB_SEARCH_REQUEST_DOMAIN_INVALID_DETAIL = (
     "Web search allowed_domains and blocked_domains must each contain at most "
     f"{MAX_WEB_SEARCH_DOMAINS} bare valid hostnames"
@@ -3005,11 +3003,9 @@ class DeclaredTools:
 class ToolBackends:
     """What runs the tools a request may use."""
 
-    code_execution_port: CodeExecutionPort | None = None
-    mcp_server_port: McpServerPort
+    ports: ToolPorts
     sandbox_containers: SandboxContainerRegistry | None = None
     sandbox_files: SandboxFileBridge | None = None
-    web_search_policy_port: WebSearchPolicyPort
 
 
 async def prepare_gateway_tools(
@@ -3031,12 +3027,12 @@ async def prepare_gateway_tools(
     try:
         claim_web_search = _admit_web_declarations(adapter, ctx, declared)
         await _admit_guardrails(adapter, ctx, response, declared)
-        mcp_servers = await _admit_mcp_servers(adapter, ctx, declared, backends.mcp_server_port)
+        mcp_servers = await _admit_mcp_servers(adapter, ctx, declared, backends.ports.mcp_server)
         code = await _admit_code_execution(adapter, ctx, declared, backends, mcp_servers_declared=bool(mcp_servers))
         web = _extract_web_tools(adapter, ctx, code.tools_after_sandbox, claim_web_search=claim_web_search)
         if web.declared_any and (code.use_sandbox or mcp_servers):
             raise adapter.error(400, WEB_SEARCH_CONFLICT_DETAIL, ErrorKind.INVALID_REQUEST)
-        web_access = await _admit_web_access(adapter, ctx, web, backends.web_search_policy_port)
+        web_access = await _admit_web_access(adapter, ctx, web, backends.ports.web_search_policy)
         await _require_tool_pricing(
             adapter,
             ctx,
@@ -3079,7 +3075,7 @@ async def prepare_gateway_tools(
         mcp_server_configs=mcp_servers,
         use_sandbox=code.use_sandbox,
         sandbox_tool_entry=code.tool_entry,
-        code_execution_port=backends.code_execution_port,
+        code_execution_port=backends.ports.code_execution,
         sandbox_exec_timeout_s=code.exec_timeout_s,
         sandbox_session_image=code.session_image,
         sandbox_allowed_tools=code.allowed_tools,
@@ -3367,10 +3363,7 @@ async def _admit_code_execution(
         native_available = provider_runs_code_natively(
             provider_code_entry, provider=_dispatch_provider_name(ctx), dialect=adapter.name
         )
-        if ctx.hybrid_mode:
-            code_execution_policy = await _hybrid_code_execution_policy(adapter, ctx)
-        else:
-            code_execution_policy = await _standalone_code_execution_policy(adapter, ctx)
+        code_execution_policy = await _resolve_code_execution_policy(adapter, ctx, backends.ports.code_execution_policy)
 
         executor_preference, executor_conflict = resolve_code_executor_preference(
             requested=requested_executor,
@@ -3516,46 +3509,33 @@ def _candidate_provider_names(ctx: RequestContext) -> list[str | None]:
     return [_dispatch_provider_name(ctx)]
 
 
-async def _standalone_code_execution_policy(
+async def _resolve_code_execution_policy(
     adapter: FormatAdapter[Any, Any],
     ctx: RequestContext,
+    port: CodeExecutionPolicyPort,
 ) -> ResolvedCodeExecutionPolicy | None:
-    """The request's workspace policy: the preamble's read where it made one, else read here.
-
-    The workspace comes off the key that authenticated the request, never off a
-    header; a master-key request resolves to the deployment's default workspace,
-    so an operator who has narrowed that workspace is narrowed by it too
-    (``services/workspace_scope.py``). ``None`` means no row and no narrowing.
-
-    Fails closed when the session or the workspace is missing. Both are
-    invariants on this path today (a standalone request with no session is
-    refused with ``DB_UNAVAILABLE_DETAIL`` before this, and ``resolve_workspace_id``
-    always answers), so this is unreachable, which is exactly why it refuses
-    rather than falling through: what it guards is a *veto*, and skipping it
-    would serve code execution to a workspace whose row says ``enabled=False``
-    on the day one of those invariants stops holding.
-    """
+    """The workspace's code execution policy: the preamble's read where it made one, else the port's answer."""
     if ctx.code_execution_policy_loaded:
         return ctx.code_execution_policy
-    if ctx.db is None or ctx.workspace_id is None:
-        raise adapter.error(500, CODE_EXEC_POLICY_UNRESOLVABLE_DETAIL, ErrorKind.API)
-    return await resolve_workspace_code_execution_policy(ctx.db, ctx.workspace_id)
-
-
-async def _hybrid_code_execution_policy(
-    adapter: FormatAdapter[Any, Any],
-    ctx: RequestContext,
-) -> ResolvedCodeExecutionPolicy:
-    """The control plane's answer for the caller's workspace, in the standalone shape.
-
-    A malformed answer is a contract break rather than a denial, so it is refused with a 502 and no code runs.
-    """
-    assert ctx.user_token is not None  # guaranteed by the hybrid-mode preamble
-    answer = await _resolve_platform_code_execution(config=ctx.config, user_token=ctx.user_token)
+    scope = CodeExecutionPolicyScope(workspace_id=ctx.workspace_id, user_token=ctx.user_token)
     try:
-        return read_code_execution_policy(answer)
-    except ValueError:
-        raise adapter.error(502, MALFORMED_CODE_EXEC_POLICY_DETAIL, ErrorKind.API) from None
+        return await port.resolve(scope)
+    except CodeExecutionPolicyResolutionFailedError as exc:
+        raise adapter.error(_code_execution_policy_failure_status(exc.reason), exc.message, ErrorKind.API) from exc
+
+
+def _code_execution_policy_failure_status(reason: CodeExecutionPolicyResolutionFailure) -> int:
+    """The HTTP status a failed code execution policy resolution renders as."""
+    match reason:
+        case CodeExecutionPolicyResolutionFailure.ANSWER_UNREADABLE:
+            return status.HTTP_502_BAD_GATEWAY
+        case (
+            CodeExecutionPolicyResolutionFailure.NO_CALLER_CREDENTIAL
+            | CodeExecutionPolicyResolutionFailure.NO_WORKSPACE
+        ):
+            return status.HTTP_500_INTERNAL_SERVER_ERROR
+        case _:
+            assert_never(reason)
 
 
 def _implementation_for(ctx: RequestContext, instance: str) -> LLMProvider | None:
