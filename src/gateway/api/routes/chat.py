@@ -221,7 +221,10 @@ class _ChatAdapter:
         if not chunk.usage:
             return None
         details = chunk.usage.prompt_tokens_details
-        return GatewayUsage(
+        # Forward provider extras (streamed timing lands in the final chunk's
+        # usage), as GatewayUsage.from_completion_usage does.
+        fields = GatewayUsage.external_extras(chunk.usage)
+        fields.update(
             prompt_tokens=chunk.usage.prompt_tokens or 0,
             completion_tokens=chunk.usage.completion_tokens or 0,
             total_tokens=chunk.usage.total_tokens or 0,
@@ -229,6 +232,7 @@ class _ChatAdapter:
             cache_read_tokens=(details.cached_tokens or 0) if details is not None else 0,
             reasoning_tokens=reasoning_tokens_of(chunk.usage),
         )
+        return GatewayUsage(**fields)
 
     def extract_usage(self, result: ChatCompletion) -> CompletionUsage | None:
         if result.usage is None:
