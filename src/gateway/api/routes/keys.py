@@ -9,14 +9,22 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col
 
-from gateway.api.deps import CurrentIdentity, get_config, get_db, require_deployment_operator
-from gateway.auth.models import generate_api_key, hash_key, key_prefix
+from gateway.api.deps import (
+    ApiKeyFormatPortDep,
+    BudgetServiceDep,
+    CallerOrganization,
+    get_config,
+    get_db,
+    require_deployment_operator,
+)
+from gateway.auth.models import hash_key, key_suffix
 from gateway.core.config import GatewayConfig
-from gateway.models.entities import APIKey, User
+from gateway.core.surface import Surface
+from gateway.models.api_keys import APIKey
 from gateway.models.tenancy import Workspace
-from gateway.repositories.users_repository import get_or_create_default_user
+from gateway.models.users import User
+from gateway.repositories.users_repository import get_or_create_default_user, owned_by_organization
 from gateway.services.model_access import is_allowlist_subset, validate_allowed_models
-from gateway.services.tenancy import OrganizationService
 from gateway.services.workspace_scope import organization_default_workspace_id
 
 # A key inherits its user's default allow-list and may narrow it, never broaden
@@ -27,32 +35,22 @@ _KEY_EXCEEDS_USER_DETAIL = (
 )
 
 router = APIRouter(
-    prefix="/v1/keys",
+    prefix="/keys",
     tags=["keys"],
     dependencies=[Depends(require_deployment_operator)],
 )
 
-
-async def _caller_organization_id(
-    db: Annotated[AsyncSession, Depends(get_db)],
-    identity: CurrentIdentity,
-) -> uuid.UUID:
-    """The organization this request acts in.
-
-    A key is minted, listed and revoked inside one organization, so every route
-    here resolves the caller's before it touches a row. A dashboard session names
-    the identity behind it and resolves that identity's active organization,
-    which is what ``POST /v1/organizations/me/switch`` moves; a header master key
-    names nobody, resolves the bootstrap operator, and therefore acts in the
-    default organization. That is the same rule ``services/workspace_scope``
-    already documents for a deployment-wide write, so an operator running several
-    organizations behind one gateway works in the one they are currently in
-    rather than across all of them (otari#817).
-    """
-    return (await OrganizationService(db).get_active_organization_for_user(identity)).id
+SURFACE = Surface("keys")
 
 
-CallerOrganization = Annotated[uuid.UUID, Depends(_caller_organization_id)]
+# Every key surface reads the keys a person created, and none of them reads the
+# ones this deployment minted for itself: an internal key carries a stored
+# credential (``models/api_keys.APIKey.internal_secret``), so a rotation or a
+# revoke through these routes would leave the holder presenting a key that no
+# longer authenticates, with nothing on screen to explain it. A read is excluded
+# for the same reason a write is, because the id a read hands back is what a write
+# is aimed with, and a 404 is the answer a route with no business in a row gives.
+NOT_INTERNAL = col(APIKey.internal_secret).is_(None)
 
 
 async def _load_key_in_organization(
@@ -79,7 +77,11 @@ async def _load_key_in_organization(
     statement = (
         select(APIKey)
         .join(Workspace, col(Workspace.id) == col(APIKey.workspace_id))
-        .where(col(APIKey.id) == key_id, col(Workspace.organization_id) == organization_id)
+        .where(
+            col(APIKey.id) == key_id,
+            col(Workspace.organization_id) == organization_id,
+            NOT_INTERNAL,
+        )
     )
     if owner_user_id is not None:
         statement = statement.where(col(APIKey.user_id) == owner_user_id)
@@ -122,9 +124,20 @@ class CreateKeyRequest(BaseModel):
         description="Per-key override of the deployment-wide capture_agent_telemetry setting: "
         "null (default) inherits it, true always stores this key's coding-agent telemetry, false "
         "always discards it. Covers both behavioral events (tool_result, tool_decision, "
-        "user_prompt, api_error) from POST /v1/logs and outcome-metric data points (lines of code, "
-        "commits, pull requests, active time) from POST /v1/metrics. Usage capture and billing are "
+        "user_prompt, api_error) from POST /otlp/v1/logs and outcome-metric data points (lines of code, "
+        "commits, pull requests, active time) from POST /otlp/v1/metrics. Usage capture and billing are "
         "unaffected either way.",
+    )
+    is_service_key: bool = Field(
+        default=False,
+        description="When true, a request may name an end user in its 'user' field. Each end user is "
+        "created on first use, owned by this key's user, and billed to its own budget, while this key's "
+        "own ceiling caps all of them together.",
+    )
+    end_user_budget_id: str | None = Field(
+        default=None,
+        description="Budget each end user this key creates is capped at. Null leaves end users capped "
+        "only by this key's own ceiling.",
     )
     workspace_id: uuid.UUID | None = Field(
         default=None,
@@ -141,9 +154,10 @@ class CreateKeyResponse(BaseModel):
 
     id: str
     key: str
-    # Leading characters of the key, echoed so the client can key its show-once
-    # reveal to the same fingerprint the list will display afterward.
+    # Leading and trailing characters of the key, echoed so the client can key its
+    # show-once reveal to the same fingerprint the list will display afterward.
     key_prefix: str | None
+    key_suffix: str | None
     key_name: str | None
     user_id: str | None
     created_at: str
@@ -153,6 +167,8 @@ class CreateKeyResponse(BaseModel):
     exclude_from_budget: bool
     reject_user_mismatch: bool | None
     capture_agent_telemetry: bool | None
+    is_service_key: bool
+    end_user_budget_id: str | None
     metadata: dict[str, Any]
 
 
@@ -160,9 +176,11 @@ class KeyInfo(BaseModel):
     """Response model for key information."""
 
     id: str
-    # Display-only fingerprint (leading characters of the plaintext key). Null for
-    # keys minted before the prefix was recorded; the full key is never returned.
+    # Display-only fingerprint (leading and trailing characters of the plaintext
+    # key). Either is null for keys minted before that half was recorded, and neither
+    # can be back-filled; the full key is never returned.
     key_prefix: str | None
+    key_suffix: str | None
     key_name: str | None
     user_id: str | None
     created_at: str
@@ -173,6 +191,8 @@ class KeyInfo(BaseModel):
     exclude_from_budget: bool
     reject_user_mismatch: bool | None
     capture_agent_telemetry: bool | None
+    is_service_key: bool
+    end_user_budget_id: str | None
     workspace_id: uuid.UUID
     metadata: dict[str, Any]
 
@@ -182,6 +202,7 @@ class KeyInfo(BaseModel):
             id=str(key.id),
             workspace_id=key.workspace_id,
             key_prefix=str(key.key_prefix) if key.key_prefix else None,
+            key_suffix=str(key.key_suffix) if key.key_suffix else None,
             key_name=str(key.key_name) if key.key_name else None,
             user_id=str(key.user_id) if key.user_id else None,
             created_at=key.created_at.isoformat(),
@@ -194,6 +215,8 @@ class KeyInfo(BaseModel):
             capture_agent_telemetry=(
                 None if key.capture_agent_telemetry is None else bool(key.capture_agent_telemetry)
             ),
+            is_service_key=bool(key.is_service_key),
+            end_user_budget_id=key.end_user_budget_id,
             metadata=dict(key.metadata_) if key.metadata_ else {},
         )
 
@@ -217,6 +240,10 @@ class UpdateKeyRequest(BaseModel):
     # unrestricted, [] = deny all, list = restrict. A plain default cannot tell
     # "absent" from "explicit null", so the handler checks model_fields_set.
     allowed_models: list[str] | None = None
+    is_service_key: bool | None = None
+    # Tri-state via model_fields_set: absent = unchanged, null = end users this
+    # key creates from now on are uncapped. End users already created keep theirs.
+    end_user_budget_id: str | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -226,6 +253,8 @@ async def create_key(
     db: Annotated[AsyncSession, Depends(get_db)],
     config: Annotated[GatewayConfig, Depends(get_config)],
     organization_id: CallerOrganization,
+    key_format: ApiKeyFormatPortDep,
+    budgets: BudgetServiceDep,
 ) -> CreateKeyResponse:
     """Create a new API key in the caller's organization.
 
@@ -245,8 +274,12 @@ async def create_key(
         allowed_models = validate_allowed_models(config, request.allowed_models)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    # Before anything is staged: the check runs in a Unit of Work block, and the
+    # block's commit would store whatever this route had added by then.
+    if request.end_user_budget_id is not None:
+        await budgets.require_end_user_budget(request.end_user_budget_id)
 
-    api_key = generate_api_key()
+    api_key = key_format.mint()
     key_hash = hash_key(api_key)
     key_id = uuid.uuid4()
 
@@ -259,10 +292,20 @@ async def create_key(
                 alias=f"User {request.user_id}",
             )
             db.add(user)
+        elif not await owned_by_organization(db, user.user_id, organization_id):
+            # An owner this organization cannot name, which is another
+            # organization's person: the same 404 an unknown id would get, so the
+            # refusal reports no more than the read on ``/users`` does. Minting
+            # here would bill this organization's traffic to their ledger and
+            # their budget (otari-ai#2108).
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with id '{request.user_id}' not found",
+            )
         elif user.deleted_at is not None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User '{request.user_id}' has been deleted. Recreate via POST /v1/users first.",
+                detail=f"User '{request.user_id}' has been deleted. Recreate via POST /api/v1/users first.",
             )
         user_id = request.user_id
     else:
@@ -311,7 +354,8 @@ async def create_key(
         id=str(key_id),
         workspace_id=workspace_id,
         key_hash=key_hash,
-        key_prefix=key_prefix(api_key),
+        key_prefix=key_format.fingerprint(api_key),
+        key_suffix=key_suffix(api_key),
         key_name=request.key_name,
         user_id=user_id,
         expires_at=request.expires_at,
@@ -319,6 +363,8 @@ async def create_key(
         exclude_from_budget=request.exclude_from_budget,
         reject_user_mismatch=request.reject_user_mismatch,
         capture_agent_telemetry=request.capture_agent_telemetry,
+        is_service_key=request.is_service_key,
+        end_user_budget_id=request.end_user_budget_id,
         metadata_=request.metadata,
     )
 
@@ -357,7 +403,7 @@ async def list_keys(
     statement = (
         select(APIKey)
         .join(Workspace, col(Workspace.id) == col(APIKey.workspace_id))
-        .where(col(Workspace.organization_id) == organization_id)
+        .where(col(Workspace.organization_id) == organization_id, NOT_INTERNAL)
     )
     if workspace_id is not None:
         statement = statement.where(col(APIKey.workspace_id) == workspace_id)
@@ -389,12 +435,16 @@ async def update_key(
     db: Annotated[AsyncSession, Depends(get_db)],
     config: Annotated[GatewayConfig, Depends(get_config)],
     organization_id: CallerOrganization,
+    budgets: BudgetServiceDep,
 ) -> KeyInfo:
     """Update an API key in the caller's organization.
 
     Requires master key authentication.
     """
     key = await _load_key_in_organization(db, key_id, organization_id)
+    # Before the key is changed, for the reason create_key gives.
+    if request.end_user_budget_id is not None:
+        await budgets.require_end_user_budget(request.end_user_budget_id)
 
     # Tri-state via model_fields_set, like allowed_models below: both columns
     # are nullable and the dashboard's edit form sends null to clear them
@@ -428,6 +478,10 @@ async def update_key(
             if not is_allowlist_subset(new_allowed, user_default):
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_KEY_EXCEEDS_USER_DETAIL)
         key.allowed_models = new_allowed
+    if request.is_service_key is not None:
+        key.is_service_key = request.is_service_key
+    if "end_user_budget_id" in request.model_fields_set:
+        key.end_user_budget_id = request.end_user_budget_id
     if request.metadata is not None:
         key.metadata_ = request.metadata
 
@@ -449,6 +503,7 @@ async def rotate_key(
     key_id: str,
     db: Annotated[AsyncSession, Depends(get_db)],
     organization_id: CallerOrganization,
+    key_format: ApiKeyFormatPortDep,
 ) -> CreateKeyResponse:
     """Rotate an API key's secret in place, within the caller's organization.
 
@@ -461,9 +516,10 @@ async def rotate_key(
     """
     key = await _load_key_in_organization(db, key_id, organization_id)
 
-    new_api_key = generate_api_key()
+    new_api_key = key_format.mint()
     key.key_hash = hash_key(new_api_key)
-    key.key_prefix = key_prefix(new_api_key)
+    key.key_prefix = key_format.fingerprint(new_api_key)
+    key.key_suffix = key_suffix(new_api_key)
     key.last_used_at = None
 
     try:

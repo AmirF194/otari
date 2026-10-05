@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { useAuth } from "@/features/auth/AuthContext"
 import { Login } from "@/features/auth/Login"
+import { API_ROOT } from "@/shared/api/client"
 import { DeploymentProvider } from "@/shared/hooks/useDeployment"
 import { TELEMETRY_EVENTS } from "@/shared/telemetry/events"
 import { bootstrap } from "@/tests/fixtures"
@@ -28,12 +29,14 @@ function Mounted({
   mailReady = false,
   maintenanceMode = false,
   oauthProviders = [],
+  openSignup = false,
 }: {
   children: React.ReactNode
   signInMethods?: ("master_key" | "password" | "passkey")[]
   mailReady?: boolean
   maintenanceMode?: boolean
   oauthProviders?: string[]
+  openSignup?: boolean
 }) {
   return (
     <AppProviders>
@@ -43,6 +46,7 @@ function Mounted({
           mail_ready: mailReady,
           maintenance_mode: maintenanceMode,
           oauth_providers: oauthProviders,
+          open_signup: openSignup,
         })}
       >
         {children}
@@ -74,7 +78,23 @@ function jsonResponse(body: unknown, status = 200): Response {
   })
 }
 
+vi.mock("@/features/auth/overlayPublicAuthFields", () => ({
+  PublicAuthFields: ({ page, isBusy }: { page: string; isBusy: boolean }) => (
+    <p>{`fields for ${page}, ${isBusy ? "busy" : "idle"}`}</p>
+  ),
+}))
+
 describe("Login", () => {
+  it("renders the edition's own fields ahead of the credential, idle until a request is out", () => {
+    render(
+      <Mounted signInMethods={["password"]}>
+        <Login />
+      </Mounted>,
+    )
+
+    expect(screen.getByText("fields for login, idle")).toBeInTheDocument()
+  })
+
   afterEach(() => {
     vi.restoreAllMocks()
     window.localStorage.clear()
@@ -98,7 +118,7 @@ describe("Login", () => {
     expect(await screen.findByText("SIGNED IN")).toBeInTheDocument()
 
     const [url, init] = fetchMock.mock.calls[0]
-    expect(url).toBe("/v1/auth/session")
+    expect(url).toBe(`${API_ROOT}/auth/session`)
     expect(init?.method).toBe("POST")
     expect(init?.body).toBe(JSON.stringify({ master_key: "sk-correct" }))
     // The raw key must not land in any JS-readable storage.
@@ -111,7 +131,7 @@ describe("Login", () => {
     )
   })
 
-  it("offers no signup or recovery link on a gateway that cannot send mail", () => {
+  it("offers no signup or recovery link on a gateway that cannot send mail", async () => {
     render(
       <Mounted signInMethods={["password"]}>
         <Harness />
@@ -124,10 +144,14 @@ describe("Login", () => {
     expect(
       screen.queryByRole("link", { name: /Forgot your password/ }),
     ).toBeNull()
+    // Opened last: the verification link lives in the Help popover, which
+    // renders nothing while closed, so asserting its absence from the closed
+    // page would pass whatever the bootstrap said.
+    await userEvent.setup().click(screen.getByRole("button", { name: "Help" }))
     expect(screen.queryByRole("link", { name: /verification link/ })).toBeNull()
   })
 
-  it("links to signup, recovery and a fresh verification link once mail works", () => {
+  it("links to signup, recovery and a fresh verification link once mail works", async () => {
     render(
       <Mounted signInMethods={["password"]} mailReady>
         <Harness />
@@ -140,35 +164,144 @@ describe("Login", () => {
     expect(
       screen.getByRole("link", { name: /Forgot your password/ }),
     ).toHaveAttribute("href", "#/recover-password")
+    await userEvent.setup().click(screen.getByRole("button", { name: "Help" }))
     expect(
       screen.getByRole("link", { name: /verification link/ }),
     ).toHaveAttribute("href", "#/resend-verification")
   })
 
-  it("hides recovery on an unclaimed deployment, where no password exists to reset", () => {
+  it("hides recovery on an unclaimed deployment, where no password exists to reset", async () => {
     render(
       <Mounted mailReady>
         <Harness />
       </Mounted>,
     )
 
+    // Signup still stands: a member an admin added by address claims it here.
+    // Asserted before Help opens, because the open popover is a dialog and
+    // takes the rest of the page out of the accessibility tree behind it.
+    expect(
+      screen.getByRole("link", { name: /Set your password/ }),
+    ).toBeInTheDocument()
+    // Both recovery links sit in the Help popover on this branch, so it has to
+    // be open for their absence to mean anything.
+    await userEvent.setup().click(screen.getByRole("button", { name: "Help" }))
     expect(
       screen.queryByRole("link", { name: /Forgot your password/ }),
     ).toBeNull()
     expect(screen.queryByRole("link", { name: /verification link/ })).toBeNull()
-    // Signup still stands: a member an admin added by address claims it here.
+  })
+
+  // otari-ai#2100. A deployment publishes both typed credentials whenever a
+  // member holds a password on one its operator never claimed, and the screen
+  // used to render the pair as either/or: the master-key box, and nowhere to
+  // put the password that would have worked.
+  it("shows the password form when both typed credentials are published", () => {
+    render(
+      <Mounted signInMethods={["master_key", "password"]}>
+        <Harness />
+      </Mounted>,
+    )
+
+    expect(screen.getByLabelText("Email")).toBeInTheDocument()
+    expect(screen.getByLabelText("Password")).toBeInTheDocument()
+    expect(screen.queryByLabelText("Master key")).toBeNull()
+  })
+
+  it("swaps to the master-key box on request, and back", async () => {
+    const user = userEvent.setup()
+    render(
+      <Mounted signInMethods={["master_key", "password"]}>
+        <Harness />
+      </Mounted>,
+    )
+
+    await user.click(
+      screen.getByRole("button", { name: "Use your master key" }),
+    )
+
+    expect(screen.getByLabelText("Master key")).toBeInTheDocument()
+    expect(screen.queryByLabelText("Email")).toBeNull()
+
+    await user.click(
+      screen.getByRole("button", { name: "Use your email and password" }),
+    )
+
+    expect(screen.getByLabelText("Email")).toBeInTheDocument()
+  })
+
+  it("signs in with a member password on a deployment nobody has claimed", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ user_id: "u1" }), { status: 200 }),
+      )
+    const user = userEvent.setup()
+    render(
+      <Mounted signInMethods={["master_key", "password"]}>
+        <Harness />
+      </Mounted>,
+    )
+
+    await user.type(screen.getByLabelText("Email"), "member@example.com")
+    await user.type(screen.getByLabelText("Password"), "correct-horse")
+    await user.click(screen.getByRole("button", { name: "Sign in" }))
+
+    expect(await screen.findByText("SIGNED IN")).toBeInTheDocument()
+    const body = String(
+      (fetchSpy.mock.calls[0]?.[1] as RequestInit | undefined)?.body,
+    )
+    expect(JSON.parse(body)).toEqual({
+      email: "member@example.com",
+      password: "correct-horse",
+    })
+  })
+
+  it("offers no swap when the gateway publishes one typed credential", () => {
+    render(
+      <Mounted signInMethods={["password"]}>
+        <Harness />
+      </Mounted>,
+    )
+
     expect(
-      screen.getByRole("link", { name: /Set your password/ }),
+      screen.queryByRole("button", { name: /Use your master key/ }),
+    ).toBeNull()
+  })
+
+  it("offers recovery to a member holding a password on an unclaimed deployment", () => {
+    render(
+      <Mounted mailReady signInMethods={["master_key", "password"]}>
+        <Harness />
+      </Mounted>,
+    )
+
+    expect(
+      screen.getByRole("link", { name: /Forgot your password/ }),
     ).toBeInTheDocument()
   })
 
-  it("links to the auth-free welcome page", () => {
+  it("invites registration rather than a claim where signup is open", () => {
+    render(
+      <Mounted mailReady openSignup>
+        <Harness />
+      </Mounted>,
+    )
+
+    expect(
+      screen.getByRole("link", { name: /Create an account/ }),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: /Set your password/ })).toBeNull()
+  })
+
+  it("links to the auth-free welcome page", async () => {
     render(
       <Mounted>
         <Harness />
       </Mounted>,
     )
 
+    await userEvent.setup().click(screen.getByRole("button", { name: "Help" }))
     const link = screen.getByRole("link", { name: /welcome/i })
     expect(link).toHaveAttribute("href", "/welcome")
   })
@@ -177,26 +310,28 @@ describe("Login", () => {
   // to name the credential the form above actually took. One block served both
   // branches before, telling anyone signing in with an email and password that
   // their "master key" was exchanged for a cookie.
-  it("names the master key in the credential note on an unclaimed deployment", () => {
+  it("names the master key in the credential note on an unclaimed deployment", async () => {
     render(
       <Mounted>
         <Harness />
       </Mounted>,
     )
 
+    await userEvent.setup().click(screen.getByRole("button", { name: "Help" }))
     expect(
       screen.getByText(/master key/, { selector: "a" }),
     ).toBeInTheDocument()
     expect(screen.queryByText(/^Your password is sent once/)).toBeNull()
   })
 
-  it("names the password in the credential note once the deployment is claimed", () => {
+  it("names the password in the credential note once the deployment is claimed", async () => {
     render(
       <Mounted signInMethods={["password"]}>
         <Harness />
       </Mounted>,
     )
 
+    await userEvent.setup().click(screen.getByRole("button", { name: "Help" }))
     expect(
       screen.getByText(/Your password is sent once and exchanged/),
     ).toBeInTheDocument()
@@ -250,7 +385,7 @@ describe("Login", () => {
     expect(await screen.findByText("SIGNED IN")).toBeInTheDocument()
 
     const [url, init] = fetchMock.mock.calls[0]
-    expect(url).toBe("/v1/auth/session")
+    expect(url).toBe(`${API_ROOT}/auth/session`)
     expect(init?.body).toBe(
       JSON.stringify({
         email: "operator@example.com",
@@ -309,7 +444,7 @@ describe("Login", () => {
     await user.click(screen.getByRole("button", { name: "Sign in" }))
 
     expect(await screen.findByText("SIGNED IN")).toBeInTheDocument()
-    expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/auth/session")
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`${API_ROOT}/auth/session`)
   })
 
   it("reports a malformed email locally instead of using browser validation", async () => {
@@ -418,6 +553,66 @@ describe("Login", () => {
     expect(screen.queryByText("SIGNED IN")).not.toBeInTheDocument()
   })
 
+  it("offers a fresh verification link when sign-in is refused for an unverified address", async () => {
+    // The password path's only 403 is the unverified-address refusal, whose
+    // wording tells the reader to request a new verification email. Without
+    // the link the sentence is a dead end.
+    const refusal =
+      "Verify your email before signing in; request a new verification email if yours expired"
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({ detail: refusal }, 403),
+    )
+    const user = userEvent.setup()
+
+    render(
+      <Mounted signInMethods={["password"]} mailReady>
+        <Harness />
+      </Mounted>,
+    )
+
+    await user.type(screen.getByLabelText("Email"), "member@example.com")
+    await user.type(screen.getByLabelText("Password"), "right-but-unverified")
+    await user.click(screen.getByRole("button", { name: "Sign in" }))
+
+    expect(await screen.findByText(refusal)).toBeInTheDocument()
+    expect(
+      screen.getByRole("link", { name: "Send a new verification link" }),
+    ).toHaveAttribute("href", "#/resend-verification")
+
+    // The link describes the refusal, not the page, so typing takes both away.
+    await user.type(screen.getByLabelText("Password"), "x")
+    expect(screen.queryByText(refusal)).toBeNull()
+    expect(
+      screen.queryByRole("link", { name: "Send a new verification link" }),
+    ).toBeNull()
+  })
+
+  it("renders the unverified refusal without a link on a gateway that cannot mail one", async () => {
+    // The resend page starts by sending a message, so on a mailless gateway
+    // the link would lead to a flow that can only 503. The refusal still
+    // renders; hiding the action is the same call `mail_ready` already makes
+    // for signup and recovery.
+    const refusal =
+      "Verify your email before signing in; request a new verification email if yours expired"
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({ detail: refusal }, 403),
+    )
+    const user = userEvent.setup()
+
+    render(
+      <Mounted signInMethods={["password"]}>
+        <Harness />
+      </Mounted>,
+    )
+
+    await user.type(screen.getByLabelText("Email"), "member@example.com")
+    await user.type(screen.getByLabelText("Password"), "right-but-unverified")
+    await user.click(screen.getByRole("button", { name: "Sign in" }))
+
+    expect(await screen.findByText(refusal)).toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: /verification link/ })).toBeNull()
+  })
+
   it("surfaces the retirement message when a stale client posts a master key to a claimed deployment", async () => {
     // A 403 is not a wrong credential, and rendering "Invalid master key." over
     // it (what this screen did before it could post a password) tells the
@@ -440,10 +635,12 @@ describe("Login", () => {
 
     expect(await screen.findByText(retired)).toBeInTheDocument()
     expect(screen.queryByText("Invalid master key.")).not.toBeInTheDocument()
+    // A master-key 403 is retirement, not an unverified address.
+    expect(screen.queryByRole("link", { name: /verification link/ })).toBeNull()
   })
 
   it("offers no credential box when the gateway reports it cannot mint a session", async () => {
-    // `/v1/bootstrap` answers [] when it cannot reach its database. A form here
+    // /api/v1/bootstrap answers [] when it cannot reach its database. A form here
     // could only ever be refused, and on a claimed deployment the fallback form
     // would be the master-key one, whose refusal reads as "wrong key".
     render(
@@ -843,10 +1040,10 @@ describe("Login with a passkey", () => {
       .spyOn(globalThis, "fetch")
       .mockImplementation((input: RequestInfo | URL) => {
         const url = String(input)
-        if (url === "/v1/auth/webauthn/authenticate/options") {
+        if (url === `${API_ROOT}/auth/webauthn/authenticate/options`) {
           return Promise.resolve(jsonResponse({ challenge: "Y2hhbGxlbmdl" }))
         }
-        if (url === "/v1/auth/webauthn/authenticate") {
+        if (url === `${API_ROOT}/auth/webauthn/authenticate`) {
           return Promise.resolve(verify())
         }
         // Anything else the shell asks for (the build poll, say) answers
@@ -890,7 +1087,9 @@ describe("Login with a passkey", () => {
     await user.keyboard("{Enter}")
 
     expect(
-      fetchMock.mock.calls.some(([url]) => String(url) === "/v1/auth/session"),
+      fetchMock.mock.calls.some(
+        ([url]) => String(url) === `${API_ROOT}/auth/session`,
+      ),
     ).toBe(false)
 
     releaseCeremony(assertion())
@@ -1157,7 +1356,7 @@ describe("Login with a passkey", () => {
 
       await waitFor(() => expect(assign).toHaveBeenCalled())
       expect(fetchMock.mock.calls[0]?.[0]).toBe(
-        "/v1/auth/oauth/google/authorize",
+        `${API_ROOT}/auth/oauth/google/authorize`,
       )
       // Stored *before* the navigation, or the callback would have nothing to
       // compare the returned state against.
@@ -1215,7 +1414,7 @@ describe("Login with a passkey", () => {
 
       expect(
         fetchMock.mock.calls.some(
-          ([url]) => String(url) === "/v1/auth/session",
+          ([url]) => String(url) === `${API_ROOT}/auth/session`,
         ),
       ).toBe(false)
       expect(assign).not.toHaveBeenCalled()

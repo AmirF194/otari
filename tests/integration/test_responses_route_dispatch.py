@@ -1,4 +1,4 @@
-"""Route-level tests for the /v1/responses endpoint wiring.
+"""Route-level tests for the /api/v1/responses endpoint wiring.
 
 Mirror of :mod:`tests.integration.test_messages_route_dispatch` for the OpenAI
 Responses API surface: tool extraction, mutual-exclusivity validation,
@@ -25,6 +25,8 @@ from openai.types.responses import (
     ResponseUsage,
 )
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
+
+from gateway.core.config import API_ROOT, GatewayConfig
 
 _MODEL = "openai:gpt-4o-mini"
 
@@ -71,7 +73,7 @@ def test_no_tools_falls_through_to_plain_aresponses(
 
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={"model": _MODEL, "input": "hi"},
             headers=api_key_header,
         )
@@ -100,7 +102,7 @@ def test_context_management_and_compaction_output_pass_through(
 
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "hi",
@@ -139,7 +141,7 @@ def test_bare_string_input_not_corrupted_by_normalization(
     prompt = "What is the capital of France?"
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={"model": _MODEL, "input": prompt},
             headers=api_key_header,
         )
@@ -161,7 +163,7 @@ def test_codex_metadata_is_forwarded_to_openai_provider(
 
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "client_metadata": {"session_id": "session_123"},
@@ -228,7 +230,7 @@ def test_client_cannot_smuggle_codex_extra_body(
 
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "safe input",
@@ -257,7 +259,7 @@ def test_gateway_internal_fields_are_stripped_from_upstream_kwargs(
 
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "hi",
@@ -287,7 +289,7 @@ def test_user_supplied_chat_shape_tools_get_flattened_to_responses_shape(
 
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "do it",
@@ -324,7 +326,9 @@ def test_mcp_servers_dispatches_through_responses_tool_loop(
 ) -> None:
     seen: dict[str, Any] = {}
 
-    async def fake_loop(*, completion_kwargs: Any, pool: Any, max_iterations: int) -> Response:
+    async def fake_loop(
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
+    ) -> Response:
         seen["completion_kwargs"] = completion_kwargs
         seen["pool"] = pool
         seen["max_iterations"] = max_iterations
@@ -347,7 +351,7 @@ def test_mcp_servers_dispatches_through_responses_tool_loop(
         patch("gateway.services.mcp_client.MCPClientPool.__aexit__", new=AsyncMock(return_value=None)),
     ):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "hi",
@@ -370,7 +374,9 @@ def test_code_execution_dispatches_through_sandbox_backend(
 
     pool_seen: list[Any] = []
 
-    async def fake_loop(*, completion_kwargs: Any, pool: Any, max_iterations: int) -> Response:
+    async def fake_loop(
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
+    ) -> Response:
         pool_seen.append(pool)
         return _response()
 
@@ -388,7 +394,7 @@ def test_code_execution_dispatches_through_sandbox_backend(
         ),
     ):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "compute",
@@ -401,16 +407,22 @@ def test_code_execution_dispatches_through_sandbox_backend(
     assert pool_seen == [fake_backend]
 
 
-def test_web_search_dispatches_through_web_search_backend(
+@pytest.mark.parametrize("tool_type", ["otari_web_search", "otari_web_fetch"])
+def test_managed_web_tool_dispatches_through_web_retrieval_backend(
     client: TestClient,
     api_key_header: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
+    test_config: GatewayConfig,
+    tool_type: str,
 ) -> None:
+    monkeypatch.setattr(test_config, "web_fetch_enabled", True)
     monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://127.0.0.1:9999/search")
 
     pool_seen: list[Any] = []
 
-    async def fake_loop(*, completion_kwargs: Any, pool: Any, max_iterations: int) -> Response:
+    async def fake_loop(
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
+    ) -> Response:
         pool_seen.append(pool)
         return _response()
 
@@ -424,20 +436,101 @@ def test_web_search_dispatches_through_web_search_backend(
 
     with (
         patch("gateway.api.routes.responses.responses_tool_loop", new=fake_loop),
-        patch("gateway.api.routes._pipeline._build_web_search_backend", return_value=fake_builder_result),
+        patch("gateway.api.routes._pipeline._build_web_retrieval_backend", return_value=fake_builder_result),
     ):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "search",
-                "tools": [{"type": "otari_web_search"}],
+                "tools": [{"type": tool_type}],
             },
             headers=api_key_header,
         )
 
     assert resp.status_code == 200, resp.text
     assert pool_seen == [fake_backend]
+
+
+def test_web_search_max_uses_reaches_the_responses_tool_loop(
+    client: TestClient,
+    api_key_header: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap the caller declared arrives at this format's loop, by value.
+
+    Counterpart to
+    ``test_messages_route_dispatch.test_intercept_routes_provider_keywords_to_the_gateway_backend``:
+    the adapter's ``use_budget`` plumbing is only reachable through the route,
+    so the unit tests that call the loop functions directly cannot cover it.
+    """
+    monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://127.0.0.1:9999/search")
+
+    budgets_seen: list[Any] = []
+
+    async def fake_loop(
+        *,
+        completion_kwargs: Any,
+        pool: Any,
+        max_iterations: int,
+        use_budget: Any = None,
+        native_tools: frozenset[str] = frozenset(),
+    ) -> Response:
+        budgets_seen.append(use_budget)
+        return _response()
+
+    fake_backend = AsyncMock()
+    fake_backend.purpose_hints = lambda: []
+
+    fake_builder_result = AsyncMock(
+        __aenter__=AsyncMock(return_value=fake_backend),
+        __aexit__=AsyncMock(return_value=None),
+    )
+
+    with (
+        patch("gateway.api.routes.responses.responses_tool_loop", new=fake_loop),
+        patch("gateway.api.routes._pipeline._build_web_retrieval_backend", return_value=fake_builder_result),
+    ):
+        resp = client.post(
+            f"{API_ROOT}/responses",
+            json={
+                "model": _MODEL,
+                "input": "search",
+                "tools": [{"type": "otari_web_search", "max_uses": 2}],
+            },
+            headers=api_key_header,
+        )
+
+    assert resp.status_code == 200, resp.text
+    budget = budgets_seen[0]
+    assert budget is not None, "the cap never reached the loop"
+    # Arrived by value, not just as "some budget": spending it exactly twice exhausts it.
+    budget.record("results")
+    assert not budget.exhausted()
+    budget.record("results")
+    assert budget.exhausted()
+
+
+def test_invalid_web_search_max_uses_is_rejected_by_this_format(
+    client: TestClient,
+    api_key_header: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed cap is a 400 in this format's own envelope, not an uncapped request."""
+    monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://127.0.0.1:9999/search")
+
+    resp = client.post(
+        f"{API_ROOT}/responses",
+        json={
+            "model": _MODEL,
+            "input": "search",
+            "tools": [{"type": "otari_web_search", "max_uses": -1}],
+        },
+        headers=api_key_header,
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == "web_search max_uses must be a non-negative integer"
 
 
 # ---------- provider-named keyword passthrough ----------
@@ -463,7 +556,7 @@ def test_provider_code_execution_passes_through_to_upstream(
 
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={"model": _MODEL, "input": "compute", "tools": [{"type": tool_type}]},
             headers=api_key_header,
         )
@@ -474,15 +567,17 @@ def test_provider_code_execution_passes_through_to_upstream(
     assert {t["type"] for t in forwarded} == {tool_type}
 
 
-@pytest.mark.parametrize("tool_type", ["web_search", "web_search_20250305"])
-def test_provider_web_search_passes_through_to_upstream(
+@pytest.mark.parametrize(
+    "tool_type",
+    ["web_search", "web_search_20250305", "web_fetch_20250910", "web_fetch_20260209"],
+)
+def test_provider_web_tool_passes_through_to_upstream(
     client: TestClient,
     api_key_header: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
     tool_type: str,
 ) -> None:
-    """Provider-named web_search keywords pass through to the provider even
-    when no gateway web_search backend is configured."""
+    """Provider-native web declarations pass through to the provider."""
     monkeypatch.delenv("OTARI_WEB_SEARCH_URL", raising=False)
     captured: dict[str, Any] = {}
 
@@ -492,7 +587,7 @@ def test_provider_web_search_passes_through_to_upstream(
 
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={"model": _MODEL, "input": "search", "tools": [{"type": tool_type}]},
             headers=api_key_header,
         )
@@ -513,7 +608,7 @@ def test_code_execution_without_sandbox_env_returns_400(
 ) -> None:
     monkeypatch.delenv("OTARI_SANDBOX_URL", raising=False)
     resp = client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={
             "model": _MODEL,
             "input": "hi",
@@ -532,7 +627,7 @@ def test_code_execution_combined_with_mcp_servers_returns_400(
 ) -> None:
     monkeypatch.setenv("OTARI_SANDBOX_URL", "http://127.0.0.1:9999/sandbox")
     resp = client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={
             "model": _MODEL,
             "input": "hi",
@@ -553,7 +648,7 @@ def test_web_search_combined_with_sandbox_returns_400(
     monkeypatch.setenv("OTARI_SANDBOX_URL", "http://127.0.0.1:9999/sandbox")
     monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://127.0.0.1:9999/search")
     resp = client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={
             "model": _MODEL,
             "input": "hi",
@@ -565,7 +660,7 @@ def test_web_search_combined_with_sandbox_returns_400(
         headers=api_key_header,
     )
     assert resp.status_code == 400
-    assert "otari_web_search cannot be combined" in resp.json()["detail"]
+    assert "cannot be combined with otari_code_execution" in resp.json()["detail"]
 
 
 # ---------- gateway-side runtime errors ----------
@@ -580,7 +675,9 @@ def test_max_tool_iterations_exceeded_returns_422(
 
     from gateway.services.mcp_loop_responses import MaxToolIterationsExceeded
 
-    async def fake_loop(*, completion_kwargs: Any, pool: Any, max_iterations: int) -> Response:
+    async def fake_loop(
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
+    ) -> Response:
         raise MaxToolIterationsExceeded(f"Exceeded max_tool_iterations={max_iterations}")
 
     fake_backend = AsyncMock()
@@ -597,7 +694,7 @@ def test_max_tool_iterations_exceeded_returns_422(
         ),
     ):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "go",
@@ -611,21 +708,27 @@ def test_max_tool_iterations_exceeded_returns_422(
     assert "max_tool_iterations" in resp.json()["detail"]
 
 
+@pytest.mark.parametrize("unavailable", [False, True])
 def test_sandbox_unreachable_returns_502(
     client: TestClient,
     api_key_header: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
+    unavailable: bool,
 ) -> None:
     monkeypatch.setenv("OTARI_SANDBOX_URL", "http://127.0.0.1:9999/sandbox")
 
-    from gateway.services.sandbox_backend import SandboxNotReachableError
+    from gateway.services.sandbox_backend import SandboxNotReachableError, SandboxUnavailableError
 
     with patch(
         "gateway.api.routes._pipeline.SandboxBackend",
-        return_value=AsyncMock(__aenter__=AsyncMock(side_effect=SandboxNotReachableError("boom"))),
+        return_value=AsyncMock(
+            __aenter__=AsyncMock(
+                side_effect=SandboxUnavailableError("15") if unavailable else SandboxNotReachableError("boom")
+            )
+        ),
     ):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "go",
@@ -634,8 +737,9 @@ def test_sandbox_unreachable_returns_502(
             headers=api_key_header,
         )
 
-    assert resp.status_code == 502
-    assert "sandbox unreachable" in resp.json()["detail"]
+    assert resp.status_code == (503 if unavailable else 502)
+    assert resp.headers.get("Retry-After") == ("15" if unavailable else None)
+    assert ("sandbox temporarily unavailable" if unavailable else "sandbox unreachable") in resp.json()["detail"]
 
 
 # ---------- streaming dispatch ----------
@@ -699,7 +803,7 @@ def test_stream_no_tools_returns_sse_response(
         patch("gateway.api.routes.responses.responses_tool_loop_stream", new=fake_loop_stream),
     ):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={"model": _MODEL, "input": "hi", "stream": True},
             headers=api_key_header,
         )
@@ -745,7 +849,7 @@ def test_stream_context_management_and_compaction_events_pass_through(
 
     with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "hi",
@@ -757,16 +861,8 @@ def test_stream_context_management_and_compaction_events_pass_through(
 
     assert resp.status_code == 200, resp.text
     assert captured["context_management"] == context_management
-    payloads = [
-        json.loads(line.removeprefix("data: "))
-        for line in resp.iter_lines()
-        if line.startswith("data: {")
-    ]
-    compactions = [
-        payload
-        for payload in payloads
-        if payload.get("item", {}).get("type") == "compaction"
-    ]
+    payloads = [json.loads(line.removeprefix("data: ")) for line in resp.iter_lines() if line.startswith("data: {")]
+    compactions = [payload for payload in payloads if payload.get("item", {}).get("type") == "compaction"]
     assert [payload["type"] for payload in compactions] == [
         "response.output_item.added",
         "response.output_item.done",
@@ -787,7 +883,7 @@ def test_stream_mcp_servers_dispatches_through_tool_loop_stream(
     seen: dict[str, Any] = {}
 
     async def fake_loop_stream(
-        *, completion_kwargs: Any, pool: Any, max_iterations: int
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
     ) -> AsyncIterator[ResponseStreamEvent]:
         seen["pool"] = pool
         seen["max_iterations"] = max_iterations
@@ -810,7 +906,7 @@ def test_stream_mcp_servers_dispatches_through_tool_loop_stream(
         patch("gateway.services.mcp_client.MCPClientPool.__aexit__", new=AsyncMock(return_value=None)),
     ):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "hi",
@@ -824,6 +920,78 @@ def test_stream_mcp_servers_dispatches_through_tool_loop_stream(
     assert resp.headers["content-type"].startswith("text/event-stream")
     assert seen.get("pool") is not None, "responses_tool_loop_stream was not invoked"
     assert plain_aresponses_called is False
+
+
+def _assert_stream_ended_cleanly(resp: Any) -> None:
+    assert resp.status_code == 200, resp.text
+    lines = [line for line in resp.text.splitlines() if line]
+    assert "event: error" not in lines, resp.text
+    assert lines[-1] == "data: [DONE]", resp.text
+    assert any('"response.completed"' in line for line in lines), resp.text
+
+
+def test_stream_mcp_pool_close_failure_does_not_cut_off_the_stream(
+    client: TestClient,
+    api_key_header: dict[str, str],
+) -> None:
+    async def fake_loop_stream(
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        yield _stream_completed_event()
+
+    with (
+        patch("gateway.api.routes.responses.responses_tool_loop_stream", new=fake_loop_stream),
+        patch(
+            "gateway.services.mcp_client.MCPClientPool.__aenter__",
+            new=AsyncMock(return_value=AsyncMock(purpose_hints=lambda: [])),
+        ),
+        patch(
+            "gateway.services.mcp_client.MCPClientPool.__aexit__",
+            new=AsyncMock(side_effect=RuntimeError("the MCP server hung up")),
+        ),
+    ):
+        resp = client.post(
+            f"{API_ROOT}/responses",
+            json={
+                "model": _MODEL,
+                "input": "hi",
+                "stream": True,
+                "mcp_servers": [{"name": "test", "url": "http://127.0.0.1:9999/mcp"}],
+            },
+            headers=api_key_header,
+        )
+
+    _assert_stream_ended_cleanly(resp)
+
+
+def test_stream_sandbox_close_failure_does_not_cut_off_the_stream(
+    client: TestClient,
+    api_key_header: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTARI_SANDBOX_URL", "http://127.0.0.1:9999/sandbox")
+
+    async def fake_loop_stream(
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        yield _stream_completed_event()
+
+    fake_backend = AsyncMock()
+    fake_backend.purpose_hints = lambda: []
+    fake_backend.__aenter__ = AsyncMock(return_value=fake_backend)
+    fake_backend.__aexit__ = AsyncMock(side_effect=RuntimeError("the sandbox hung up"))
+
+    with (
+        patch("gateway.api.routes.responses.responses_tool_loop_stream", new=fake_loop_stream),
+        patch("gateway.api.routes._pipeline.SandboxBackend", return_value=fake_backend),
+    ):
+        resp = client.post(
+            f"{API_ROOT}/responses",
+            json={"model": _MODEL, "input": "compute", "stream": True, "tools": [{"type": "otari_code_execution"}]},
+            headers=api_key_header,
+        )
+
+    _assert_stream_ended_cleanly(resp)
 
 
 def test_stream_code_execution_dispatches_through_sandbox(
@@ -845,7 +1013,7 @@ def test_stream_code_execution_dispatches_through_sandbox(
     pool_seen: list[Any] = []
 
     async def fake_loop_stream(
-        *, completion_kwargs: Any, pool: Any, max_iterations: int
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
     ) -> AsyncIterator[ResponseStreamEvent]:
         pool_seen.append(pool)
         yield _stream_completed_event()
@@ -860,7 +1028,7 @@ def test_stream_code_execution_dispatches_through_sandbox(
         patch("gateway.api.routes._pipeline.SandboxBackend", return_value=fake_backend),
     ):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "compute",
@@ -875,10 +1043,12 @@ def test_stream_code_execution_dispatches_through_sandbox(
     assert pool_seen == [fake_backend], "tool loop didn't receive the SandboxBackend"
 
 
+@pytest.mark.parametrize("unavailable", [False, True])
 def test_stream_sandbox_unreachable_returns_502(
     client: TestClient,
     api_key_header: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
+    unavailable: bool,
 ) -> None:
     """Regression test for the eager-open error mapping bug: when the
     streaming sandbox eager-open fails, the route must return a 502 with the
@@ -887,14 +1057,18 @@ def test_stream_sandbox_unreachable_returns_502(
     """
     monkeypatch.setenv("OTARI_SANDBOX_URL", "http://127.0.0.1:9999/sandbox")
 
-    from gateway.services.sandbox_backend import SandboxNotReachableError
+    from gateway.services.sandbox_backend import SandboxNotReachableError, SandboxUnavailableError
 
     with patch(
         "gateway.api.routes._pipeline.SandboxBackend",
-        return_value=AsyncMock(__aenter__=AsyncMock(side_effect=SandboxNotReachableError("boom"))),
+        return_value=AsyncMock(
+            __aenter__=AsyncMock(
+                side_effect=SandboxUnavailableError("15") if unavailable else SandboxNotReachableError("boom")
+            )
+        ),
     ):
         resp = client.post(
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": _MODEL,
                 "input": "go",
@@ -904,8 +1078,9 @@ def test_stream_sandbox_unreachable_returns_502(
             headers=api_key_header,
         )
 
-    assert resp.status_code == 502
-    assert "sandbox unreachable" in resp.json()["detail"]
+    assert resp.status_code == (503 if unavailable else 502)
+    assert resp.headers.get("Retry-After") == ("15" if unavailable else None)
+    assert ("sandbox temporarily unavailable" if unavailable else "sandbox unreachable") in resp.json()["detail"]
 
 
 # ---------- provider-support guard (pre-existing behavior) ----------
@@ -920,7 +1095,7 @@ def test_provider_without_responses_support_returns_400(
     might be bypassed by the tool dispatch path.
     """
     resp = client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={"model": "anthropic:claude-3-5-sonnet-20241022", "input": "hi"},
         headers=api_key_header,
     )

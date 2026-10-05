@@ -598,7 +598,7 @@ class TestDiscoveryStallGuards:
     async def test_concurrent_callers_share_one_upstream_call(self) -> None:
         """Concurrent discoveries of the same provider dial it once (single-flight).
 
-        This is what stops /v1/models and /v1/models/discoverable from each firing
+        This is what stops /api/v1/models and /api/v1/models/discoverable from each firing
         a full fanout when the Models page mounts both at once.
         """
         config = self._config({"openai": {"api_key": "sk-test"}})
@@ -650,9 +650,7 @@ class TestDiscoveryStallGuards:
             await asyncio.sleep(0.02)
             return ProviderDiscovery(provider="p", models=[], error="NEW")
 
-        inflight = asyncio.ensure_future(
-            cache.get_or_discover("p", positive_ttl=300, negative_ttl=30, discover=stale)
-        )
+        inflight = asyncio.ensure_future(cache.get_or_discover("p", positive_ttl=300, negative_ttl=30, discover=stale))
         await asyncio.sleep(0.02)  # let the stale discovery register as in-flight
         cache.clear("p")  # a credential change invalidates it
         late = await cache.get_or_discover("p", positive_ttl=300, negative_ttl=30, discover=fresh)
@@ -682,7 +680,7 @@ class TestDiscoveryStallGuards:
     async def test_one_provider_raising_does_not_sink_the_listing(self) -> None:
         """A provider whose discovery raises is dropped/surfaced, never propagated.
 
-        discover_models_with_status feeds the operator's /v1/models/discoverable,
+        discover_models_with_status feeds the operator's /api/v1/models/discoverable,
         which awaits it with no guard, so an escaped exception must not 500 it.
         """
         config = self._config({"good": {"api_key": "x"}, "bad": {"api_key": "y"}})
@@ -711,9 +709,7 @@ class TestKeylessProviderConnection:
     """test_provider_credentials must honor the optional key for custom endpoints (otari#421)."""
 
     @pytest.mark.asyncio
-    async def test_keyless_custom_endpoint_supplies_placeholder(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_keyless_custom_endpoint_supplies_placeholder(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A keyless "Test connection" for a custom endpoint would otherwise be
         # rejected by any-llm with MissingApiKeyError; the ad-hoc test path injects
         # the same placeholder the saved path uses so the endpoint is dialed.
@@ -1051,6 +1047,46 @@ class TestBackgroundDiscovery:
             patch("gateway.services.model_discovery_service.alist_models") as mock_alist,
         ):
             result = await discover_all_models(config, serve_stale=True)
+
+        assert [model.id for _, model in result] == ["gpt-4o"]
+        mock_alist.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cached_only_never_dials_a_provider_never_checked(self) -> None:
+        """``cached_only`` is the opposite trade from ``serve_stale``.
+
+        A caller off the request path (the selector index rebuild) would
+        otherwise fan out to every configured provider on a timer, and would
+        dial even while ``model_cache_ttl_seconds`` is 0, whose whole meaning is
+        that the reads dial for themselves. An undialed provider reads as having
+        no models instead.
+        """
+        config = self._config()
+        cache = ModelCache()
+
+        with (
+            patch("gateway.services.model_discovery_service.get_model_cache", return_value=cache),
+            patch("gateway.services.model_discovery_service._supports_list_models", return_value=True),
+            patch("gateway.services.model_discovery_service.alist_models") as mock_alist,
+        ):
+            result = await discover_all_models(config, cached_only=True)
+
+        assert result == []
+        mock_alist.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cached_only_serves_an_expired_entry(self) -> None:
+        """What the cache holds is served whatever its age, since nothing refills it here."""
+        config = self._config()
+        cache = ModelCache()
+        cache.set("openai", [_make_model("gpt-4o")])
+        cache._store["openai"].cached_at = time.monotonic() - 10_000
+
+        with (
+            patch("gateway.services.model_discovery_service.get_model_cache", return_value=cache),
+            patch("gateway.services.model_discovery_service.alist_models") as mock_alist,
+        ):
+            result = await discover_all_models(config, cached_only=True)
 
         assert [model.id for _, model in result] == ["gpt-4o"]
         mock_alist.assert_not_called()

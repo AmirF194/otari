@@ -8,6 +8,7 @@ input items shape.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
@@ -28,14 +29,26 @@ from openai.types.responses.response_usage import InputTokensDetails, OutputToke
 
 from gateway.services import mcp_loop_responses as responses_loop_module
 from gateway.services.mcp_loop_responses import (
+    CODE_INTERPRETER_CALL_ID_PREFIX,
     MaxToolIterationsExceeded,
     responses_tool_loop,
     responses_tool_loop_stream,
 )
+from gateway.services.sandbox_backend import CODE_EXECUTION_TOOL_NAME, CodeExecution
 from gateway.services.tool_format import (
     inject_purpose_hints_responses,
     openai_to_responses_tools,
 )
+from gateway.services.tools import ToolUseBudget
+from gateway.services.web_retrieval_backend import WEB_SEARCH_TOOL_NAME
+from gateway.types.code_execution import ResultBlock
+
+_SEARCH = frozenset({WEB_SEARCH_TOOL_NAME})
+
+
+def _use_budget(max_uses: int) -> ToolUseBudget:
+    """A cap on the gateway's own searches, which is the tool these loops run."""
+    return ToolUseBudget(WEB_SEARCH_TOOL_NAME, max_uses)
 
 
 class _FakePool:
@@ -223,13 +236,66 @@ async def test_loop_executes_owned_function_call_and_completes(monkeypatch: pyte
     assert "function_call" in types
     assert "function_call_output" in types
     output_item = next(
-        item
-        for item in second_input
-        if isinstance(item, dict) and item.get("type") == "function_call_output"
+        item for item in second_input if isinstance(item, dict) and item.get("type") == "function_call_output"
     )
     assert output_item["call_id"] == "call_1"
     assert output_item["output"] == "ok"
     assert out.status == "completed"
+
+
+class _FakeSearchPool(_FakePool):
+    """A pool that owns ``web_search`` and buffers hits like the real search backend.
+
+    ``take_last_results`` is what marks it as the gateway's own search rather than
+    an MCP server that happens to expose the same tool name.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(tool_names=["web_search"], results={"web_search": "[1] Result\nhttps://a"})
+
+    def take_last_results(self) -> list[dict[str, Any]]:
+        return [{"url": "https://a", "title": "A"}]
+
+
+@pytest.mark.asyncio
+async def test_max_uses_stops_further_searches_and_announces_only_the_one_that_ran(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refused search is a tool error, and no ``web_search_call`` claims it happened."""
+    responses = iter(
+        [
+            _response(output=[_function_call("c1", "web_search", '{"query": "first"}')]),
+            _response(output=[_function_call("c2", "web_search", '{"query": "second"}')]),
+            _response(output=[], status="completed"),
+        ]
+    )
+    captured_inputs: list[Any] = []
+
+    async def fake_aresponses(**kwargs: Any) -> Response:
+        captured_inputs.append(list(kwargs["input_data"]))
+        return next(responses)
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+    pool = _FakeSearchPool()
+
+    out = await responses_tool_loop(
+        completion_kwargs={"model": "fake", "input_data": [{"role": "user", "content": "hi"}]},
+        pool=cast(Any, pool),
+        max_iterations=5,
+        use_budget=_use_budget(1),
+        native_tools=_SEARCH,
+    )
+
+    assert pool.calls == [("web_search", {"query": "first"})]
+    refused = next(
+        item
+        for item in captured_inputs[2]
+        if isinstance(item, dict) and item.get("type") == "function_call_output" and item.get("call_id") == "c2"
+    )
+    assert refused["output"] == "[tool error] max_uses_exceeded"
+    announced = [item for item in (out.output or []) if getattr(item, "type", None) == "web_search_call"]
+    assert len(announced) == 1, "a refused search must not be announced as a completed one"
+    assert announced[0].id == "c1"
 
 
 @pytest.mark.asyncio
@@ -359,11 +425,34 @@ async def test_loop_mixed_calls_executes_owned_and_returns_only_foreign(
     )
     assert pool.calls == [("fetch_url", {})]
     remaining_call_ids = [
-        getattr(item, "call_id", None)
-        for item in out.output
-        if getattr(item, "type", None) == "function_call"
+        getattr(item, "call_id", None) for item in out.output if getattr(item, "type", None) == "function_call"
     ]
     assert remaining_call_ids == ["foreign_id"]
+
+
+@pytest.mark.asyncio
+async def test_loop_mixed_capped_search_hides_refusal_and_returns_foreign_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_aresponses(**kwargs: Any) -> Response:
+        return _response(
+            output=[
+                _function_call("search_id", "web_search", '{"query": "x"}'),
+                _function_call("foreign_id", "user_tool", "{}"),
+            ],
+        )
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+    pool = _FakeSearchPool()
+    out = await responses_tool_loop(
+        completion_kwargs={"model": "fake", "input_data": "go"},
+        pool=cast(Any, pool),
+        max_iterations=5,
+        use_budget=_use_budget(0),
+    )
+
+    assert pool.calls == []
+    assert [getattr(item, "call_id", None) for item in out.output or []] == ["foreign_id"]
 
 
 @pytest.mark.asyncio
@@ -395,9 +484,7 @@ async def test_loop_tool_failure_appears_as_function_call_output(monkeypatch: py
     )
     second_input = captured_inputs[1]
     output_item = next(
-        item
-        for item in second_input
-        if isinstance(item, dict) and item.get("type") == "function_call_output"
+        item for item in second_input if isinstance(item, dict) and item.get("type") == "function_call_output"
     )
     assert "tool error" in output_item["output"]
     assert "upstream down" in output_item["output"]
@@ -622,6 +709,62 @@ async def test_stream_passes_text_events_through_and_terminates(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_stream_max_uses_announces_only_the_search_that_ran(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused search gets no ``web_search_call`` item on the wire.
+
+    ``synthetic_events`` runs after ``advance_stream_transcript``, so the refusal
+    has to be recorded on the per-iteration state for it to be skipped there.
+    Without that, the stream would announce a search the cap stopped.
+    """
+
+    def _search_round(call_id: str, item_id: str, query: str) -> AsyncIterator[ResponseStreamEvent]:
+        arguments = json.dumps({"query": query})
+        return _async_iter(
+            _output_item_added(0, _function_call(call_id, "web_search", "")),
+            _function_call_args_delta(0, item_id, arguments),
+            _function_call_args_done(0, item_id, "web_search", arguments),
+            _output_item_done(0, _function_call(call_id, "web_search", arguments)),
+            _response_completed(),
+        )
+
+    iter_streams = iter(
+        [
+            _search_round("c1", "fc_1", "first"),
+            _search_round("c2", "fc_2", "second"),
+            _async_iter(_text_delta("msg_1", 0, "done"), _response_completed()),
+        ]
+    )
+
+    async def fake_aresponses(**kwargs: Any) -> AsyncIterator[ResponseStreamEvent]:
+        return next(iter_streams)
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+    pool = _FakeSearchPool()
+
+    events = [
+        event
+        async for event in responses_tool_loop_stream(
+            completion_kwargs={"model": "fake", "input_data": "go"},
+            pool=cast(Any, pool),
+            max_iterations=5,
+            use_budget=_use_budget(1),
+            native_tools=_SEARCH,
+        )
+    ]
+
+    assert pool.calls == [("web_search", {"query": "first"})]
+    announced = [
+        event
+        for event in events
+        if event.type == "response.output_item.added" and getattr(event.item, "type", None) == "web_search_call"
+    ]
+    assert len(announced) == 1, "a refused search must not be announced as a completed one"
+    assert announced[0].item.id == "c1"
+
+
+@pytest.mark.asyncio
 async def test_stream_runs_owned_function_call_and_continues(monkeypatch: pytest.MonkeyPatch) -> None:
     """Iteration 1 emits a function_call output item; the loop executes it and
     drops the intermediate response.completed. Iteration 2 runs and its
@@ -722,11 +865,10 @@ async def test_stream_replays_and_returns_compaction_from_hidden_iteration(
         "function_call_output",
     ]
     assert replay[0]["encrypted_content"] == "opaque-cmp_1"
-    assert [
-        event.type
-        for event in events
-        if getattr(getattr(event, "item", None), "type", None) == "compaction"
-    ] == ["response.output_item.added", "response.output_item.done"]
+    assert [event.type for event in events if getattr(getattr(event, "item", None), "type", None) == "compaction"] == [
+        "response.output_item.added",
+        "response.output_item.done",
+    ]
     completed = next(event for event in events if event.type == "response.completed")
     assert [getattr(item, "type", None) for item in completed.response.output] == ["compaction"]
     assert isinstance(completed.response.output[0], ResponseCompactionItem)
@@ -849,13 +991,12 @@ async def test_stream_announces_gateway_search_as_native_web_search_call(
             completion_kwargs={"model": "fake", "input_data": "go"},
             pool=cast(Any, pool),
             max_iterations=5,
+            native_tools=_SEARCH,
         )
     ]
 
     web_search_items = [
-        getattr(e, "item")
-        for e in events
-        if getattr(getattr(e, "item", None), "type", None) == "web_search_call"
+        getattr(e, "item") for e in events if getattr(getattr(e, "item", None), "type", None) == "web_search_call"
     ]
     # One added + one done event, carrying the same item.
     assert len(web_search_items) == 2
@@ -922,3 +1063,278 @@ async def test_stream_mixed_batch_hides_runs_and_strips_the_gateway_call(
     assert names == ["user_tool"]
 
     assert pool.calls == [("fetch_url", {"u": "x"})]
+
+
+@pytest.mark.asyncio
+async def test_stream_mixed_capped_search_hides_refusal_and_returns_foreign_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = _function_call("call_owned", "web_search", '{"query": "x"}')
+    foreign = _function_call("call_foreign", "user_tool", "{}")
+    iter_streams = iter(
+        [
+            _async_iter(
+                _output_item_added(0, owned),
+                _function_call_args_done(0, "fc_owned", "web_search", '{"query": "x"}'),
+                _output_item_added(1, foreign),
+                _function_call_args_done(1, "fc_foreign", "user_tool", "{}"),
+                _response_completed(output=[owned, foreign]),
+            ),
+        ]
+    )
+
+    async def fake_aresponses(**kwargs: Any) -> AsyncIterator[ResponseStreamEvent]:
+        return next(iter_streams)
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+    pool = _FakeSearchPool()
+    events = [
+        event
+        async for event in responses_tool_loop_stream(
+            completion_kwargs={"model": "fake", "input_data": "go"},
+            pool=cast(Any, pool),
+            max_iterations=5,
+            use_budget=_use_budget(0),
+        )
+    ]
+
+    completed = next(e for e in events if e.type == "response.completed")
+    assert [getattr(item, "call_id", None) for item in completed.response.output] == ["call_foreign"]
+    assert pool.calls == []
+
+
+# --- native code_interpreter_call items -------------------------------------------------
+
+
+def _exec_result(stdout: str = "42\n", stderr: str = "", return_code: int = 0) -> ResultBlock:
+    return ResultBlock.model_validate(
+        {
+            "type": "code_execution_tool_result",
+            "content": {
+                "type": "code_execution_result",
+                "stdout": stdout,
+                "stderr": stderr,
+                "return_code": return_code,
+                "content": [],
+            },
+        }
+    )
+
+
+class _FakeSandboxPool(_FakePool):
+    """A pool that owns ``code_execution`` and keeps executions like the real backend."""
+
+    container_id = "otari_cntr_test"
+
+    def __init__(self, *, result: ResultBlock | None = _exec_result()) -> None:
+        super().__init__(tool_names=["code_execution"], results={"code_execution": "stdout:\n42"})
+        self._result = result
+        self._executions: list[CodeExecution] = []
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        self.calls.append((name, arguments))
+        self._executions.append(CodeExecution(code=str(arguments.get("code") or ""), result=self._result))
+        return self._results["code_execution"]
+
+    def take_executions(self) -> list[CodeExecution]:
+        taken, self._executions = self._executions, []
+        return taken
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_execution_is_announced_as_a_code_interpreter_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    responses = iter(
+        [
+            _response(output=[_function_call("call_1", "code_execution", '{"code": "print(6 * 7)"}')]),
+            _response(output=[], status="completed"),
+        ]
+    )
+
+    async def fake_aresponses(**kwargs: Any) -> Response:
+        return next(responses)
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+
+    out = await responses_tool_loop(
+        completion_kwargs={"model": "fake", "input_data": [{"role": "user", "content": "compute"}]},
+        pool=cast(Any, _FakeSandboxPool()),
+        max_iterations=5,
+        native_tools=frozenset({CODE_EXECUTION_TOOL_NAME}),
+    )
+
+    items = [item for item in (out.output or []) if getattr(item, "type", None) == "code_interpreter_call"]
+    assert len(items) == 1
+    item = cast(Any, items[0])
+    assert item.id.startswith(CODE_INTERPRETER_CALL_ID_PREFIX)
+    assert item.code == "print(6 * 7)"
+    assert item.container_id == "otari_cntr_test"
+    assert item.status == "completed"
+    assert [(output.type, output.logs) for output in item.outputs] == [("logs", "42\n")]
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_batch_still_announces_the_gateway_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The round exits for the caller to dispatch its own tool, but the code the
+    # gateway ran is announced alongside, as it is on the all-owned path.
+    async def fake_aresponses(**kwargs: Any) -> Response:
+        return _response(
+            output=[
+                _function_call("call_1", "code_execution", '{"code": "print(1)"}'),
+                _function_call("foreign_id", "user_tool", "{}"),
+            ],
+        )
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+
+    pool = _FakeSandboxPool()
+    out = await responses_tool_loop(
+        completion_kwargs={"model": "fake", "input_data": "go"},
+        pool=cast(Any, pool),
+        max_iterations=5,
+        native_tools=frozenset({CODE_EXECUTION_TOOL_NAME}),
+    )
+
+    assert pool.calls == [("code_execution", {"code": "print(1)"})]
+    types = [getattr(item, "type", None) for item in (out.output or [])]
+    assert types == ["code_interpreter_call", "function_call"]
+    assert cast(Any, out.output[1]).call_id == "foreign_id"
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_mixed_batch_announces_the_execution_and_the_terminal_lists_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = _function_call("call_1", "code_execution", '{"code": "print(1)"}')
+    foreign = _function_call("call_foreign", "user_tool", "{}")
+    iter_streams = iter(
+        [
+            _async_iter(
+                _output_item_added(0, owned),
+                _function_call_args_done(0, "fc_owned", "code_execution", '{"code": "print(1)"}'),
+                _output_item_added(1, foreign),
+                _function_call_args_done(1, "fc_foreign", "user_tool", "{}"),
+                _response_completed(output=[owned, foreign]),
+            ),
+        ]
+    )
+
+    async def fake_aresponses(**kwargs: Any) -> AsyncIterator[ResponseStreamEvent]:
+        return next(iter_streams)
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+
+    pool = _FakeSandboxPool()
+    events = [
+        event
+        async for event in responses_tool_loop_stream(
+            completion_kwargs={"model": "fake", "input_data": "go"},
+            pool=cast(Any, pool),
+            max_iterations=5,
+            native_tools=frozenset({CODE_EXECUTION_TOOL_NAME}),
+        )
+    ]
+
+    assert pool.calls == [("code_execution", {"code": "print(1)"})]
+    announced = [e for e in events if getattr(getattr(e, "item", None), "type", None) == "code_interpreter_call"]
+    assert len(announced) == 2  # added and done, before the terminal event
+    completed = next(e for e in events if e.type == "response.completed")
+    # ``get_final_response()`` agrees with the stream: the run it announced is
+    # in the terminal output, the gateway's consumed call is not.
+    assert [getattr(item, "type", None) for item in completed.response.output] == [
+        "code_interpreter_call",
+        "function_call",
+    ]
+    assert events.index(announced[-1]) < events.index(completed)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_program_is_a_failed_interpreter_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    responses = iter(
+        [
+            _response(output=[_function_call("call_1", "code_execution", '{"code": "1/0"}')]),
+            _response(output=[], status="completed"),
+        ]
+    )
+
+    async def fake_aresponses(**kwargs: Any) -> Response:
+        return next(responses)
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+
+    out = await responses_tool_loop(
+        completion_kwargs={"model": "fake", "input_data": [{"role": "user", "content": "compute"}]},
+        pool=cast(Any, _FakeSandboxPool(result=_exec_result(stdout="", stderr="boom", return_code=1))),
+        max_iterations=5,
+        native_tools=frozenset({CODE_EXECUTION_TOOL_NAME}),
+    )
+
+    item = cast(Any, next(i for i in (out.output or []) if getattr(i, "type", None) == "code_interpreter_call"))
+    assert item.status == "failed"
+    assert item.outputs[0].logs == "boom"
+
+
+@pytest.mark.asyncio
+async def test_no_interpreter_call_without_the_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    responses = iter(
+        [
+            _response(output=[_function_call("call_1", "code_execution", '{"code": "print(1)"}')]),
+            _response(output=[], status="completed"),
+        ]
+    )
+
+    async def fake_aresponses(**kwargs: Any) -> Response:
+        return next(responses)
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+
+    out = await responses_tool_loop(
+        completion_kwargs={"model": "fake", "input_data": [{"role": "user", "content": "compute"}]},
+        pool=cast(Any, _FakeSandboxPool()),
+        max_iterations=5,
+    )
+
+    assert [getattr(item, "type", None) for item in (out.output or [])] == []
+
+
+@pytest.mark.asyncio
+async def test_stream_announces_the_execution_as_a_code_interpreter_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    fc = _function_call("call_1", "code_execution", "")
+    iter_streams = iter(
+        [
+            _async_iter(
+                _output_item_added(0, fc),
+                _function_call_args_done(0, "fc_item_1", "code_execution", '{"code": "print(1)"}'),
+                _output_item_done(0, _function_call("call_1", "code_execution", '{"code": "print(1)"}')),
+                _response_completed(),
+            ),
+            _async_iter(
+                _text_delta("msg_1", 0, "1"),
+                _response_completed(),
+            ),
+        ]
+    )
+
+    async def fake_aresponses(**kwargs: Any) -> AsyncIterator[ResponseStreamEvent]:
+        return next(iter_streams)
+
+    monkeypatch.setattr(responses_loop_module, "aresponses", fake_aresponses)
+
+    pool = _FakeSandboxPool()
+    events = [
+        event
+        async for event in responses_tool_loop_stream(
+            completion_kwargs={"model": "fake", "input_data": "go"},
+            pool=cast(Any, pool),
+            max_iterations=5,
+            native_tools=frozenset({CODE_EXECUTION_TOOL_NAME}),
+        )
+    ]
+
+    assert pool.calls == [("code_execution", {"code": "print(1)"})]
+    items = [
+        getattr(e, "item") for e in events if getattr(getattr(e, "item", None), "type", None) == "code_interpreter_call"
+    ]
+    # One added and one done event, both carrying the complete item.
+    assert len(items) == 2
+    assert items[0].code == "print(1)"
+    assert items[0].status == "completed"

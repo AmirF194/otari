@@ -8,9 +8,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gateway.core.config import API_KEY_HEADER
-from gateway.models.entities import Budget, User
-from gateway.services.budget_service import _cas_reset_user_budget, _is_model_free
+from gateway.core.config import API_KEY_HEADER, API_ROOT
+from gateway.models.budgets import Budget
+from gateway.models.users import User
+from gateway.services.budgets._reservations import _cas_reset_user_budget, _is_model_free
 
 
 def test_create_user_rollback_on_commit_failure(
@@ -23,7 +24,7 @@ def test_create_user_rollback_on_commit_failure(
         side_effect=OperationalError("db", {}, Exception("connection lost")),
     ):
         resp = client.post(
-            "/v1/users",
+            f"{API_ROOT}/users",
             json={"user_id": "fail-user"},
             headers=master_key_header,
         )
@@ -35,17 +36,21 @@ def test_delete_user_rollback_on_commit_failure(
     master_key_header: dict[str, str],
 ) -> None:
     """delete_user rolls back both the API key deactivation and soft-delete on commit failure."""
-    client.post("/v1/users", json={"user_id": "del-fail-user"}, headers=master_key_header)
+    client.post(f"{API_ROOT}/users", json={"user_id": "del-fail-user"}, headers=master_key_header)
+    # Provisioned before the patch, for the reason the create-key case below
+    # states: this route resolves the caller's organization now, and first-boot
+    # provisioning commits outside the handler's own rollback.
+    assert client.get(f"{API_ROOT}/organizations/me", headers=master_key_header).status_code == 200
 
     with patch(
         "gateway.api.routes.users.AsyncSession.commit",
         side_effect=OperationalError("db", {}, Exception("connection lost")),
     ):
-        resp = client.delete("/v1/users/del-fail-user", headers=master_key_header)
+        resp = client.delete(f"{API_ROOT}/users/del-fail-user", headers=master_key_header)
     assert resp.status_code == 500
 
     # User should still be active because the commit was rolled back
-    resp = client.get("/v1/users/del-fail-user", headers=master_key_header)
+    resp = client.get(f"{API_ROOT}/users/del-fail-user", headers=master_key_header)
     assert resp.status_code == 200
 
 
@@ -57,13 +62,13 @@ def test_create_key_rollback_on_commit_failure(
     # Provisioned before the patch: the route resolves the caller's organization,
     # and first-boot provisioning commits, which the patch below would otherwise
     # fail outside the handler's own rollback.
-    assert client.get("/v1/organizations/me", headers=master_key_header).status_code == 200
+    assert client.get(f"{API_ROOT}/organizations/me", headers=master_key_header).status_code == 200
     with patch(
         "gateway.api.routes.keys.AsyncSession.commit",
         side_effect=OperationalError("db", {}, Exception("connection lost")),
     ):
         resp = client.post(
-            "/v1/keys",
+            f"{API_ROOT}/keys",
             json={"key_name": "fail-key"},
             headers=master_key_header,
         )
@@ -80,7 +85,7 @@ def test_create_budget_rollback_on_commit_failure(
         side_effect=OperationalError("db", {}, Exception("connection lost")),
     ):
         resp = client.post(
-            "/v1/budgets",
+            f"{API_ROOT}/budgets",
             json={"max_budget": 100.0},
             headers=master_key_header,
         )
@@ -97,7 +102,7 @@ def test_set_pricing_rollback_on_commit_failure(
         side_effect=OperationalError("db", {}, Exception("connection lost")),
     ):
         resp = client.post(
-            "/v1/pricing",
+            f"{API_ROOT}/pricing",
             json={
                 "model_key": "openai:gpt-4o",
                 "input_price_per_million": 2.5,
@@ -147,7 +152,10 @@ async def test_is_model_free_catches_unsupported_provider_error(async_db: AsyncS
 @pytest.mark.asyncio
 async def test_is_model_free_accepts_string_provider_from_any_llm(async_db: AsyncSession) -> None:
     """_is_model_free stays fail-closed when any-llm returns a registry-only string provider."""
-    with patch("gateway.services.budget_service.AnyLLM.split_model_provider", return_value=("registry-only", "model")):
+    with patch(
+        "gateway.services.budgets._reservations.AnyLLM.split_model_provider",
+        return_value=("registry-only", "model"),
+    ):
         result = await _is_model_free(async_db, "registry-only:model")
 
     assert result is False
@@ -158,7 +166,7 @@ async def test_is_model_free_uses_the_resolved_provider_instance(async_db: Async
     """Policies are named locally, while their selected targets may use instances."""
     pricing = SimpleNamespace(input_price_per_million=0, output_price_per_million=0)
     lookup = AsyncMock(return_value=pricing)
-    with patch("gateway.services.budget_service.find_model_pricing", lookup):
+    with patch("gateway.services.budgets._reservations.find_model_pricing", lookup):
         result = await _is_model_free(async_db, "Kimi-K3", pricing_provider="otari.ai")
 
     assert result is True
@@ -173,7 +181,7 @@ async def test_is_model_free_uses_the_resolved_provider_instance(async_db: Async
 async def test_is_model_free_catches_sqlalchemy_error(async_db: AsyncSession) -> None:
     """_is_model_free returns False on SQLAlchemy errors during pricing lookup."""
     with patch(
-        "gateway.services.budget_service.find_model_pricing",
+        "gateway.services.budgets._reservations.find_model_pricing",
         side_effect=OperationalError("db", {}, Exception("connection lost")),
     ):
         result = await _is_model_free(async_db, "openai:gpt-4o")
@@ -184,7 +192,7 @@ async def test_is_model_free_catches_sqlalchemy_error(async_db: AsyncSession) ->
 async def test_is_model_free_does_not_catch_unexpected_errors(async_db: AsyncSession) -> None:
     """_is_model_free does not swallow unexpected non-DB, non-ValueError exceptions."""
     with (
-        patch("gateway.services.budget_service.find_model_pricing", side_effect=RuntimeError("unexpected")),
+        patch("gateway.services.budgets._reservations.find_model_pricing", side_effect=RuntimeError("unexpected")),
         pytest.raises(RuntimeError, match="unexpected"),
     ):
         await _is_model_free(async_db, "openai:gpt-4o")
@@ -196,7 +204,7 @@ def test_auth_commit_failure_does_not_break_verification(
 ) -> None:
     """API key verification succeeds even if the last_used_at commit fails."""
     key_resp = client.post(
-        "/v1/keys",
+        f"{API_ROOT}/keys",
         json={"key_name": "auth-fail-key"},
         headers=master_key_header,
     )
@@ -207,10 +215,10 @@ def test_auth_commit_failure_does_not_break_verification(
         side_effect=OperationalError("db", {}, Exception("connection lost")),
     ):
         resp = client.get(
-            "/v1/users",
+            f"{API_ROOT}/users",
             headers={API_KEY_HEADER: f"Bearer {api_key}"},
         )
         # Auth should not crash with 500 from the commit failure.
-        # The /v1/users endpoint requires master key, so we may get 401
+        # The /api/v1/users endpoint requires master key, so we may get 401
         # (API key not accepted as master key), but crucially not 500.
         assert resp.status_code != 500

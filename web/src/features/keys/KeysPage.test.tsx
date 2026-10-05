@@ -1,13 +1,14 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { screen, waitFor, within } from "@testing-library/react"
-import userEvent from "@testing-library/user-event"
+import { act, screen, waitFor, within } from "@testing-library/react"
+import userEvent, { type UserEvent } from "@testing-library/user-event"
 import type { ReactElement } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { ApiKey, DeploymentBootstrap, User } from "@/client"
 import { KeysPage } from "@/features/keys/KeysPage"
+import { API_ROOT } from "@/shared/api/client"
 import { DeploymentProvider } from "@/shared/hooks/useDeployment"
-import { bootstrap, organizationMember } from "@/tests/fixtures"
+import { apiKey, bootstrap, organizationMember } from "@/tests/fixtures"
 import { renderWithRouter } from "@/tests/router"
 import { pickOption } from "@/tests/select"
 
@@ -35,25 +36,37 @@ function user(overrides: Partial<User> = {}): User {
   }
 }
 
-function apiKey(overrides: Partial<ApiKey> = {}): ApiKey {
-  return {
-    capture_agent_telemetry: null,
-    id: "key-1",
-    // NOT NULL on the server: a key always belongs to exactly one workspace.
-    workspace_id: "11111111-1111-1111-1111-111111111111",
-    key_prefix: "gw-AbC3dE",
-    key_name: "ci-bot",
-    user_id: "alice",
-    created_at: "2026-01-01T00:00:00+00:00",
-    last_used_at: null,
-    expires_at: null,
-    is_active: true,
-    allowed_models: null,
-    exclude_from_budget: false,
-    reject_user_mismatch: null,
-    metadata: {},
-    ...overrides,
-  }
+// The page picks its layout from the region it is given, which jsdom reports as
+// 0 wide. Feeding the observer a width is what selects wide, compact or the list.
+function stubRegionWidth(width: number) {
+  const OriginalObserver = globalThis.ResizeObserver
+  vi.stubGlobal(
+    "ResizeObserver",
+    class extends OriginalObserver {
+      constructor(callback: ResizeObserverCallback) {
+        // Acted: the callback drives `setLayout`, and forwarding it raw left
+        // every layout change as an unacted update.
+        super((entries, observer) => {
+          act(() => {
+            callback(
+              entries.map((entry) => ({
+                ...entry,
+                contentRect: { ...entry.contentRect, width },
+              })),
+              observer,
+            )
+          })
+        })
+      }
+    },
+  )
+}
+
+async function chooseAction(user: UserEvent, row: HTMLElement, action: string) {
+  await user.click(within(row).getByRole("button", { name: /^Actions for / }))
+  await user.click(
+    await screen.findByRole("menuitem", { name: new RegExp(`^${action}`) }),
+  )
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -68,10 +81,10 @@ const REGEN_SECRET =
   "gw-REGEN00000000000000000000000000000000000000000000000000"
 
 // Both key surfaces answer identical shapes, so one handler serves them: the
-// operator's `/v1/keys` and the member's `/v1/organizations/me/keys`
+// operator's /api/v1/keys and the member's /api/v1/organizations/me/keys
 // (otari-ai#1941). Which one the page asked is what the member-view cases
 // assert, off the spy's recorded URLs.
-const KEYS_URL = /\/v1\/(?:organizations\/me\/)?keys(?:\/|\?|$)/
+const KEYS_URL = /\/api\/v1\/(?:organizations\/me\/)?keys(?:\/|\?|$)/
 
 function mockApi(
   opts: {
@@ -95,11 +108,17 @@ function mockApi(
         if (url.endsWith("/rotate") && method === "POST") {
           const id = url.split("/").slice(-2)[0]
           const prefix = REGEN_SECRET.slice(0, 10)
+          const suffix = REGEN_SECRET.slice(-4)
           list = list.map((k) =>
-            k.id === id ? { ...k, key_prefix: prefix } : k,
+            k.id === id ? { ...k, key_prefix: prefix, key_suffix: suffix } : k,
           )
           const row = list.find((k) => k.id === id) ?? apiKey({ id })
-          return jsonResponse({ ...row, key: REGEN_SECRET, key_prefix: prefix })
+          return jsonResponse({
+            ...row,
+            key: REGEN_SECRET,
+            key_prefix: prefix,
+            key_suffix: suffix,
+          })
         }
         if (method === "POST") {
           const body = JSON.parse(String(init?.body)) as {
@@ -111,6 +130,7 @@ function mockApi(
           const row = apiKey({
             id: "key-new",
             key_prefix: NEW_SECRET.slice(0, 10),
+            key_suffix: NEW_SECRET.slice(-4),
             key_name: body.key_name ?? null,
             user_id: body.user_id ?? "apikey-key-new",
             allowed_models: body.allowed_models ?? null,
@@ -132,15 +152,15 @@ function mockApi(
         }
         return jsonResponse(list)
       }
-      // Before /v1/users, and paged: the owner picker names members through
+      // Before /api/v1/users, and paged: the owner picker names members through
       // this, and `fetchAllPaged` reads `data`/`count` rather than a bare list.
-      if (url.includes("/v1/organizations/me/members")) {
+      if (url.includes(`${API_ROOT}/organizations/me/members`)) {
         return jsonResponse({ data: members, count: members.length })
       }
       // Seeds the scope: `deployment_operator` is what routes the page onto the
       // operator surface or the member one. These suites default to the
       // operator's view, and the member cases flip it.
-      if (url.endsWith("/v1/organizations/me")) {
+      if (url.endsWith(`${API_ROOT}/organizations/me`)) {
         return jsonResponse({
           organization_member_id: "om-1",
           role: "member",
@@ -159,10 +179,10 @@ function mockApi(
           workspace_memberships: [],
         })
       }
-      if (url.includes("/v1/users")) {
+      if (url.includes(`${API_ROOT}/users`)) {
         return jsonResponse(users)
       }
-      if (url.includes("/v1/models/discoverable")) {
+      if (url.includes(`${API_ROOT}/models/discoverable`)) {
         return jsonResponse({
           providers: [
             {
@@ -174,10 +194,10 @@ function mockApi(
           ],
         })
       }
-      if (url.includes("/v1/providers")) {
+      if (url.includes(`${API_ROOT}/providers`)) {
         return jsonResponse({ providers: [{ instance: "openai" }] })
       }
-      if (url.includes("/v1/aliases")) {
+      if (url.includes(`${API_ROOT}/aliases`)) {
         return jsonResponse([])
       }
       return jsonResponse([])
@@ -201,9 +221,116 @@ function renderPage(
   )
 }
 
+/**
+ * Press the create dialog's submit.
+ *
+ * Scoped to the dialog because "Create key" is deliberately on screen twice
+ * while it is open: the labels rule makes the page's trigger and the dialog's
+ * submit the same string, and the trigger no longer hides behind the form.
+ */
+async function submitTheCreateDialog(user: UserEvent) {
+  const dialog = await screen.findByRole("dialog")
+  await user.click(within(dialog).getByRole("button", { name: "Create key" }))
+}
+
 describe("KeysPage", () => {
   afterEach(() => {
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it("keeps selection and full identity available in the mobile list", async () => {
+    stubRegionWidth(390)
+    const name = "prod-gateway-eu-west-1-primary-ingress-router"
+    const owner = "alexandra.constantinescu@platform-engineering.example.com"
+    mockApi({
+      keys: [
+        apiKey({ key_name: name, user_id: owner, key_prefix: "gw-prefix" }),
+      ],
+    })
+    const user = userEvent.setup()
+    renderPage(<KeysPage />)
+    await screen.findByRole("button", { name: `Actions for ${name}` })
+    expect(screen.queryByRole("grid")).not.toBeInTheDocument()
+    await user.click(screen.getByRole("checkbox", { name: "Select all keys" }))
+    expect(
+      screen.getByRole("checkbox", { name: `Select ${name}` }),
+    ).toBeChecked()
+    await user.click(
+      screen.getByRole("button", { name: `Actions for ${name}` }),
+    )
+    const menu = await screen.findByRole("menu")
+    expect(within(menu.parentElement!).getByText(owner)).toBeInTheDocument()
+    expect(screen.getByText("Created:")).toBeInTheDocument()
+    expect(screen.getByRole("menuitem", { name: /^Delete/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    )
+    await user.keyboard("{Escape}")
+    expect(
+      await screen.findByRole("checkbox", { name: `Select ${name}` }),
+    ).toBeChecked()
+    expect(
+      screen.queryByRole("button", { name: `Copy key prefix for ${name}` }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("keeps two faces in Owner and folds the lanes into the menu only once they leave the row", async () => {
+    const member = "33333333-3333-3333-3333-333333333333"
+    stubRegionWidth(1440)
+    mockApi({
+      keys: [
+        apiKey({ id: "key-1", key_name: "named", user_id: member }),
+        apiKey({ id: "key-2", key_name: "raw", user_id: "ci-bot" }),
+      ],
+      users: [user({ user_id: member, alias: "alice@example.com" })],
+      members: [
+        organizationMember({
+          attribution_user_id: member,
+          full_name: "Alice Example",
+        }),
+      ],
+    })
+    const usr = userEvent.setup()
+    renderPage(<KeysPage />)
+
+    // A member is a person and takes the body face; a raw id is an identifier
+    // and takes the mono one, which is the only thing telling the two apart.
+    const named = await screen.findByText("Alice Example")
+    expect(named).toHaveClass("text-sm", "text-foreground")
+    expect(named).toHaveAttribute("title", member)
+    expect(screen.getByText("ci-bot", { selector: "span" })).toHaveClass(
+      "text-mono-caption",
+    )
+
+    // Created, Last used and Expires are lanes here, so the menu does not
+    // repeat them.
+    await usr.click(screen.getByRole("button", { name: "Actions for named" }))
+    await screen.findByRole("menu")
+    expect(screen.queryByText("Created:")).not.toBeInTheDocument()
+  })
+
+  it("loads inside the list on a phone rather than painting the table first", async () => {
+    stubRegionWidth(390)
+    let release: (() => void) | undefined
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const base = mockApi({ keys: [apiKey({ key_name: "held" })] })
+    const inner = base.getMockImplementation()!
+    base.mockImplementation(async (input, init) => {
+      if (KEYS_URL.test(String(input))) await held
+      return inner(input, init)
+    })
+    renderPage(<KeysPage />)
+
+    // The seven-column skeleton is what used to appear here for the whole load.
+    expect(await screen.findByText("Loading…")).toBeInTheDocument()
+    expect(screen.queryByRole("grid")).not.toBeInTheDocument()
+
+    release?.()
+    await screen.findByRole("button", { name: "Actions for held" })
+    expect(screen.queryByRole("grid")).not.toBeInTheDocument()
   })
 
   it("shows a single empty state (onboarding panel, not also the table fallback)", async () => {
@@ -225,14 +352,21 @@ describe("KeysPage", () => {
     ).not.toBeInTheDocument()
   })
 
-  it("lists keys with status and prefix, never the full secret", async () => {
+  it("lists key fingerprints and supports keys without stored suffixes", async () => {
     mockApi({
       keys: [
         apiKey({
           id: "key-1",
           key_name: "ci-bot",
           key_prefix: "gw-AbC3dE",
+          key_suffix: "1234",
           is_active: true,
+        }),
+        apiKey({
+          id: "key-prefix-only",
+          key_name: "prefix-only",
+          key_prefix: "gw-Older",
+          key_suffix: null,
         }),
         apiKey({
           id: "key-2",
@@ -246,7 +380,15 @@ describe("KeysPage", () => {
 
     const activeRow = (await screen.findByText("ci-bot")).closest("tr")!
     expect(within(activeRow).getByText("Active")).toBeInTheDocument()
-    expect(within(activeRow).getByText("gw-AbC3dE…")).toBeInTheDocument()
+    expect(within(activeRow).getByText("gw-AbC3dE…1234")).toBeInTheDocument()
+    expect(
+      within(activeRow).queryByRole("button", {
+        name: "Copy key prefix for ci-bot",
+      }),
+    ).not.toBeInTheDocument()
+
+    const prefixOnlyRow = screen.getByText("prefix-only").closest("tr")!
+    expect(within(prefixOnlyRow).getByText("gw-Older…")).toBeInTheDocument()
 
     // A key minted before the prefix existed renders "—", not a crash.
     const legacyRow = screen.getByText("legacy").closest("tr")!
@@ -256,7 +398,7 @@ describe("KeysPage", () => {
     expect(document.body.textContent).not.toContain(NEW_SECRET)
   })
 
-  it("shows the plaintext + first-call snippet once, then only the prefix", async () => {
+  it("conceals a new key and its snippets until explicitly revealed", async () => {
     mockApi({ keys: [] })
     const user = userEvent.setup()
     renderPage(<KeysPage />)
@@ -268,31 +410,70 @@ describe("KeysPage", () => {
     await user.type(screen.getByLabelText("Name"), "deploy-key")
     await user.type(screen.getByPlaceholderText(/Pick a user/), "alice")
     await user.keyboard("{Escape}")
-    await user.click(screen.getByRole("button", { name: "Create key" }))
+    await submitTheCreateDialog(user)
 
-    // The reveal shows the secret and a runnable curl snippet with the key injected.
     const reveal = await screen.findByRole("alert", {
       name: /API key created|New secret for/,
     })
-    expect(within(reveal).getByDisplayValue(NEW_SECRET)).toBeInTheDocument()
-    const curl = within(reveal).getByDisplayValue(
-      new RegExp(`Otari-Key: ${NEW_SECRET}`),
+    expect(within(reveal).getByLabelText("Secret key")).toHaveValue(
+      "gw-NEWSECR••••••••0000",
     )
-    expect(curl).toBeInTheDocument()
-    expect((curl as HTMLTextAreaElement).value).toContain(
-      `${window.location.origin}/v1/chat/completions`,
-    )
-
+    expect(
+      (within(reveal).getByLabelText("curl") as HTMLTextAreaElement).value,
+    ).not.toContain(NEW_SECRET)
+    expect(
+      (
+        within(reveal).getByLabelText(
+          "Python (Otari SDK)",
+        ) as HTMLTextAreaElement
+      ).value,
+    ).not.toContain(NEW_SECRET)
     await user.click(
-      within(reveal).getByRole("button", { name: /I.?ve saved this key/ }),
+      within(reveal).getByRole("button", { name: "Show Secret key" }),
+    )
+    expect(within(reveal).getByLabelText("Secret key")).toHaveValue(NEW_SECRET)
+    const curl = within(reveal).getByLabelText("curl") as HTMLTextAreaElement
+    const python = within(reveal).getByLabelText(
+      "Python (Otari SDK)",
+    ) as HTMLTextAreaElement
+    expect(curl.value).toContain(`Otari-Key: ${NEW_SECRET}`)
+    expect(curl.value).toContain(
+      `${window.location.origin}${API_ROOT}/chat/completions`,
+    )
+    expect(python.value).toContain(NEW_SECRET)
+
+    // One credential, one reveal: concealing the key conceals the requests that
+    // carry it, rather than leaving it in plain sight twice over.
+    await user.click(
+      within(reveal).getByRole("button", { name: "Hide Secret key" }),
+    )
+    expect(within(reveal).getByLabelText("Secret key")).not.toHaveValue(
+      NEW_SECRET,
+    )
+    expect(curl.value).not.toContain(NEW_SECRET)
+    expect(python.value).not.toContain(NEW_SECRET)
+
+    // And the affordance is on each field, not only on the key: the snippet's
+    // own toggle brings all three back (otari-ai#2111).
+    await user.click(within(reveal).getByRole("button", { name: "Show curl" }))
+    expect(within(reveal).getByLabelText("Secret key")).toHaveValue(NEW_SECRET)
+    expect(curl.value).toContain(NEW_SECRET)
+    expect(python.value).toContain(NEW_SECRET)
+
+    // The acknowledgement is the dialog's footer action, so it is outside the
+    // alert that holds the key. It is unique on screen either way.
+    await user.click(
+      screen.getByRole("button", { name: /I.?ve saved this key/ }),
     )
 
-    // After closing, the list shows only the prefix and the secret is gone from the DOM.
+    // After closing, only the fingerprint remains.
     expect(
       screen.queryByRole("alert", { name: /API key created|New secret for/ }),
     ).not.toBeInTheDocument()
     expect(
-      await screen.findByText(`${NEW_SECRET.slice(0, 10)}…`),
+      await screen.findByText(
+        `${NEW_SECRET.slice(0, 10)}…${NEW_SECRET.slice(-4)}`,
+      ),
     ).toBeInTheDocument()
     expect(document.body.textContent).not.toContain(NEW_SECRET)
   })
@@ -330,10 +511,10 @@ describe("KeysPage", () => {
       }),
     )
 
-    const curl = dialog.getByDisplayValue(
-      new RegExp(`Otari-Key: ${NEW_SECRET}`),
-    ) as HTMLTextAreaElement
-    expect(curl.value).toContain("https://gateway.otari.ai/v1/chat/completions")
+    const curl = dialog.getByLabelText("curl") as HTMLTextAreaElement
+    expect(curl.value).toContain(
+      `https://gateway.otari.ai${API_ROOT}/chat/completions`,
+    )
     expect(curl.value).not.toContain(window.location.origin)
   })
 
@@ -344,10 +525,8 @@ describe("KeysPage", () => {
       bootstrap({ deployment_type: "hosted", data_plane_url: null }),
     )
 
-    expect(dialog.getByDisplayValue(NEW_SECRET)).toBeInTheDocument()
-    expect(
-      dialog.queryByDisplayValue(new RegExp(`Otari-Key: ${NEW_SECRET}`)),
-    ).not.toBeInTheDocument()
+    expect(dialog.getByLabelText("Secret key")).toBeInTheDocument()
+    expect(dialog.queryByLabelText("curl")).not.toBeInTheDocument()
     expect(
       dialog.getByText(/has not published the gateway address/),
     ).toBeInTheDocument()
@@ -368,9 +547,9 @@ describe("KeysPage", () => {
     )
     await user.type(screen.getByPlaceholderText(/Pick a user/), "alice")
     await user.keyboard("{Escape}")
-    await user.click(screen.getByRole("button", { name: "Create key" }))
+    await submitTheCreateDialog(user)
 
-    const reveal = await screen.findByRole("alert", {
+    await screen.findByRole("alert", {
       name: /API key created|New secret for/,
     })
     await user.keyboard("{Escape}")
@@ -378,21 +557,23 @@ describe("KeysPage", () => {
       screen.getByRole("alert", { name: /API key created|New secret for/ }),
     ).toBeInTheDocument()
 
+    // The acknowledgement is the dialog's footer action, so it is outside the
+    // alert that holds the key. It is unique on screen either way.
     await user.click(
-      within(reveal).getByRole("button", { name: /I.?ve saved this key/ }),
+      screen.getByRole("button", { name: /I.?ve saved this key/ }),
     )
     expect(
       screen.queryByRole("alert", { name: /API key created|New secret for/ }),
     ).not.toBeInTheDocument()
   })
 
-  // The reveal is a strip, not a modal: it has no backdrop to press and does
-  // not take the page out of the accessibility tree. Both would be a dialog
-  // fighting its own conventions, as the reveal's own docstring argues.
-  // What has to survive is the part that mattered, that nothing incidental can
-  // dismiss a secret shown once, so that is what this asserts now. The page
-  // behind staying reachable is a deliberate change and not covered here.
-  it("keeps the reveal up through a press elsewhere on the page", async () => {
+  // The reveal is a modal again, and the objection its docstring used to raise
+  // is answered rather than ignored: Escape and the backdrop work everywhere in
+  // this dialog EXCEPT here, where the content cannot be recovered. So the press
+  // that must not dismiss it is the backdrop, which is the only "elsewhere" a
+  // modal has; the page behind is deliberately out of the accessibility tree now
+  // and there is nothing on it to click.
+  it("keeps the reveal up through a press on the backdrop", async () => {
     mockApi({ keys: [] })
     const user = userEvent.setup()
     renderPage(<KeysPage />)
@@ -403,18 +584,22 @@ describe("KeysPage", () => {
     )
     await user.type(screen.getByPlaceholderText(/Pick a user/), "alice")
     await user.keyboard("{Escape}")
-    await user.click(screen.getByRole("button", { name: "Create key" }))
+    await submitTheCreateDialog(user)
 
-    const reveal = await screen.findByRole("alert", {
+    await screen.findByRole("alert", {
       name: /API key created|New secret for/,
     })
-    await user.click(screen.getByRole("heading", { name: "API keys" }))
+    const backdrop = document.querySelector('[class*="modal__backdrop"]')
+    expect(backdrop).not.toBeNull()
+    await user.click(backdrop as Element)
     expect(
       screen.getByRole("alert", { name: /API key created|New secret for/ }),
     ).toBeInTheDocument()
 
+    // The acknowledgement is the dialog's footer action, so it is outside the
+    // alert that holds the key. It is unique on screen either way.
     await user.click(
-      within(reveal).getByRole("button", { name: /I.?ve saved this key/ }),
+      screen.getByRole("button", { name: /I.?ve saved this key/ }),
     )
     await waitFor(() =>
       expect(
@@ -436,13 +621,15 @@ describe("KeysPage", () => {
     )
     await user.type(screen.getByPlaceholderText(/Pick a user/), "alice")
     await user.keyboard("{Escape}")
-    await user.click(screen.getByRole("button", { name: "Create key" }))
+    await submitTheCreateDialog(user)
 
-    const reveal = await screen.findByRole("alert", {
+    await screen.findByRole("alert", {
       name: /API key created|New secret for/,
     })
+    // The acknowledgement is the dialog's footer action, so it is outside the
+    // alert that holds the key. It is unique on screen either way.
     await user.click(
-      within(reveal).getByRole("button", { name: /I.?ve saved this key/ }),
+      screen.getByRole("button", { name: /I.?ve saved this key/ }),
     )
 
     // The form that opened the reveal is gone by now, so nothing else has a
@@ -454,55 +641,41 @@ describe("KeysPage", () => {
     )
   })
 
-  // Rewritten from "moves focus onto the confirm and back on cancel". That
-  // version scoped every query to `within(row)` because the confirm used to
-  // swap the trigger for a Confirm/Cancel pair in place, and React reused the
-  // same <button> node, so focus rode onto Confirm with nothing managing it.
-  // The confirmation is a sibling row now, which changes the facts: probing
-  // document.activeElement shows the trigger is never unmounted and keeps
-  // focus, so arming cannot strand it on <body>. That is what is asserted.
-  it("keeps the armed row's trigger mounted and focused, so arming never drops focus", async () => {
-    mockApi({ keys: [apiKey()] })
+  it("opens actions with the keyboard and returns focus after cancelling regeneration", async () => {
+    const fetchMock = mockApi({ keys: [apiKey()] })
     const user = userEvent.setup()
     renderPage(<KeysPage />)
-
     const row = (await screen.findByText("ci-bot")).closest("tr")!
-    const trigger = within(row).getByRole("button", { name: "Regenerate" })
+    const trigger = within(row).getByRole("button", {
+      name: "Actions for ci-bot",
+    })
+    // Open it once with the pointer first. Until an overlay has been opened in
+    // this document, ArrowDown on the trigger reaches the table's own row
+    // navigation instead of the menu, and focus lands on the next row. Other
+    // specs in this file open one for their own reasons, so without this the
+    // test only passes on the order they happen to run in.
     await user.click(trigger)
+    await user.keyboard("{Escape}")
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull())
 
-    await screen.findByText(/stops working immediately/)
-    // Same node, not a re-rendered replacement: the strip is added beside the
-    // row rather than swapped into it.
-    expect(within(row).getByRole("button", { name: "Regenerate" })).toBe(
-      trigger,
+    trigger.focus()
+    await user.keyboard("{ArrowDown}")
+    const menu = await screen.findByRole("menu")
+    expect(
+      within(menu).getByRole("menuitem", { name: /^Delete/ }),
+    ).toHaveAttribute("aria-disabled", "true")
+    await user.click(
+      within(menu).getByRole("menuitem", { name: /^Regenerate/ }),
     )
-    expect(document.activeElement).not.toBe(document.body)
-  })
-
-  it("returns focus to the row action when an armed row is cancelled", async () => {
-    // Cancelling unmounts the strip from under the focused Confirm, which the
-    // browser answers by moving focus to <body>: the keyboard loses its place
-    // on the most destructive control in the row. `useConfirmationFocus` hands
-    // it back, and the trigger is identified by `lastArmed` rather than `armed`
-    // so the ref is still attached when the hook's effect runs.
-    mockApi({ keys: [apiKey()] })
-    const user = userEvent.setup()
-    renderPage(<KeysPage />)
-
-    const row = (await screen.findByText("ci-bot")).closest("tr")!
-    const trigger = within(row).getByRole("button", { name: "Regenerate" })
-    await user.click(trigger)
-    await screen.findByText(/stops working immediately/)
-
-    await user.click(screen.getByRole("button", { name: "Cancel" }))
-    await waitFor(() =>
-      expect(screen.queryByText(/stops working immediately/)).toBeNull(),
-    )
-
-    expect(document.activeElement).not.toBe(document.body)
-    expect(document.activeElement).toBe(
-      within(row).getByRole("button", { name: "Regenerate" }),
-    )
+    const dialog = await screen.findByRole("alertdialog")
+    expect(
+      within(dialog).getByText(/stops working immediately/),
+    ).toBeInTheDocument()
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }))
+    await waitFor(() => expect(trigger).toHaveFocus())
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).endsWith("/rotate")),
+    ).toBe(false)
   })
 
   it("confirms Copied when the clipboard API is available", async () => {
@@ -523,15 +696,20 @@ describe("KeysPage", () => {
     )
     await user.type(screen.getByPlaceholderText(/Pick a user/), "alice")
     await user.keyboard("{Escape}")
-    await user.click(screen.getByRole("button", { name: "Create key" }))
+    await submitTheCreateDialog(user)
 
     const reveal = await screen.findByRole("alert", {
       name: /API key created|New secret for/,
     })
-    const copyButtons = within(reveal).getAllByRole("button", { name: "Copy" })
-    await user.click(copyButtons[0])
+    await user.click(
+      within(reveal).getByRole("button", { name: "Copy Secret key" }),
+    )
 
+    // The key reached the clipboard and never the screen.
     expect(writeText).toHaveBeenCalledWith(NEW_SECRET)
+    expect(
+      within(reveal).queryByDisplayValue(NEW_SECRET),
+    ).not.toBeInTheDocument()
     expect(
       await within(reveal).findByText("Copied to clipboard."),
     ).toBeInTheDocument()
@@ -545,25 +723,32 @@ describe("KeysPage", () => {
     renderPage(<KeysPage />)
 
     const row = (await screen.findByText("ci-bot")).closest("tr")!
-    // An active key offers no Delete (require-disable-first).
-    expect(
-      within(row).queryByRole("button", { name: "Delete" }),
-    ).not.toBeInTheDocument()
+    // An active key refuses Delete, in the menu and with its reason
+    // (require-disable-first).
+    await user.click(
+      within(row).getByRole("button", { name: "Actions for ci-bot" }),
+    )
+    const refused = await screen.findByRole("menuitem", { name: /^Delete/ })
+    expect(refused).toHaveAttribute("aria-disabled", "true")
+    expect(refused).toHaveTextContent("Disable it first")
+    await user.keyboard("{Escape}")
 
-    await user.click(within(row).getByRole("button", { name: "Disable" }))
+    await chooseAction(user, row, "Disable")
 
     const patch = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).includes("/v1/keys/key-1") &&
+        String(u).includes(`${API_ROOT}/keys/key-1`) &&
         (init?.method ?? "") === "PATCH",
     )
     expect(JSON.parse(String(patch?.[1]?.body))).toEqual({ is_active: false })
 
-    // Once disabled, a Delete action appears.
     const disabledRow = (await screen.findByText("Disabled")).closest("tr")!
+    await user.click(
+      within(disabledRow).getByRole("button", { name: "Actions for ci-bot" }),
+    )
     expect(
-      within(disabledRow).getByRole("button", { name: "Delete" }),
-    ).toBeInTheDocument()
+      await screen.findByRole("menuitem", { name: /^Delete/ }),
+    ).not.toHaveAttribute("aria-disabled", "true")
   })
 
   it("regenerates a secret after an explicit confirm", async () => {
@@ -574,23 +759,205 @@ describe("KeysPage", () => {
     renderPage(<KeysPage />)
 
     const row = (await screen.findByText("ci-bot")).closest("tr")!
-    await user.click(within(row).getByRole("button", { name: "Regenerate" }))
-    // Arming opens a strip in its own row directly under the key's, so the
-    // message and the confirm are siblings of that row rather than inside it.
-    const armed = screen
-      .getByText(/stops working immediately/)
-      .closest("tr") as HTMLTableRowElement
-    expect(armed).not.toBe(row)
-    expect(row.nextElementSibling).toBe(armed)
-    // The message names the key it is about, which is the whole point of
-    // confirming in place rather than in a dialog.
-    expect(within(armed).getByText("ci-bot")).toBeInTheDocument()
-    await user.click(within(armed).getByRole("button", { name: "Regenerate" }))
+    await chooseAction(user, row, "Regenerate")
+    const confirm = await screen.findByRole("alertdialog")
+    expect(within(confirm).getByText("ci-bot")).toBeInTheDocument()
+    await user.click(
+      within(confirm).getByRole("button", { name: "Regenerate" }),
+    )
 
     const reveal = await screen.findByRole("alert", {
       name: /API key created|New secret for/,
     })
-    expect(within(reveal).getByDisplayValue(REGEN_SECRET)).toBeInTheDocument()
+    expect(within(reveal).getByLabelText("Secret key")).toHaveValue(
+      "gw-REGEN00••••••••0000",
+    )
+    expect(
+      (within(reveal).getByLabelText("curl") as HTMLTextAreaElement).value,
+    ).not.toContain(REGEN_SECRET)
+  })
+
+  it("keeps the page's create action visible while the dialog is open", async () => {
+    // It used to hide itself while the inline form was on the page. The form is
+    // over the page now, so hiding the control that opened it would take the
+    // heading's action away mid-task for no reason, and it is also where focus
+    // returns.
+    mockApi({ keys: [] })
+    const user = userEvent.setup()
+    renderPage(<KeysPage />)
+
+    await screen.findByText("No API keys yet")
+    const trigger = screen.getByRole("button", { name: "Create key" })
+    await user.click(
+      screen.getByRole("button", { name: "Create your first key" }),
+    )
+
+    await screen.findByRole("dialog")
+    expect(trigger).toBeInTheDocument()
+  })
+
+  it("clears the owner and the budget exemption when it reopens", async () => {
+    // The draft is fresh on every open, which is what the page's open counter
+    // buys: the dialog stays mounted through the exit so its content is intact
+    // while it animates out, and the remount on the way in is what clears it.
+    // Before that, the reset ran on close and left the owner and the exemption
+    // behind, so the next key inherited both and a reopened dialog was dirty on
+    // arrival, arming the guard on a form nobody had touched.
+    mockApi({ keys: [], users: [user({ user_id: "alice", alias: "Alice" })] })
+    const usr = userEvent.setup()
+    renderPage(<KeysPage />)
+
+    await screen.findByText("No API keys yet")
+    await usr.click(
+      screen.getByRole("button", { name: "Create your first key" }),
+    )
+    await usr.type(screen.getByPlaceholderText(/Pick a user/), "alice")
+    // Focus off the picker before reaching for anything else: its popover is
+    // open and react-aria aria-hides the rest of the dialog while it is.
+    await usr.click(screen.getByLabelText("Name"))
+    await usr.click(screen.getByRole("button", { name: "Advanced" }))
+    await usr.click(screen.getByLabelText("Exempt from budget"))
+
+    // Out through the guard, which is the only way out of a dirty form.
+    await usr.keyboard("{Escape}")
+    await usr.click(screen.getByRole("button", { name: "Discard" }))
+
+    await usr.click(screen.getByRole("button", { name: "Create key" }))
+    expect(screen.getByPlaceholderText(/Pick a user/)).toHaveValue("")
+    await usr.click(screen.getByRole("button", { name: "Advanced" }))
+    expect(screen.getByLabelText("Exempt from budget")).not.toBeChecked()
+    // And nothing is unsaved on arrival, so Escape closes rather than guarding.
+    await usr.keyboard("{Escape}")
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  it("guards a field the old dirty check did not know about", async () => {
+    // The check read three of the seven values the form owns, so a backdrop
+    // press or Escape discarded the rest without asking.
+    mockApi({ keys: [] })
+    const usr = userEvent.setup()
+    renderPage(<KeysPage />)
+
+    await screen.findByText("No API keys yet")
+    await usr.click(
+      screen.getByRole("button", { name: "Create your first key" }),
+    )
+    await usr.click(screen.getByRole("button", { name: "Advanced" }))
+    await usr.click(screen.getByLabelText("Exempt from budget"))
+
+    await usr.keyboard("{Escape}")
+    expect(screen.getByRole("dialog")).toHaveTextContent("Unsaved changes")
+  })
+
+  it("does not walk /v1/users until the create dialog is opened", async () => {
+    // The dialog stays mounted while closed so it can animate out, which left
+    // its owner picker's roster fetching on every visit to the page.
+    // `fetchAllUsers` walks up to 100 pages of 1000, so this is the page's
+    // cost, not the dialog's. The same shape is waiting on every other page
+    // this series migrates.
+    const fetchMock = mockApi({ keys: [] })
+    const user = userEvent.setup()
+    renderPage(<KeysPage />)
+
+    await screen.findByText("No API keys yet")
+    const usersCalls = () =>
+      fetchMock.mock.calls.filter(([u]) =>
+        String(u).includes(`${API_ROOT}/users`),
+      )
+    expect(usersCalls()).toHaveLength(0)
+
+    await user.click(
+      screen.getByRole("button", { name: "Create your first key" }),
+    )
+    await screen.findByRole("dialog")
+    await waitFor(() => expect(usersCalls().length).toBeGreaterThan(0))
+  })
+
+  it("hands over the secret with no way for the form to skip it", async () => {
+    // The one chance to read the key is not something the form can waive. The
+    // only "Create another" is on the secret step, where it is reached by
+    // having been shown the key first.
+    mockApi({ keys: [] })
+    const user = userEvent.setup()
+    renderPage(<KeysPage />)
+
+    await screen.findByText("No API keys yet")
+    await user.click(
+      screen.getByRole("button", { name: "Create your first key" }),
+    )
+    const dialog = await screen.findByRole("dialog")
+    expect(
+      within(dialog).queryByLabelText("Create another"),
+    ).not.toBeInTheDocument()
+    await user.type(screen.getByLabelText("Name"), "first-key")
+    await user.type(screen.getByPlaceholderText(/Pick a user/), "alice")
+    await user.keyboard("{Escape}")
+    await submitTheCreateDialog(user)
+
+    expect(
+      await screen.findByRole("alert", { name: /API key created/ }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: /I.?ve saved this key/ }),
+    ).toBeInTheDocument()
+  })
+
+  it("shows a regenerated secret in the same dialog a created one arrives in", async () => {
+    // Create and regenerate hand over the same thing, so they hand it over the
+    // same way. Before this they were a dialog and a full-width strip on one
+    // page.
+    mockApi({
+      keys: [apiKey({ id: "key-1", key_name: "ci-bot", is_active: true })],
+    })
+    const user = userEvent.setup()
+    renderPage(<KeysPage />)
+
+    const row = (await screen.findByText("ci-bot")).closest("tr")!
+    await chooseAction(user, row, "Regenerate")
+    const confirm = await screen.findByRole("alertdialog")
+    await user.click(
+      within(confirm).getByRole("button", { name: "Regenerate" }),
+    )
+
+    const dialog = await screen.findByRole("dialog")
+    expect(
+      within(dialog).getByRole("alert", { name: /New secret for ci-bot/ }),
+    ).toBeInTheDocument()
+    // No form step and nothing to create again: the key already exists.
+    expect(
+      within(dialog).queryByRole("button", { name: "Create another" }),
+    ).not.toBeInTheDocument()
+    expect(
+      within(dialog).getByRole("button", { name: /I.?ve saved this key/ }),
+    ).toBeInTheDocument()
+  })
+
+  it("keeps the action lane's slots the same on a live row and a disabled one", async () => {
+    mockApi({
+      keys: [
+        apiKey({ id: "key-1", key_name: "ci-bot", is_active: true }),
+        apiKey({ id: "key-2", key_name: "legacy", is_active: false }),
+      ],
+    })
+    renderPage(<KeysPage />)
+
+    const slots = async (name: string) => {
+      const row = (await screen.findByText(name)).closest("tr")!
+      const lane = row.lastElementChild!.firstElementChild!
+      return lane.children.length
+    }
+
+    // Delete is only offered once a key is disabled, and the lane is
+    // right-aligned, so a lane one control shorter slid every glyph beside it
+    // along and put Edit in a different column on each row. The slot is held
+    // open instead.
+    expect(await slots("ci-bot")).toBe(await slots("legacy"))
+    expect(
+      within((await screen.findByText("ci-bot")).closest("tr")!).queryByRole(
+        "button",
+        { name: "Delete" },
+      ),
+    ).not.toBeInTheDocument()
   })
 
   it("permanently deletes a disabled key after confirm", async () => {
@@ -601,19 +968,21 @@ describe("KeysPage", () => {
     renderPage(<KeysPage />)
 
     const row = (await screen.findByText("legacy")).closest("tr")!
-    await user.click(within(row).getByRole("button", { name: "Delete" }))
-    const armed = screen
-      .getByText(/unlinks its usage history/)
-      .closest("tr") as HTMLTableRowElement
-    expect(row.nextElementSibling).toBe(armed)
-    expect(within(armed).getByText("legacy")).toBeInTheDocument()
+    await chooseAction(user, row, "Delete")
+    const dialog = await screen.findByRole("alertdialog")
+    expect(
+      within(dialog).getByText(/unlinks its usage history/),
+    ).toBeInTheDocument()
+    // The key is named in the dialog, so the operator is not confirming against
+    // a row they can no longer see.
+    expect(within(dialog).getByText("legacy")).toBeInTheDocument()
     await user.click(
-      within(armed).getByRole("button", { name: "Delete permanently" }),
+      within(dialog).getByRole("button", { name: "Delete permanently" }),
     )
 
     const del = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).includes("/v1/keys/key-1") &&
+        String(u).includes(`${API_ROOT}/keys/key-1`) &&
         (init?.method ?? "") === "DELETE",
     )
     expect(del).toBeDefined()
@@ -641,11 +1010,12 @@ describe("KeysPage", () => {
     )
     // Close the combobox popover, which otherwise aria-hides the submit button.
     await user.keyboard("{Escape}")
-    await user.click(screen.getByRole("button", { name: "Create key" }))
+    await submitTheCreateDialog(user)
 
     const post = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).endsWith("/v1/keys") && (init?.method ?? "") === "POST",
+        String(u).endsWith(`${API_ROOT}/keys`) &&
+        (init?.method ?? "") === "POST",
     )
     expect(JSON.parse(String(post?.[1]?.body)).allowed_models).toEqual([
       "openai:gpt-4o",
@@ -672,7 +1042,8 @@ describe("KeysPage", () => {
 
     const post = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).endsWith("/v1/keys") && (init?.method ?? "") === "POST",
+        String(u).endsWith(`${API_ROOT}/keys`) &&
+        (init?.method ?? "") === "POST",
     )
     expect(JSON.parse(String(post?.[1]?.body)).exclude_from_budget).toBe(true)
   })
@@ -694,7 +1065,8 @@ describe("KeysPage", () => {
 
     const post = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).endsWith("/v1/keys") && (init?.method ?? "") === "POST",
+        String(u).endsWith(`${API_ROOT}/keys`) &&
+        (init?.method ?? "") === "POST",
     )
     expect(JSON.parse(String(post?.[1]?.body)).reject_user_mismatch).toBe(false)
     // The created row carries the override back, so the list reflects it.
@@ -712,11 +1084,12 @@ describe("KeysPage", () => {
     )
     await user.type(screen.getByPlaceholderText(/Pick a user/), "alice")
     await user.keyboard("{Escape}")
-    await user.click(screen.getByRole("button", { name: "Create key" }))
+    await submitTheCreateDialog(user)
 
     const post = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).endsWith("/v1/keys") && (init?.method ?? "") === "POST",
+        String(u).endsWith(`${API_ROOT}/keys`) &&
+        (init?.method ?? "") === "POST",
     )
     expect(JSON.parse(String(post?.[1]?.body)).reject_user_mismatch).toBeNull()
   })
@@ -766,28 +1139,74 @@ describe("KeysPage", () => {
     // re-firing onInputChange. The keys API does not know that id, so it silently
     // created a second user aliased "User alice (Alice)" instead of reusing alice.
     const fetchMock = mockApi({
-      keys: [],
+      // The key is what puts alice in this organization, and so in the picker
+      // at all (otari-ai#2108).
+      keys: [apiKey({ id: "key-1", key_name: "existing", user_id: "alice" })],
       users: [user({ user_id: "alice", alias: "Alice" })],
     })
     const usr = userEvent.setup()
     renderPage(<KeysPage />)
 
-    await screen.findByText("No API keys yet")
-    await usr.click(
-      screen.getByRole("button", { name: "Create your first key" }),
-    )
+    await screen.findByText("existing")
+    await usr.click(screen.getByRole("button", { name: "Create key" }))
     await usr.click(screen.getByPlaceholderText(/Pick a user/))
     await usr.click(
       await screen.findByRole("option", { name: "alice (Alice)" }),
     )
-    await usr.keyboard("{Escape}")
-    await usr.click(screen.getByRole("button", { name: "Create key" }))
+    // Focus goes to another field rather than Escape putting the popover away.
+    // The box is `menuTrigger="focus"`, so selecting an option hands focus back
+    // to the input and the popover reopens, and react-aria marks the rest of the
+    // page `aria-hidden` while it is open, which is what puts the submit out of
+    // reach. Escape would close it and then reach the dialog, arming the
+    // unsaved-changes guard and taking the submit out of the footer instead.
+    await usr.click(screen.getByLabelText("Name"))
+    await submitTheCreateDialog(usr)
 
     const post = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).endsWith("/v1/keys") && (init?.method ?? "") === "POST",
+        String(u).endsWith(`${API_ROOT}/keys`) &&
+        (init?.method ?? "") === "POST",
     )
     expect(JSON.parse(String(post?.[1]?.body)).user_id).toBe("alice")
+  })
+
+  it("offers this organization's users as owners, not the deployment's", async () => {
+    // `/api/v1/users` is deployment-wide, so on a deployment holding several
+    // tenants it answered with every tenant's people and the picker offered
+    // them all (otari-ai#2108).
+    const member = "33333333-3333-3333-3333-333333333333"
+    const otherTenant = "44444444-4444-4444-4444-444444444444"
+    mockApi({
+      keys: [apiKey({ id: "key-1", key_name: "ci", user_id: "ci-bot" })],
+      users: [
+        user({ user_id: member, alias: "alice@example.com" }),
+        user({ user_id: "ci-bot", alias: null }),
+        user({ user_id: otherTenant, alias: "someone@other.example" }),
+      ],
+      members: [
+        organizationMember({
+          attribution_user_id: member,
+          full_name: "Alice Example",
+        }),
+      ],
+    })
+    const usr = userEvent.setup()
+    renderPage(<KeysPage />)
+
+    await screen.findByText("ci")
+    await usr.click(screen.getByRole("button", { name: "Create key" }))
+    await usr.click(screen.getByPlaceholderText(/Pick a user/))
+
+    // On the roster, and the owner of a key in this organization.
+    expect(
+      await screen.findByRole("option", { name: /Alice Example/ }),
+    ).toBeInTheDocument()
+    expect(screen.getByRole("option", { name: "ci-bot" })).toBeInTheDocument()
+    // Neither: another organization's person, and nothing here names them.
+    expect(
+      screen.queryByRole("option", { name: /other\.example/ }),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText(otherTenant)).not.toBeInTheDocument()
   })
 
   it("blocks all models by posting an empty list", async () => {
@@ -807,7 +1226,8 @@ describe("KeysPage", () => {
 
     const post = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).endsWith("/v1/keys") && (init?.method ?? "") === "POST",
+        String(u).endsWith(`${API_ROOT}/keys`) &&
+        (init?.method ?? "") === "POST",
     )
     expect(JSON.parse(String(post?.[1]?.body)).allowed_models).toEqual([])
   })
@@ -868,18 +1288,46 @@ describe("KeysPage", () => {
     expect(screen.getByText(/starts unrestricted/)).toBeInTheDocument()
   })
 
-  it("opens the edit form from a key row's Edit action", async () => {
+  it("opens the edit form in a dialog, naming the key it is about", async () => {
     mockApi({ keys: [apiKey({ id: "key-1", key_name: "ci-bot" })] })
     const user = userEvent.setup()
     renderPage(<KeysPage />)
 
     const row = (await screen.findByText("ci-bot")).closest("tr")!
-    await user.click(within(row).getByRole("button", { name: "Edit" }))
+    await chooseAction(user, row, "Edit")
 
-    // The inline edit card appears (its Save button is unique to edit mode).
+    // A dialog rather than a band above the table: the row keeps its place, and
+    // the page under it does not shift by the height of a form (otari-ai#2125).
+    const dialog = await screen.findByRole("dialog", { name: "Edit key" })
+    expect(within(dialog).getByText("ci-bot")).toBeInTheDocument()
     expect(
-      await screen.findByRole("button", { name: "Save changes" }),
+      within(dialog).getByRole("button", { name: "Save" }),
     ).toBeInTheDocument()
+    expect(within(dialog).getByLabelText("Name")).toHaveValue("ci-bot")
+    await user.keyboard("{Escape}")
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    )
+    expect(
+      within(row).getByRole("button", { name: "Actions for ci-bot" }),
+    ).toHaveFocus()
+  })
+
+  it("asks before discarding an edited field", async () => {
+    mockApi({ keys: [apiKey({ id: "key-1", key_name: "ci-bot" })] })
+    const user = userEvent.setup()
+    renderPage(<KeysPage />)
+
+    const row = (await screen.findByText("ci-bot")).closest("tr")!
+    await chooseAction(user, row, "Edit")
+    await user.type(await screen.findByLabelText("Name"), "-2")
+    await user.keyboard("{Escape}")
+
+    // The guard, not the exit: an edit form seeds from the row, so dirty has to
+    // mean "differs from the key" rather than "is not empty".
+    expect(screen.getByRole("button", { name: "Keep editing" })).toBeVisible()
+    await user.click(screen.getByRole("button", { name: "Discard" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
   })
 
   it("toggles exclude_from_budget on an existing key via PATCH", async () => {
@@ -892,13 +1340,13 @@ describe("KeysPage", () => {
     renderPage(<KeysPage />)
 
     const row = (await screen.findByText("ci-bot")).closest("tr")!
-    await user.click(within(row).getByRole("button", { name: "Edit" }))
+    await chooseAction(user, row, "Edit")
     await user.click(await screen.findByLabelText("Exempt from budget"))
-    await user.click(screen.getByRole("button", { name: "Save changes" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
 
     const patch = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).includes("/v1/keys/key-1") &&
+        String(u).includes(`${API_ROOT}/keys/key-1`) &&
         (init?.method ?? "") === "PATCH",
     )
     expect(JSON.parse(String(patch?.[1]?.body)).exclude_from_budget).toBe(true)
@@ -914,13 +1362,13 @@ describe("KeysPage", () => {
     renderPage(<KeysPage />)
 
     const row = (await screen.findByText("ci-bot")).closest("tr")!
-    await user.click(within(row).getByRole("button", { name: "Edit" }))
+    await chooseAction(user, row, "Edit")
     await pickOption(user, "Mismatched user field", "Always accept")
-    await user.click(screen.getByRole("button", { name: "Save changes" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
 
     const patch = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).includes("/v1/keys/key-1") &&
+        String(u).includes(`${API_ROOT}/keys/key-1`) &&
         (init?.method ?? "") === "PATCH",
     )
     expect(JSON.parse(String(patch?.[1]?.body)).reject_user_mismatch).toBe(
@@ -942,17 +1390,17 @@ describe("KeysPage", () => {
     renderPage(<KeysPage />)
 
     const row = (await screen.findByText("ci-bot")).closest("tr")!
-    await user.click(within(row).getByRole("button", { name: "Edit" }))
+    await chooseAction(user, row, "Edit")
     await pickOption(
       user,
       "Mismatched user field",
       "Use the deployment setting (default)",
     )
-    await user.click(screen.getByRole("button", { name: "Save changes" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
 
     const patch = fetchMock.mock.calls.find(
       ([u, init]) =>
-        String(u).includes("/v1/keys/key-1") &&
+        String(u).includes(`${API_ROOT}/keys/key-1`) &&
         (init?.method ?? "") === "PATCH",
     )
     // An explicit null is what clears the override; omitting it would leave it set.
@@ -970,13 +1418,14 @@ describe("KeysPage", () => {
     renderPage(<KeysPage />)
 
     const alphaRow = (await screen.findByText("alpha")).closest("tr")!
-    await user.click(within(alphaRow).getByRole("button", { name: "Edit" }))
+    await chooseAction(user, alphaRow, "Edit")
     expect(await screen.findByLabelText("Name")).toHaveValue("alpha")
+    await user.click(screen.getByRole("button", { name: "Cancel" }))
 
-    // Switching to another key must remount the form; without a keyed remount it
-    // would keep "alpha" and PATCH the wrong key.
+    // The next key must open on its own values; a form that survived the first
+    // row would keep "alpha" and PATCH the wrong key.
     const bravoRow = screen.getByText("bravo").closest("tr")!
-    await user.click(within(bravoRow).getByRole("button", { name: "Edit" }))
+    await chooseAction(user, bravoRow, "Edit")
     expect(await screen.findByLabelText("Name")).toHaveValue("bravo")
   })
 
@@ -988,10 +1437,10 @@ describe("KeysPage", () => {
     renderPage(<KeysPage />)
 
     const row = (await screen.findByText("ci-bot")).closest("tr")!
-    await user.click(within(row).getByRole("button", { name: "Disable" }))
+    await chooseAction(user, row, "Disable")
 
     expect(
-      screen.queryByRole("button", { name: "Save changes" }),
+      screen.queryByRole("button", { name: "Save" }),
     ).not.toBeInTheDocument()
   })
 
@@ -1077,7 +1526,7 @@ describe("KeysPage", () => {
   })
 
   // The member's view of the same page (otari-ai#1941): every hook reads and
-  // writes `/v1/organizations/me/keys`, and the operator-only affordances (the
+  // writes /api/v1/organizations/me/keys, and the operator-only affordances (the
   // owner picker, the budget exemption, the Owner column, the links to pages a
   // member cannot open) are absent rather than present and refused.
   describe("as a member", () => {
@@ -1097,7 +1546,7 @@ describe("KeysPage", () => {
         .filter((u) => KEYS_URL.test(u))
       expect(listCalls.length).toBeGreaterThan(0)
       for (const u of listCalls) {
-        expect(u).toContain("/v1/organizations/me/keys")
+        expect(u).toContain(`${API_ROOT}/organizations/me/keys`)
       }
 
       // Every key here is the caller's own, so no Owner column; and the pages
@@ -1137,11 +1586,13 @@ describe("KeysPage", () => {
       const reveal = await screen.findByRole("alert", {
         name: /API key created|New secret for/,
       })
-      expect(within(reveal).getByDisplayValue(NEW_SECRET)).toBeInTheDocument()
+      expect(within(reveal).getByLabelText("Secret key")).toHaveValue(
+        "gw-NEWSECR••••••••0000",
+      )
 
       const post = fetchMock.mock.calls.find(
         ([u, init]) =>
-          String(u).endsWith("/v1/organizations/me/keys") &&
+          String(u).endsWith(`${API_ROOT}/organizations/me/keys`) &&
           (init?.method ?? "") === "POST",
       )
       expect(post).toBeDefined()
@@ -1161,16 +1612,16 @@ describe("KeysPage", () => {
       renderPage(<KeysPage />)
 
       const row = (await screen.findByText("mine")).closest("tr")!
-      await usr.click(within(row).getByRole("button", { name: "Edit" }))
+      await chooseAction(usr, row, "Edit")
       expect(
         screen.queryByLabelText("Exempt from budget"),
       ).not.toBeInTheDocument()
 
-      await usr.click(screen.getByRole("button", { name: "Save changes" }))
+      await usr.click(screen.getByRole("button", { name: "Save" }))
 
       const patch = fetchMock.mock.calls.find(
         ([u, init]) =>
-          String(u).endsWith("/v1/organizations/me/keys/key-1") &&
+          String(u).endsWith(`${API_ROOT}/organizations/me/keys/key-1`) &&
           (init?.method ?? "") === "PATCH",
       )
       expect(patch).toBeDefined()

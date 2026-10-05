@@ -1,8 +1,7 @@
 import { Button } from "@heroui/react"
 import { useState } from "react"
-
+import { ErrorBanner } from "@/design-system/feedback/ErrorBanner"
 import { useResetPassword } from "@/shared/api/auth"
-import { ErrorBanner } from "@/shared/components/feedback/ErrorBanner"
 import { tokenFromHash } from "@/shared/helpers/hashParams"
 import {
   MAX_PASSWORD_BYTES,
@@ -33,8 +32,8 @@ export function ResetPasswordPage({ hash }: { hash: string }) {
   const [confirmPassword, setConfirmPassword] = useState("")
 
   const problem = newPasswordProblem(password, confirmPassword)
-  const complete = password !== "" && confirmPassword !== ""
-  const canSubmit = token !== null && complete && problem === null
+  const isComplete = password !== "" && confirmPassword !== ""
+  const canSubmit = token !== null && isComplete && problem === null
 
   // A refusal describes a call that is no longer the one being made, so typing
   // clears it. Never while one is in flight: `reset()` returns the observer to
@@ -121,6 +120,7 @@ export function ResetPasswordPage({ hash }: { hash: string }) {
           }}
           autoComplete="new-password"
           description={`At least ${MIN_PASSWORD_LENGTH} characters, and at most ${MAX_PASSWORD_BYTES} bytes.`}
+          errorMessage={problem ?? undefined}
         />
         <AuthPasswordField
           label="Confirm new password"
@@ -131,11 +131,6 @@ export function ResetPasswordPage({ hash }: { hash: string }) {
           }}
           autoComplete="new-password"
         />
-        {problem ? (
-          <p role="alert" className="text-caption text-danger">
-            {problem}
-          </p>
-        ) : null}
         <ErrorBanner error={reset.error} />
         <Button
           type="submit"

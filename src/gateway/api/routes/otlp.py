@@ -4,12 +4,12 @@ Any application instrumented for GenAI telemetry can ship its usage to Otari ove
 OTLP and have it recorded as imported usage: priced at Otari's own rates, budget
 exempt, idempotent, and content-free. Two signal endpoints, one mapping:
 
-- ``POST /v1/traces`` accepts spans, the shape most GenAI instrumentation emits
+- ``POST /otlp/v1/traces`` accepts spans, the shape most GenAI instrumentation emits
   (OpenLLMetry, OpenLIT, native SDK OpenTelemetry).
-- ``POST /v1/logs`` accepts log events, the shape Claude Code emits (its
+- ``POST /otlp/v1/logs`` accepts log events, the shape Claude Code emits (its
   ``api_request`` event rides the logs signal, not traces).
 
-A third endpoint, ``POST /v1/metrics``, receives the metrics signal. It carries no
+A third endpoint, ``POST /otlp/v1/metrics``, receives the metrics signal. It carries no
 usage: it records the content-free outcome counters (lines changed, commits, pull
 requests, active time) that give recorded spend a denominator.
 
@@ -31,9 +31,9 @@ Both protobuf and JSON OTLP payloads are accepted (optionally gzip-encoded), and
 standard OTLP export response is returned. Authentication requires a budget-exempt
 API key: OTLP events carry no user attribution of their own, so usage binds to the
 key's user. The master key is refused here (it has no user to bind to; use
-``POST /v1/usage/external-events`` with an explicit ``user_id`` instead). Point the
+``POST /api/v1/usage/external-events`` with an explicit ``user_id`` instead). Point the
 exporter's endpoint at the Otari root; the exporter appends the signal path
-(``/v1/traces`` or ``/v1/logs``) itself.
+(``/otlp/v1/traces`` or ``/otlp/v1/logs``) itself.
 """
 
 import hashlib
@@ -64,7 +64,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gateway.api.deps import TelemetryStoragePortDep, get_config, get_db, verify_api_key_or_master_key
 from gateway.core.config import GatewayConfig
 from gateway.log_config import logger
-from gateway.models.entities import APIKey
+from gateway.models.api_keys import APIKey
 from gateway.ports.telemetry_storage_port import TelemetryRecord
 from gateway.services.agent_telemetry_service import (
     CUMULATIVE,
@@ -78,7 +78,7 @@ from gateway.services.external_usage_service import (
     ExternalEventsRequest,
     ExternalUsageEvent,
     ingest_external_events,
-    reserved_source_reason,
+    is_reserved_source,
 )
 
 router = APIRouter(tags=["otel"])
@@ -206,10 +206,9 @@ def _resolve_timestamp(attrs: dict[str, Any], default: datetime | None) -> datet
 
 def _sanitize_source(name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._:-]+", "-", name).strip("-")[:64]
-    # "gateway" is reserved for usage Otari served itself and the `otari-ai:` prefix for
-    # the provenance tags otari.ai writes; a client claiming either would masquerade as
-    # those rows (and fail the ingest schema with a 500).
-    if not slug or reserved_source_reason(slug) is not None:
+    # "gateway" is reserved for usage Otari served itself; a client claiming it would
+    # masquerade as those rows (and fail the ingest schema with a 500).
+    if not slug or is_reserved_source(slug):
         return _DEFAULT_SOURCE
     return slug
 
@@ -262,10 +261,11 @@ def _build_event(
     # tokens, 1h overcharges the 5m ones. Anthropic prices a 1h write at 2x base input
     # against 1.25x for a 5m one, so booking the base bucket keeps an imported estimate
     # from ever reading above true cost. Callers holding the real split use
-    # POST /v1/usage/external-events, which takes cache_write_1h_tokens directly.
+    # POST /api/v1/usage/external-events, which takes cache_write_1h_tokens directly.
     # No branch below reassigns this today: it stays a variable rather than a literal at
     # the construction site as the seam for an emitter that does report the split.
     cache_write_1h = 0
+    reasoning = 0
     event_name = attrs.get("event.name")
     if event_name == "api_request":
         # Claude Code: cache reads/writes are additive (outside input_tokens).
@@ -293,6 +293,7 @@ def _build_event(
             input_tokens = _int(attrs.get("input_token_count"))
             output_tokens = _int(attrs.get("output_token_count"))
             cache_read = _int(attrs.get("cached_token_count"))
+            reasoning = _int(attrs.get("reasoning_token_count"))
             event_id = _codex_event_id(attrs, None)
             duration = duration_ms
         else:  # codex.api_request (HTTP /models path)
@@ -339,6 +340,7 @@ def _build_event(
             cache_read_tokens=cache_read,
             cache_write_tokens=cache_write,
             cache_write_1h_tokens=cache_write_1h,
+            reasoning_tokens=reasoning,
             cache_tokens_in_prompt=cache_tokens_in_prompt,
             duration_ms=int(duration) if duration is not None else None,
             session_label=str(session) if session else None,
@@ -360,7 +362,7 @@ def _require_import_key(api_key: APIKey | None) -> APIKey:
             status.HTTP_403_FORBIDDEN,
             "OTLP export cannot authenticate with the master key: OTLP events carry no user to "
             "attribute usage to. Use a budget-exempt API key for the importing user, or "
-            "POST /v1/usage/external-events with an explicit user_id.",
+            "POST /api/v1/usage/external-events with an explicit user_id.",
         )
     return api_key
 
@@ -517,7 +519,7 @@ async def receive_logs(
     # Usage and behavioral events insert a row each and are disjoint by event name,
     # so the bound is on their total: checked per-list, one export could persist
     # twice _MAX_EVENTS_PER_EXPORT rows. The narrower check inside _ingest still
-    # covers /v1/traces, which has no behavioral path.
+    # covers /otlp/v1/traces, which has no behavioral path.
     if len(pairs) + len(telemetry) > _MAX_EVENTS_PER_EXPORT:
         raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "Too many events in one OTLP export")
 

@@ -1,24 +1,27 @@
 import { AlertDialog, Button, buttonVariants, Input } from "@heroui/react"
-import { useEffect, useRef, useState } from "react"
+import { Fragment, useEffect, useRef, useState } from "react"
 import type { ConfigField, UpdateSettingsRequest } from "@/client"
+import { CONCEALED_SECRET, CopyField } from "@/design-system/actions/CopyField"
+import { ErrorBanner } from "@/design-system/feedback/ErrorBanner"
+import { InfoBanner } from "@/design-system/feedback/InfoBanner"
+import { PageLoading } from "@/design-system/feedback/PageLoading"
+import { Checkbox } from "@/design-system/forms/Checkbox"
+import { INPUT_CLASS } from "@/design-system/forms/inputClass"
+import { Toggle } from "@/design-system/forms/Toggle"
+import { PageIntro } from "@/design-system/layout/PageIntro"
+import { SettingsGroup } from "@/design-system/layout/SettingsGroup"
+import { Toolbar } from "@/design-system/layout/Toolbar"
+import { FilterSelect } from "@/design-system/navigation/FilterSelect"
 import { MailDeliveryCard } from "@/features/settings/MailDeliveryCard"
 import { MaintenanceModeCard } from "@/features/settings/MaintenanceModeCard"
-import { Toggle } from "@/features/settings/Toggle"
+import { RateLimitsCard } from "@/features/settings/RateLimitsCard"
 import { useRotateMasterKey } from "@/shared/api/auth"
 import {
   useReencryptProviderCredentials,
   useStoredProviders,
 } from "@/shared/api/providers"
 import { useSettings, useUpdateSettings } from "@/shared/api/settings"
-import { ErrorBanner } from "@/shared/components/feedback/ErrorBanner"
-import { InfoBanner } from "@/shared/components/feedback/InfoBanner"
-import { PageLoading } from "@/shared/components/feedback/PageLoading"
-import { Checkbox } from "@/shared/components/forms/Checkbox"
-import { INPUT_CLASS } from "@/shared/components/forms/inputClass"
-import { PageIntro } from "@/shared/components/layout/PageIntro"
-import { SettingsGroup } from "@/shared/components/layout/SettingsGroup"
-import { Toolbar } from "@/shared/components/layout/Toolbar"
-import { FilterSelect } from "@/shared/components/navigation/FilterSelect"
+import { useDeployment } from "@/shared/hooks/useDeployment"
 
 // A single settable field maps onto one key of UpdateSettingsRequest. The keys
 // come from the backend's `settable` marking, so cast at this one boundary.
@@ -43,19 +46,76 @@ function isSubsequence(needle: string, haystack: string): boolean {
 // substring of the field's key/description/group or a fuzzy subsequence of its
 // key (so "mctts" finds "model_cache_ttl_seconds"). An empty query matches all.
 export function fieldMatches(field: ConfigField, query: string): boolean {
+  return textMatches(
+    `${field.key} ${field.description ?? ""} ${field.group}`,
+    field.key,
+    query,
+  )
+}
+
+function textMatches(text: string, name: string, query: string): boolean {
   const q = query.trim().toLowerCase()
   if (q === "") return true
-  const haystack =
-    `${field.key} ${field.description ?? ""} ${field.group}`.toLowerCase()
-  const key = field.key.toLowerCase().replace(/[^a-z0-9]/g, "")
+  const haystack = text.toLowerCase()
+  const key = name.toLowerCase().replace(/[^a-z0-9]/g, "")
   return q
     .split(/\s+/)
     .every((term) => haystack.includes(term) || isSubsequence(term, key))
 }
 
+// The server's `SettingsGroup.RATE_LIMITING`. The rules card follows it.
+const RATE_LIMITING_GROUP = "Rate limiting & CORS"
+
+/** Whether a search finds the rate limit rules card, which no config field stands for. */
+export function rateLimitRulesMatch(query: string): boolean {
+  return textMatches(
+    `rate_limits rate limit rules requests tokens per minute in flight ${RATE_LIMITING_GROUP}`,
+    "rate_limits",
+    query,
+  )
+}
+
+/**
+ * The index of the shown group the rules card follows, or -1 to put it first.
+ *
+ * It follows the rate limiting group, and when a filter hides that group it
+ * keeps its place among the groups still shown. A deployment whose settings
+ * name no such group gets the card after them all.
+ */
+export function rulesCardAfter(
+  shown: { name: string }[],
+  all: { name: string }[],
+): number {
+  const order = all.map((group) => group.name)
+  const anchor = order.indexOf(RATE_LIMITING_GROUP)
+  if (anchor === -1) return shown.length - 1
+  return shown.reduce(
+    (after, group, index) =>
+      order.indexOf(group.name) <= anchor ? index : after,
+    -1,
+  )
+}
+
+// The text a control shows over a committed server value.
+//
+// A committed value that moves replaces the draft, so a field nobody is editing
+// follows the server. An unsaved edit stands, so another operator's change (any
+// save on this page writes the whole settings payload back) does not take a
+// half-typed value out from under the cursor. Adjusting state during render is
+// React's answer for a reset conditioned on a value, and the shape
+// `design-system/forms/ComboBoxField.tsx` uses.
+function useDraft(committed: string) {
+  const [draft, setDraft] = useState(committed)
+  const [lastSeenValue, setLastSeenValue] = useState(committed)
+  if (committed !== lastSeenValue) {
+    setLastSeenValue(committed)
+    if (draft === lastSeenValue) setDraft(committed)
+  }
+  return [draft, setDraft] as const
+}
+
 // A numeric setting (int or float) with an explicit Save, so a mistyped value is
-// not applied on every keystroke. The draft resyncs whenever the committed value
-// changes (after a save round-trip).
+// not applied on every keystroke.
 function NumberSetting({
   field,
   onSave,
@@ -66,12 +126,8 @@ function NumberSetting({
   disabled?: boolean
 }) {
   const committed = typeof field.value === "number" ? field.value : 0
-  const [draft, setDraft] = useState(String(committed))
+  const [draft, setDraft] = useDraft(String(committed))
   const isFloat = field.type === "float"
-
-  useEffect(() => {
-    setDraft(String(committed))
-  }, [committed])
 
   const parsed = Number(draft)
   const wellFormed =
@@ -89,8 +145,8 @@ function NumberSetting({
       : ge !== undefined
         ? parsed >= ge
         : parsed >= 0
-  const valid = wellFormed && withinBounds
-  const changed = valid && parsed !== committed
+  const isValid = wellFormed && withinBounds
+  const hasChanged = isValid && parsed !== committed
 
   return (
     <div className="flex items-center gap-2">
@@ -109,7 +165,7 @@ function NumberSetting({
         size="sm"
         variant="primary"
         aria-label={`Save ${field.key}`}
-        isDisabled={disabled || !changed}
+        isDisabled={disabled || !hasChanged}
         onPress={() => onSave(parsed)}
       >
         Save
@@ -130,13 +186,14 @@ function TextSetting({
   disabled?: boolean
 }) {
   const committed = typeof field.value === "string" ? field.value : ""
-  const [draft, setDraft] = useState(committed)
+  const [draft, setDraft] = useDraft(committed)
 
-  useEffect(() => {
-    setDraft(committed)
-  }, [committed])
-
-  const changed = draft !== committed
+  // What a save would store, as text: a box holding only whitespace clears the
+  // value. Comparing and showing this rather than the raw text is what keeps
+  // Save armed for a real change only, and what leaves the box reading the
+  // value it just sent.
+  const saved = draft.trim() === "" ? "" : draft
+  const hasChanged = saved !== committed
 
   return (
     <div className="flex items-center gap-2">
@@ -153,8 +210,11 @@ function TextSetting({
         size="sm"
         variant="primary"
         aria-label={`Save ${field.key}`}
-        isDisabled={disabled || !changed}
-        onPress={() => onSave(draft.trim() === "" ? null : draft)}
+        isDisabled={disabled || !hasChanged}
+        onPress={() => {
+          setDraft(saved)
+          onSave(saved === "" ? null : saved)
+        }}
       >
         Save
       </Button>
@@ -212,10 +272,10 @@ function SettingControl({
   if (field.type === "bool") {
     return (
       <Toggle
-        checked={field.value === true}
+        isSelected={field.value === true}
         onChange={(next) => patch(settableUpdate(field.key, next))}
         label={field.key}
-        disabled={disabled}
+        isDisabled={disabled}
       />
     )
   }
@@ -290,67 +350,6 @@ function ConfigRow({
   )
 }
 
-function CopyField({
-  value,
-  fieldRef,
-}: {
-  value: string
-  fieldRef?: React.RefObject<HTMLInputElement | null>
-}) {
-  const internalRef = useRef<HTMLInputElement>(null)
-  const ref = fieldRef ?? internalRef
-  const [copied, setCopied] = useState(false)
-  const [selectHint, setSelectHint] = useState(false)
-
-  const copy = async () => {
-    ref.current?.focus()
-    ref.current?.select()
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(value)
-        setCopied(true)
-        setSelectHint(false)
-        window.setTimeout(() => setCopied(false), 2_000)
-        return
-      }
-    } catch {
-      // Fall through to the manual-copy hint.
-    }
-    setSelectHint(true)
-  }
-
-  return (
-    <div className="flex flex-col gap-1">
-      <div className="flex items-center justify-between">
-        <span className="text-caption">New master key</span>
-        <Button size="sm" variant="ghost" onPress={copy}>
-          {copied ? "Copied" : "Copy"}
-        </Button>
-      </div>
-      <input
-        ref={ref}
-        readOnly
-        value={value}
-        onFocus={(event) => event.currentTarget.select()}
-        autoComplete="off"
-        autoCorrect="off"
-        autoCapitalize="off"
-        spellCheck={false}
-        data-1p-ignore
-        data-lpignore="true"
-      />
-      <span aria-live="polite" className="text-xs text-success">
-        {copied ? "Copied to clipboard." : ""}
-      </span>
-      {selectHint ? (
-        <span className="text-caption">
-          Selected. Press Ctrl/Cmd-C to copy.
-        </span>
-      ) : null}
-    </div>
-  )
-}
-
 function MasterKeyRotationDialog({
   masterKey,
   error,
@@ -364,12 +363,13 @@ function MasterKeyRotationDialog({
   onRegenerate: () => void
   onClose: () => void
 }) {
-  const keyRef = useRef<HTMLInputElement>(null)
+  const keyRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null)
 
   useEffect(() => {
     if (masterKey === undefined) return
+    // Focus without a selection: the key is concealed until it is asked for,
+    // and selecting the stand-in would invite a Ctrl/Cmd-C that copies bullets.
     keyRef.current?.focus()
-    keyRef.current?.select()
   }, [masterKey])
 
   return (
@@ -394,7 +394,12 @@ function MasterKeyRotationDialog({
                   The previous master key has stopped working. This browser tab
                   now uses the new key.
                 </p>
-                <CopyField value={masterKey} fieldRef={keyRef} />
+                <CopyField
+                  label="New master key"
+                  value={masterKey}
+                  concealed={CONCEALED_SECRET}
+                  fieldRef={keyRef}
+                />
               </>
             ) : (
               <>
@@ -596,26 +601,22 @@ function SecurityKeysSection({
 function groupFields(
   fields: ConfigField[],
 ): { name: string; fields: ConfigField[] }[] {
-  const order: { name: string; fields: ConfigField[] }[] = []
-  const byName = new Map<string, { name: string; fields: ConfigField[] }>()
-  for (const field of fields) {
-    let group = byName.get(field.group)
-    if (!group) {
-      group = { name: field.group, fields: [] }
-      byName.set(field.group, group)
-      order.push(group)
-    }
-    group.fields.push(field)
-  }
-  return order
+  const byName = fields.reduce((groups, field) => {
+    const group = groups.get(field.group)
+    if (group) group.fields.push(field)
+    else groups.set(field.group, { name: field.group, fields: [field] })
+    return groups
+  }, new Map<string, { name: string; fields: ConfigField[] }>())
+  return [...byName.values()]
 }
 
 export function SettingsPage() {
   const settings = useSettings()
   const updateSettings = useUpdateSettings()
+  const { deployment_type } = useDeployment()
 
   const data = settings.data
-  const pending = updateSettings.isPending
+  const isPending = updateSettings.isPending
 
   const [search, setSearch] = useState("")
   const [settableOnly, setSettableOnly] = useState(false)
@@ -648,6 +649,15 @@ export function SettingsPage() {
       (settableOnly ? field.settable : true) && fieldMatches(field, search),
   )
   const groups = groupFields(filtered)
+  // Shown under "Settable only" too: the rules are editable even though the
+  // rows in the group beside them are startup-only. Not before the settings
+  // answer, or the card would render first and then move under its group.
+  // Not on a hosted control plane, which serves no request a rule could limit.
+  const showRules =
+    data !== undefined &&
+    deployment_type !== "hosted" &&
+    rateLimitRulesMatch(search)
+  const rulesAfter = rulesCardAfter(groups, groupFields(allFields))
 
   return (
     <div className="flex flex-col">
@@ -683,27 +693,28 @@ export function SettingsPage() {
         </p>
       ) : null}
 
-      {data && filtered.length === 0 ? (
+      {data && filtered.length === 0 && !showRules ? (
         <p className="text-sm text-muted">No settings match your search.</p>
       ) : null}
 
       {settings.isLoading ? <PageLoading /> : null}
 
-      {groups.map((group) => (
-        <SettingsGroup
-          key={group.name}
-          title={group.name}
-          count={group.fields.length}
-        >
-          {group.fields.map((field) => (
-            <ConfigRow
-              key={field.key}
-              field={field}
-              patch={patch}
-              disabled={!data || pending}
-            />
-          ))}
-        </SettingsGroup>
+      {showRules && rulesAfter === -1 ? <RateLimitsCard /> : null}
+
+      {groups.map((group, index) => (
+        <Fragment key={group.name}>
+          <SettingsGroup title={group.name} count={group.fields.length}>
+            {group.fields.map((field) => (
+              <ConfigRow
+                key={field.key}
+                field={field}
+                patch={patch}
+                disabled={!data || isPending}
+              />
+            ))}
+          </SettingsGroup>
+          {showRules && index === rulesAfter ? <RateLimitsCard /> : null}
+        </Fragment>
       ))}
 
       {data ? (

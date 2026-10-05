@@ -1,32 +1,12 @@
 import { describe, expect, it } from "vitest"
 
-import type { Budget, ProviderHealthResponse } from "@/client"
+import type { AllocationHealth, ProviderHealthResponse } from "@/client"
 import {
-  budgetHealth,
+  allocationStrip,
   errorRateHealth,
   providerHealthStatus,
-  toStatStatus,
 } from "@/features/overview/overview"
 import { usageTotals } from "@/tests/fixtures"
-
-function budget(over: Partial<Budget>): Budget {
-  return {
-    budget_id: "b",
-    organization_id: null,
-    name: null,
-    max_budget: 100,
-    token_limit: null,
-    request_limit: null,
-    reset_alignment: null,
-    budget_duration_sec: null,
-    created_at: "2026-01-01T00:00:00Z",
-    updated_at: "2026-01-01T00:00:00Z",
-    user_count: 1,
-    total_spend: 0,
-    total_reserved: 0,
-    ...over,
-  }
-}
 
 const totals = usageTotals
 
@@ -84,62 +64,123 @@ describe("providerHealthStatus", () => {
   })
 })
 
-describe("budgetHealth", () => {
-  it("is neutral with no budgets configured", () => {
-    expect(budgetHealth([]).status).toBe("neutral")
-    expect(budgetHealth([]).label).toBe("No budgets configured")
-  })
+const LABELS = {
+  none: "No budgets configured",
+  noneCapped: "No capped budgets",
+}
 
-  it("excludes unlimited caps and user-less budgets", () => {
-    const result = budgetHealth([
-      budget({ max_budget: null, total_spend: 9999 }),
-      budget({ user_count: 0, total_spend: 9999 }),
-    ])
+function health(over: Partial<AllocationHealth> = {}): AllocationHealth {
+  return {
+    over_count: 0,
+    near_count: 0,
+    capped_count: 1,
+    total_count: 1,
+    worst: {
+      budget_id: "11111111-2222-3333-4444-555555555555",
+      name: "Monthly",
+      spent: 50,
+      allocated: 100,
+      scope_type: null,
+      scope_id: null,
+    },
+    ...over,
+  }
+}
+
+describe("allocationStrip", () => {
+  it("is neutral with nothing configured", () => {
+    const result = allocationStrip(health({ total_count: 0 }), LABELS)
+
     expect(result.status).toBe("neutral")
-    expect(result.cappedCount).toBe(0)
+    expect(result.label).toBe("No budgets configured")
   })
 
-  it("uses cap * user_count for allocation (per-user cap)", () => {
-    // cap 10 * 2 users = 20 allocated; spend 25 => over.
-    const result = budgetHealth([
-      budget({ max_budget: 10, user_count: 2, total_spend: 25, name: "team" }),
-    ])
+  it("tells nothing configured from nothing capped", () => {
+    const result = allocationStrip(
+      health({ capped_count: 0, worst: null }),
+      LABELS,
+    )
+
+    expect(result.status).toBe("neutral")
+    expect(result.label).toBe("No capped budgets")
+  })
+
+  it("is neutral where the caller may not see the strip at all", () => {
+    // Withheld rather than empty, so the page says the same thing it says for
+    // a deployment with no budgets rather than showing a false zero.
+    expect(allocationStrip(null, LABELS).status).toBe("neutral")
+    expect(allocationStrip(undefined, LABELS).label).toBe(
+      "No budgets configured",
+    )
+  })
+
+  it("derives the share from the worst row the server picked", () => {
+    const result = allocationStrip(
+      health({ worst: { ...health().worst!, spent: 75, allocated: 300 } }),
+      LABELS,
+    )
+
+    expect(result.worst?.pct).toBe(0.25)
+  })
+
+  it("reads spend against an allowance of zero as a full share", () => {
+    // It admits nothing, so anything spent is past it, and the share has no
+    // finite value to render.
+    const result = allocationStrip(
+      health({
+        over_count: 1,
+        worst: { ...health().worst!, spent: 5, allocated: 0 },
+      }),
+      LABELS,
+    )
+
+    expect(result.worst?.pct).toBe(1)
     expect(result.status).toBe("alert")
-    expect(result.overCount).toBe(1)
-    expect(result.worst).toEqual({
-      name: "team",
-      spent: 25,
-      allocated: 20,
-      pct: 1.25,
-    })
   })
 
-  it("flags near-limit at 80% and picks the worst-off budget", () => {
-    const result = budgetHealth([
-      budget({
-        budget_id: "a",
-        max_budget: 100,
-        user_count: 1,
-        total_spend: 50,
-      }), // 50%
-      budget({
-        budget_id: "b",
-        max_budget: 100,
-        user_count: 1,
-        total_spend: 85,
-      }), // 85% near
-    ])
-    expect(result.status).toBe("warn")
-    expect(result.nearCount).toBe(1)
-    expect(result.worst?.name).toBe("b")
-  })
-})
+  it("names an unnamed row by its id fingerprint", () => {
+    const result = allocationStrip(
+      health({ worst: { ...health().worst!, name: null } }),
+      LABELS,
+    )
 
-describe("toStatStatus", () => {
-  it("maps neutral to undefined and passes the rest through", () => {
-    expect(toStatStatus("neutral")).toBeUndefined()
-    expect(toStatStatus("ok")).toBe("ok")
-    expect(toStatStatus("warn")).toBe("warn")
-    expect(toStatStatus("alert")).toBe("alert")
+    expect(result.worst?.name).toBe("11111111")
+  })
+
+  it("names an unnamed row by what it caps, where it caps something", () => {
+    // A spend ceiling nobody named is named after its scope. Falling through to
+    // the id fingerprint here would put hex in the meter's accessible name.
+    const result = allocationStrip(
+      health({
+        worst: {
+          ...health().worst!,
+          name: null,
+          scope_type: "workspace",
+          scope_id: "ws-1",
+        },
+      }),
+      { ...LABELS, nameOf: () => "A workspace" },
+    )
+
+    expect(result.worst?.name).toBe("A workspace")
+  })
+
+  it("words the strip from the counts the server returned", () => {
+    expect(allocationStrip(health({ over_count: 2 }), LABELS).label).toBe(
+      "2 over limit",
+    )
+    expect(allocationStrip(health({ near_count: 1 }), LABELS).label).toBe(
+      "1 near limit",
+    )
+    expect(allocationStrip(health(), LABELS).label).toBe("All within budget")
+  })
+
+  it("puts over-limit ahead of near-limit in the status", () => {
+    const result = allocationStrip(
+      health({ over_count: 1, near_count: 3 }),
+      LABELS,
+    )
+
+    expect(result.status).toBe("alert")
   })
 })

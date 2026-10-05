@@ -1,4 +1,4 @@
-"""``GET /v1/tool-settings`` answers a tenant, without the service endpoints in it.
+"""``GET /api/v1/tool-settings`` answers a tenant, without the service endpoints in it.
 
 The roles matrix has the Tools pages at View for a member, and mozilla-ai/otari#867
 deferred this one read because the fields are deployment infrastructure rather
@@ -23,11 +23,11 @@ from fastapi import status
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from gateway.models.entities import DashboardSession
-from gateway.models.tenancy import Organization, OrganizationMember, User
+from gateway.core.config import API_ROOT
+from gateway.models.tenancy import DashboardSession, Organization, OrganizationMember, User
 from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME, hash_session_token
 
-_PATH = "/v1/tool-settings"
+_PATH = f"{API_ROOT}/tool-settings"
 _URL_KEYS = {"web_search_url", "sandbox_url", "guardrails_url"}
 
 
@@ -59,7 +59,7 @@ def _identity(session: Session, *, email: str, organization_id: uuid.UUID, is_su
 def sessions(
     client: TestClient, master_key_header: dict[str, str], db_session_factory: Callable[[], Session]
 ) -> dict[str, str]:
-    assert client.get("/v1/organizations/me", headers=master_key_header).status_code == status.HTTP_200_OK
+    assert client.get(f"{API_ROOT}/organizations/me", headers=master_key_header).status_code == status.HTTP_200_OK
     session = db_session_factory()
     try:
         organization = Organization(name="Alpha", slug="alpha")
@@ -68,9 +68,7 @@ def sessions(
         session.refresh(organization)
         return {
             "member": _identity(session, email="member@alpha.test", organization_id=organization.id),
-            "operator": _identity(
-                session, email="root@alpha.test", organization_id=organization.id, is_superuser=True
-            ),
+            "operator": _identity(session, email="root@alpha.test", organization_id=organization.id, is_superuser=True),
         }
     finally:
         session.close()

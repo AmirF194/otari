@@ -1,50 +1,144 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import {
+  hashKey,
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query"
 import type {
+  AcceptInvitationRequest,
   AcceptInvitationResult,
+  BulkInviteOrganizationMembersRequest,
+  BulkInviteOrganizationMembersResult,
   CallerOrganizationMembership,
   CreateOrganizationDomainRequest,
-  CreateOrganizationMemberRequest,
-  CreateOrganizationMemberResult,
   CreateOrganizationRequest,
   CreateOrgProviderKeyRequest,
   InvitationPreview,
   InviteOrganizationMemberRequest,
   InviteOrganizationMemberResult,
+  OfferOrgProviderModelRequest,
   Organization,
   OrganizationContext,
   OrganizationDomain,
   OrganizationMember,
+  OrganizationMembers,
+  OrgProviderAvailableModels,
   OrgProviderKey,
+  OrgProviderModel,
+  OrgProviderModels,
+  OrgProviderModelsRefresh,
   PendingOrganizationInvitation,
   SwitchOrganizationRequest,
   UpdateOrganizationDomainRequest,
   UpdateOrganizationMemberRequest,
   UpdateOrganizationRequest,
   UpdateOrgProviderKeyRequest,
+  UpdateOrgProviderModelRequest,
 } from "@/client"
-import { ApiError, apiFetch } from "@/shared/api/client"
+import { ApiError, apiFetch, longRequestSignal } from "@/shared/api/client"
 import { fetchAllPaged } from "@/shared/api/paging"
 import {
+  CATALOG,
+  MODELS,
+  NO_RETRY,
+  ORGANIZATION_CONTEXT,
   ORGANIZATION_DOMAINS,
   ORGANIZATION_MEMBERS,
+  ORGANIZATION_PROVIDER_AVAILABLE_MODELS,
   ORGANIZATION_PROVIDER_KEYS,
+  ORGANIZATION_PROVIDER_MODELS,
   ORGANIZATIONS,
   WORKSPACES,
 } from "@/shared/api/queryKeys"
 
-export function useOrganizationContext() {
+/** The context key as React Query addresses it, for a filter that excludes it. */
+const ORGANIZATION_CONTEXT_HASH = hashKey(ORGANIZATION_CONTEXT)
+
+// The organization the caller's identity is pointed at, and their standing in
+// it. Every tenancy page reads it first: it names the tenant on screen and
+// decides whether the management controls are offered at all. Read often and
+// changed rarely, so it is cached for a minute like the other management lists.
+//
+// `enabled` is for the one page that renders ahead of a session: the public
+// catalog has no organization to ask about, and asking would 401 into the
+// sign-out handler.
+export function useOrganizationContext(enabled = true) {
   return useQuery({
-    queryKey: [ORGANIZATIONS, "context"],
-    queryFn: () => apiFetch<OrganizationContext>("/v1/organizations/me"),
+    queryKey: ORGANIZATION_CONTEXT,
+    queryFn: () => apiFetch<OrganizationContext>("/organizations/me"),
     staleTime: 60_000,
+    enabled,
   })
+}
+
+/**
+ * What the organization context says about whether the caller operates the
+ * deployment, as one of four answers rather than a boolean.
+ *
+ * `"unavailable"` is the read having failed with nothing cached to fall back
+ * on. It is kept apart from `"not-operator"` because the two call for opposite
+ * behavior: a resolved no withholds the operator surface silently, while a
+ * failed read cannot say whether anything is being withheld from its owner.
+ */
+export type DeploymentOperatorAnswer =
+  | "operator"
+  | "not-operator"
+  | "pending"
+  | "unavailable"
+
+/**
+ * Derive the answer from the context query.
+ *
+ * Cached data wins over a later failed refetch. `isFetched` rather than
+ * `isError` marks a failure, because a query that errored with no data goes
+ * back to pending on its next fetch, and a caller that read that as "still
+ * loading" would swap pages on every retry. An older gateway that omits the
+ * field reads as not an operator.
+ */
+export function deploymentOperatorAnswer(query: {
+  data?: OrganizationContext
+  isFetched: boolean
+}): DeploymentOperatorAnswer {
+  if (query.data) {
+    return query.data.deployment_operator === true ? "operator" : "not-operator"
+  }
+  return query.isFetched ? "unavailable" : "pending"
+}
+
+/**
+ * Whether to treat the caller as a deployment operator, for every page, rail
+ * row and scope hook that asks (otari#876).
+ *
+ * `isOperator` **fails open** on an unavailable answer. Every deployment-wide
+ * route it gates refuses a non-operator with a 403 that names the reason, so
+ * offering the surface costs a tenant a refusal during the outage, while
+ * withholding it would silently take an operator's controls away with nothing
+ * on screen saying why. It is false while the answer is pending, so nothing
+ * deployment-wide is asked for and then refused on an ordinary first paint;
+ * `isSettled` is for a caller that must wait rather than render that window.
+ *
+ * Client-side only: it decides what to offer, and the server still authorizes
+ * every request.
+ */
+export function useDeploymentOperator(enabled = true): {
+  answer: DeploymentOperatorAnswer
+  isOperator: boolean
+  isSettled: boolean
+} {
+  const answer = deploymentOperatorAnswer(useOrganizationContext(enabled))
+  return {
+    answer,
+    isOperator: answer === "operator" || answer === "unavailable",
+    isSettled: answer !== "pending",
+  }
 }
 
 // Whether the deployment can encrypt a provider credential at rest, i.e. whether
 // OTARI_SECRET_KEY is set on the server. Both provider-key pages gate their add
 // control on it, so the rule lives here rather than twice.
 //
-// Read off the membership context rather than `/v1/settings`, which reports the
+// Read off the membership context rather than `/settings`, which reports the
 // same fact as `secret_key_configured` but is operator-only: an organization
 // owner is not one, so that query 403s for the whole tenant-facing audience and
 // a refusal used to read as "the key is missing" (#839).
@@ -69,13 +163,13 @@ export function useOrganizationMemberships() {
     queryKey: [ORGANIZATIONS, "memberships"],
     queryFn: () =>
       fetchAllPaged<CallerOrganizationMembership>(
-        "/v1/organizations/me/memberships",
+        "/organizations/me/memberships",
       ),
     staleTime: 60_000,
     // Same guard as `useUsageGroupedSeries` and `useInFlightRequests`, and for
     // both of their reasons: a gateway older than this bundle does not serve
     // this route (the process may not have restarted onto the build that ships
-    // it), and a hybrid gateway answers 404 for every `/v1/organizations` path
+    // it), and a hybrid gateway answers 404 for every `/organizations` path
     // by design. Neither is something a retry fixes; the switcher falls back to
     // stating the one organization the context names.
     retry: (failureCount, error) =>
@@ -90,7 +184,7 @@ export function useCreateOrganization() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (body: CreateOrganizationRequest) =>
-      apiFetch<Organization>("/v1/organizations", {
+      apiFetch<Organization>("/organizations", {
         method: "POST",
         body: JSON.stringify(body),
       }),
@@ -104,10 +198,13 @@ export function useCreateOrganization() {
 
 // Switching moves `users.active_organization_id`, which is what every scoped
 // read on the server resolves through, so *everything* cached here is about
-// the organization just left. Hence `invalidateQueries()` with no key rather
-// than a list of them: enumerating the affected keys would mean keeping that
-// list in step with every future query, and the one it missed would render
-// another organization's rows under this one's name.
+// the organization just left. Hence an invalidation with no key rather than a
+// list of them: enumerating the affected keys would mean keeping that list in
+// step with every future query, and the one it missed would render another
+// organization's rows under this one's name.
+//
+// The context is the exception, and the only one: it is what the switch itself
+// answers with, and what a role gate reads.
 export function useSwitchOrganization() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -118,13 +215,22 @@ export function useSwitchOrganization() {
       const body: SwitchOrganizationRequest = {
         organization_id: organizationId,
       }
-      return apiFetch<OrganizationContext>("/v1/organizations/me/switch", {
+      return apiFetch<OrganizationContext>("/organizations/me/switch", {
         method: "POST",
         body: JSON.stringify(body),
       })
     },
-    onSuccess: () => {
-      void queryClient.invalidateQueries()
+    onSuccess: (context) => {
+      // Written, not invalidated, and written first: the invalidation below is
+      // where every query decides whether to refetch, and one gated on the role
+      // in here would decide it against the organization just left, asking for
+      // a read the new one refuses (otari#1300). Refetching the context instead
+      // would hold the caller's new role a round trip behind the reads already
+      // being made in it.
+      queryClient.setQueryData(ORGANIZATION_CONTEXT, context)
+      void queryClient.invalidateQueries({
+        predicate: (query) => query.queryHash !== ORGANIZATION_CONTEXT_HASH,
+      })
     },
   })
 }
@@ -137,9 +243,32 @@ export function useOrganizationMembers(enabled = true) {
   return useQuery({
     queryKey: [ORGANIZATION_MEMBERS],
     queryFn: () =>
-      fetchAllPaged<OrganizationMember>("/v1/organizations/me/members"),
+      fetchAllPaged<OrganizationMember>("/organizations/me/members"),
     staleTime: 60_000,
     enabled,
+  })
+}
+
+/**
+ * One page of the roster, with the total.
+ *
+ * The rows carry their own workspaces, ceilings and spend since otari#1381, so
+ * the members table can ask for a page rather than reading the roster to join
+ * six other collections against it.
+ *
+ * Separate from `useOrganizationMembers` rather than replacing it: that one
+ * still answers the two readers who genuinely want every row, a label lookup
+ * and a candidate list, and both are tracked elsewhere (otari#1380).
+ */
+export function useOrganizationMembersPage(page: number, pageSize: number) {
+  return useQuery({
+    queryKey: [ORGANIZATION_MEMBERS, "page", page, pageSize],
+    queryFn: () =>
+      apiFetch<OrganizationMembers>(
+        `/organizations/me/members?skip=${page * pageSize}&limit=${pageSize}`,
+      ),
+    staleTime: 60_000,
+    placeholderData: keepPreviousData,
   })
 }
 
@@ -147,7 +276,7 @@ export function useUpdateOrganization() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (body: UpdateOrganizationRequest) =>
-      apiFetch<OrganizationContext>("/v1/organizations/me", {
+      apiFetch<OrganizationContext>("/organizations/me", {
         method: "PATCH",
         body: JSON.stringify(body),
       }),
@@ -156,31 +285,6 @@ export function useUpdateOrganization() {
     },
   })
 }
-// One of two write paths that put a second row on the roster: this one lands
-// the membership `active` immediately, with nothing emailed.
-// `useInviteOrganizationMember` below is the other, which lands `invited` and
-// emails an accept link.
-export function useAddOrganizationMember() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (body: CreateOrganizationMemberRequest) =>
-      apiFetch<CreateOrganizationMemberResult>("/v1/organizations/me/members", {
-        method: "POST",
-        body: JSON.stringify(body),
-      }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: [ORGANIZATION_MEMBERS] })
-      // A request may place the new member into workspaces in the same
-      // transaction, so their rosters move with it.
-      void queryClient.invalidateQueries({ queryKey: [WORKSPACES] })
-      // The switcher reads its list from `workspace_memberships` on the
-      // organization context, not from this key, so a roster change that moves
-      // the caller in or out of a workspace has to refresh it too.
-      void queryClient.invalidateQueries({ queryKey: [ORGANIZATIONS] })
-    },
-  })
-}
-
 export function useUpdateOrganizationMember() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -192,7 +296,7 @@ export function useUpdateOrganizationMember() {
       body: UpdateOrganizationMemberRequest
     }) =>
       apiFetch<OrganizationMember>(
-        `/v1/organizations/me/members/${encodeURIComponent(id)}`,
+        `/organizations/me/members/${encodeURIComponent(id)}`,
         { method: "PATCH", body: JSON.stringify(body) },
       ),
     onSuccess: () => {
@@ -208,7 +312,7 @@ export function useRemoveOrganizationMember() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) =>
-      apiFetch<void>(`/v1/organizations/me/members/${encodeURIComponent(id)}`, {
+      apiFetch<void>(`/organizations/me/members/${encodeURIComponent(id)}`, {
         method: "DELETE",
       }),
     onSuccess: () => {
@@ -224,15 +328,32 @@ export function useRemoveOrganizationMember() {
   })
 }
 
-// The other write path onto the roster: lands `invited` rather than `active`,
-// and the response always carries `accept_link` (whether or not `mail_sent`
-// is true), so the caller can offer "share this link yourself" when it isn't.
+// The dashboard's one write path onto the roster: lands `invited`, and the
+// response always carries `accept_link` (whether or not `mail_sent` is true),
+// so the operator can share it themselves.
 export function useInviteOrganizationMember() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (body: InviteOrganizationMemberRequest) =>
       apiFetch<InviteOrganizationMemberResult>(
-        "/v1/organizations/me/member-invitations",
+        "/organizations/me/member-invitations",
+        { method: "POST", body: JSON.stringify(body) },
+      ),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: [ORGANIZATION_MEMBERS] })
+      void queryClient.invalidateQueries({ queryKey: [ORGANIZATIONS] })
+    },
+  })
+}
+
+// Several addresses in one call: each is invited or refused on its own, and
+// every invited entry carries its own `mail_sent` and accept link.
+export function useBulkInviteOrganizationMembers() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (body: BulkInviteOrganizationMembersRequest) =>
+      apiFetch<BulkInviteOrganizationMembersResult>(
+        "/organizations/me/member-invitations/bulk",
         { method: "POST", body: JSON.stringify(body) },
       ),
     onSuccess: () => {
@@ -247,7 +368,7 @@ export function useRevokeOrganizationMemberInvitation() {
   return useMutation({
     mutationFn: (invitationId: string) =>
       apiFetch<void>(
-        `/v1/organizations/me/member-invitations/${encodeURIComponent(invitationId)}`,
+        `/organizations/me/member-invitations/${encodeURIComponent(invitationId)}`,
         { method: "DELETE" },
       ),
     onSuccess: () => {
@@ -266,7 +387,7 @@ export function useRevokeOrganizationMemberInvitation() {
 // it along with the rest of the tenancy cache. Same 404 guard as
 // `useOrganizationMemberships`, for both of its reasons: a gateway older than
 // this bundle does not serve this route, and a hybrid gateway answers 404 for
-// every `/v1/organizations` path by design. Neither is something a retry
+// every `/organizations` path by design. Neither is something a retry
 // fixes, and the entry point that reads the count treats a failure as "nothing
 // waiting" rather than showing an error in the chrome.
 export function usePendingOrganizationInvitations() {
@@ -274,7 +395,7 @@ export function usePendingOrganizationInvitations() {
     queryKey: [ORGANIZATIONS, "pending-memberships"],
     queryFn: () =>
       fetchAllPaged<PendingOrganizationInvitation>(
-        "/v1/organizations/me/pending-memberships",
+        "/organizations/me/pending-memberships",
       ),
     staleTime: 60_000,
     retry: (failureCount, error) =>
@@ -292,7 +413,7 @@ export function useAcceptPendingMembership() {
   return useMutation({
     mutationFn: (organizationMemberId: string) =>
       apiFetch<AcceptInvitationResult>(
-        `/v1/organizations/me/pending-memberships/${encodeURIComponent(
+        `/organizations/me/pending-memberships/${encodeURIComponent(
           organizationMemberId,
         )}/accept`,
         { method: "POST" },
@@ -310,7 +431,7 @@ export function useDeclinePendingMembership() {
   return useMutation({
     mutationFn: (organizationMemberId: string) =>
       apiFetch<{ message: string }>(
-        `/v1/organizations/me/pending-memberships/${encodeURIComponent(
+        `/organizations/me/pending-memberships/${encodeURIComponent(
           organizationMemberId,
         )}/decline`,
         { method: "POST" },
@@ -334,7 +455,7 @@ export function useValidateInvitation(token: string) {
     // token is a bearer credential, and a URL is what an access log or an
     // intermediate proxy routinely retains.
     queryFn: () =>
-      apiFetch<InvitationPreview>("/v1/invitations/validate", {
+      apiFetch<InvitationPreview>("/invitations/validate", {
         method: "POST",
         body: JSON.stringify({ token }),
       }),
@@ -348,10 +469,10 @@ export function useValidateInvitation(token: string) {
 
 export function useAcceptInvitation() {
   return useMutation({
-    mutationFn: (token: string) =>
-      apiFetch<AcceptInvitationResult>("/v1/invitations/accept", {
+    mutationFn: (body: AcceptInvitationRequest) =>
+      apiFetch<AcceptInvitationResult>("/invitations/accept", {
         method: "POST",
-        body: JSON.stringify({ token }),
+        body: JSON.stringify(body),
       }),
   })
 }
@@ -371,16 +492,52 @@ export function useAcceptInvitation() {
 // link. The response is the same sentence whether the address was unknown,
 // already claimed, or genuinely just claimed, so nothing here may branch on it.
 
+/**
+ * Refresh what one write to a provider key actually moved.
+ *
+ * Both flags default off, because both are expensive in their own way.
+ * Refetching every key's model list is what the separate root key exists to
+ * avoid (see `queryKeys.ts`), and only a write that moves a model row earns it.
+ * The catalog is the other: creating a key offers its whole model list,
+ * archiving one withdraws what it served, restoring one brings it back,
+ * deleting one takes its rows, and a re-entered credential makes an unusable key
+ * usable again.
+ */
 function invalidateOrgProviderKeys(
   queryClient: ReturnType<typeof useQueryClient>,
+  { offeredModels = false, catalog = false } = {},
 ): void {
   void queryClient.invalidateQueries({
     queryKey: [ORGANIZATION_PROVIDER_KEYS],
   })
+  if (offeredModels) {
+    void queryClient.invalidateQueries({
+      queryKey: [ORGANIZATION_PROVIDER_MODELS],
+    })
+  }
+  if (catalog) {
+    void queryClient.invalidateQueries({ queryKey: [MODELS] })
+    void queryClient.invalidateQueries({ queryKey: [CATALOG] })
+  }
+}
+
+// Every model write moves three reads: this key's panel, and both catalog
+// surfaces, because an offered model appears in the listing carrying its price
+// and a withdrawn one leaves it. The same three `invalidateOrganizationPricing`
+// moves, for the same reason.
+function invalidateOrgProviderModels(
+  queryClient: ReturnType<typeof useQueryClient>,
+  keyId: string,
+): void {
+  void queryClient.invalidateQueries({
+    queryKey: [ORGANIZATION_PROVIDER_MODELS, keyId],
+  })
+  void queryClient.invalidateQueries({ queryKey: [MODELS] })
+  void queryClient.invalidateQueries({ queryKey: [CATALOG] })
 }
 
 // The organization's own upstream provider credentials (#670), which every
-// workspace under it inherits. A different table from `/v1/provider-credentials`
+// workspace under it inherits. A different table from `/provider-credentials`
 // above: that one is keyed on an instance name and belongs to the process, this
 // one belongs to the tenant. Only a hosted deployment reports the surface these
 // hooks serve (`organization_providers`).
@@ -397,7 +554,7 @@ export function useOrgProviderKeys(enabled = true) {
   return useQuery({
     queryKey: [ORGANIZATION_PROVIDER_KEYS],
     queryFn: () =>
-      fetchAllPaged<OrgProviderKey>("/v1/organizations/me/provider-keys", {
+      fetchAllPaged<OrgProviderKey>("/organizations/me/provider-keys", {
         include_archived: "true",
       }),
     staleTime: 60_000,
@@ -409,11 +566,17 @@ export function useCreateOrgProviderKey() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (body: CreateOrgProviderKeyRequest) =>
-      apiFetch<OrgProviderKey>("/v1/organizations/me/provider-keys", {
+      apiFetch<OrgProviderKey>("/organizations/me/provider-keys", {
         method: "POST",
         body: JSON.stringify(body),
       }),
-    onSuccess: () => invalidateOrgProviderKeys(queryClient),
+    onSuccess: () =>
+      // The create offers everything the credential reaches, so the whole
+      // catalog moves with it.
+      invalidateOrgProviderKeys(queryClient, {
+        offeredModels: true,
+        catalog: true,
+      }),
   })
 }
 
@@ -428,10 +591,15 @@ export function useUpdateOrgProviderKey() {
       body: UpdateOrgProviderKeyRequest
     }) =>
       apiFetch<OrgProviderKey>(
-        `/v1/organizations/me/provider-keys/${encodeURIComponent(keyId)}`,
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}`,
         { method: "PATCH", body: JSON.stringify(body) },
       ),
-    onSuccess: () => invalidateOrgProviderKeys(queryClient),
+    onSuccess: () =>
+      // No offered row moves, but the catalog can: a key whose credential will
+      // not decrypt is unusable, and an unusable key contributes nothing
+      // (`organization_model_access.key_is_usable`), so re-entering a working
+      // one puts its models back.
+      invalidateOrgProviderKeys(queryClient, { catalog: true }),
   })
 }
 
@@ -443,10 +611,12 @@ export function useArchiveOrgProviderKey() {
   return useMutation({
     mutationFn: (keyId: string) =>
       apiFetch<OrgProviderKey>(
-        `/v1/organizations/me/provider-keys/${encodeURIComponent(keyId)}/archive`,
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/archive`,
         { method: "POST" },
       ),
-    onSuccess: () => invalidateOrgProviderKeys(queryClient),
+    onSuccess: () =>
+      // Archiving withdraws what the key served without touching its rows.
+      invalidateOrgProviderKeys(queryClient, { catalog: true }),
   })
 }
 
@@ -455,10 +625,12 @@ export function useRestoreOrgProviderKey() {
   return useMutation({
     mutationFn: (keyId: string) =>
       apiFetch<OrgProviderKey>(
-        `/v1/organizations/me/provider-keys/${encodeURIComponent(keyId)}/restore`,
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/restore`,
         { method: "POST" },
       ),
-    onSuccess: () => invalidateOrgProviderKeys(queryClient),
+    onSuccess: () =>
+      // Restoring serves them again.
+      invalidateOrgProviderKeys(queryClient, { catalog: true }),
   })
 }
 
@@ -467,10 +639,12 @@ export function useSetOrgProviderKeyDefault() {
   return useMutation({
     mutationFn: (keyId: string) =>
       apiFetch<OrgProviderKey>(
-        `/v1/organizations/me/provider-keys/${encodeURIComponent(keyId)}/default`,
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/default`,
         { method: "POST" },
       ),
-    onSuccess: () => invalidateOrgProviderKeys(queryClient),
+    onSuccess: () =>
+      // Which key dispatches, not which models exist.
+      invalidateOrgProviderKeys(queryClient),
   })
 }
 
@@ -480,10 +654,15 @@ export function useDeleteOrgProviderKey() {
   return useMutation({
     mutationFn: (keyId: string) =>
       apiFetch<{ message: string }>(
-        `/v1/organizations/me/provider-keys/${encodeURIComponent(keyId)}`,
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}`,
         { method: "DELETE" },
       ),
-    onSuccess: () => invalidateOrgProviderKeys(queryClient),
+    onSuccess: () =>
+      // The rows cascade away with the key.
+      invalidateOrgProviderKeys(queryClient, {
+        offeredModels: true,
+        catalog: true,
+      }),
   })
 }
 
@@ -499,7 +678,7 @@ export function useOrganizationDomains(enabled = true) {
     queryKey: [ORGANIZATION_DOMAINS],
     queryFn: () =>
       apiFetch<{ data: OrganizationDomain[]; count: number }>(
-        "/v1/organizations/me/domains",
+        "/organizations/me/domains",
       ),
     staleTime: 60_000,
     enabled,
@@ -516,7 +695,7 @@ export function useCreateOrganizationDomain() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (body: CreateOrganizationDomainRequest) =>
-      apiFetch<OrganizationDomain>("/v1/organizations/me/domains", {
+      apiFetch<OrganizationDomain>("/organizations/me/domains", {
         method: "POST",
         body: JSON.stringify(body),
       }),
@@ -535,7 +714,7 @@ export function useUpdateOrganizationDomain() {
       body: UpdateOrganizationDomainRequest
     }) =>
       apiFetch<OrganizationDomain>(
-        `/v1/organizations/me/domains/${encodeURIComponent(domainId)}`,
+        `/organizations/me/domains/${encodeURIComponent(domainId)}`,
         { method: "PATCH", body: JSON.stringify(body) },
       ),
     onSuccess: () => invalidateOrganizationDomains(queryClient),
@@ -547,7 +726,7 @@ export function useVerifyOrganizationDomain() {
   return useMutation({
     mutationFn: (domainId: string) =>
       apiFetch<OrganizationDomain>(
-        `/v1/organizations/me/domains/${encodeURIComponent(domainId)}/verify`,
+        `/organizations/me/domains/${encodeURIComponent(domainId)}/verify`,
         { method: "POST" },
       ),
     onSuccess: () => invalidateOrganizationDomains(queryClient),
@@ -559,10 +738,127 @@ export function useDeleteOrganizationDomain() {
   return useMutation({
     mutationFn: (domainId: string) =>
       apiFetch<{ message: string }>(
-        `/v1/organizations/me/domains/${encodeURIComponent(domainId)}`,
+        `/organizations/me/domains/${encodeURIComponent(domainId)}`,
         { method: "DELETE" },
       ),
     onSuccess: () => invalidateOrganizationDomains(queryClient),
+  })
+}
+
+// The models an organization offers on one of its provider keys, and what each
+// currently costs it. Paged on the server, because one provider can list several
+// hundred models.
+//
+// `placeholderData` follows `useOrganizationPricing`'s shape rather than a bare
+// `keepPreviousData`, and the difference is load-bearing here: the key id is
+// part of the query key, so `keepPreviousData` would paint one provider's models
+// under another provider's name for a frame every time a different row is
+// expanded.
+export function useOrgProviderModels(
+  keyId: string,
+  page: number,
+  pageSize: number,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [ORGANIZATION_PROVIDER_MODELS, keyId, page, pageSize],
+    queryFn: () =>
+      apiFetch<OrgProviderModels>(
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/models?skip=${page * pageSize}&limit=${pageSize}`,
+      ),
+    staleTime: 60_000,
+    placeholderData: (previous, previousQuery) =>
+      previousQuery?.queryKey[1] === keyId ? previous : undefined,
+    enabled,
+  })
+}
+
+// What the provider says it serves on the stored credential. Answering means
+// dialing the upstream, so it is fetched only while the add-model form is open
+// and held for a minute: one dial per form visit, not one per re-render.
+export function useOrgProviderAvailableModels(keyId: string, enabled: boolean) {
+  return useQuery({
+    ...NO_RETRY,
+    queryKey: [ORGANIZATION_PROVIDER_AVAILABLE_MODELS, keyId],
+    queryFn: () =>
+      apiFetch<OrgProviderAvailableModels>(
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/available-models`,
+      ),
+    staleTime: 60_000,
+    enabled,
+  })
+}
+
+export function useOfferOrgProviderModel(keyId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (body: OfferOrgProviderModelRequest) =>
+      apiFetch<OrgProviderModel>(
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/models`,
+        { method: "POST", body: JSON.stringify(body) },
+      ),
+    onSuccess: () => invalidateOrgProviderModels(queryClient, keyId),
+  })
+}
+
+export function useSetOrgProviderModelEnabled(keyId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      modelId,
+      ...body
+    }: { modelId: string } & UpdateOrgProviderModelRequest) =>
+      apiFetch<OrgProviderModel>(
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/models/${encodeURIComponent(modelId)}`,
+        { method: "PATCH", body: JSON.stringify(body) },
+      ),
+    onSuccess: () => invalidateOrgProviderModels(queryClient, keyId),
+  })
+}
+
+export function useWithdrawOrgProviderModel(keyId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (modelId: string) =>
+      apiFetch<{ message: string }>(
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/models/${encodeURIComponent(modelId)}`,
+        { method: "DELETE" },
+      ),
+    onSuccess: () => invalidateOrgProviderModels(queryClient, keyId),
+  })
+}
+
+// Both refreshes carry `longRequestSignal`, as the deployment pricing preview
+// does: one re-dials the provider and the other walks the community dataset per
+// model, and neither fits the default request budget.
+export function useRefreshOrgProviderModels(keyId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<OrgProviderModelsRefresh>(
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/models/refresh`,
+        { method: "POST", signal: longRequestSignal() },
+      ),
+    onSuccess: () => {
+      invalidateOrgProviderModels(queryClient, keyId)
+      // The dial's answer is fresher than whatever the picker last cached.
+      void queryClient.invalidateQueries({
+        queryKey: [ORGANIZATION_PROVIDER_AVAILABLE_MODELS, keyId],
+      })
+    },
+  })
+}
+
+export function useRefreshOrgProviderModelPricing(keyId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<OrgProviderModelsRefresh>(
+        `/organizations/me/provider-keys/${encodeURIComponent(keyId)}/pricing/refresh`,
+        { method: "POST", signal: longRequestSignal() },
+      ),
+    // Not the available-models key: this one never asks the provider anything.
+    onSuccess: () => invalidateOrgProviderModels(queryClient, keyId),
   })
 }
 

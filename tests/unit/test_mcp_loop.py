@@ -33,6 +33,14 @@ from gateway.services.mcp_loop import (
     mcp_tool_loop,
     mcp_tool_loop_stream,
 )
+from gateway.services.tools import ToolUseBudget
+from gateway.services.web_retrieval_backend import WEB_SEARCH_TOOL_NAME
+
+
+def _use_budget(max_uses: int) -> ToolUseBudget:
+    """A cap on the gateway's own searches, which is the tool these loops run."""
+    return ToolUseBudget(WEB_SEARCH_TOOL_NAME, max_uses)
+
 
 _FinishReason = Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
 
@@ -112,6 +120,7 @@ def _chunk(
     finish: _FinishReason | None = None,
     content: str | None = None,
     tool_calls: list[tuple[int, str | None, str | None, str | None]] | None = None,
+    usage: CompletionUsage | None = None,
 ) -> ChatCompletionChunk:
     """Build a streaming chunk. tool_calls items are (index, id, name_delta, args_delta)."""
     delta_tool_calls = (
@@ -134,6 +143,7 @@ def _chunk(
         created=0,
         model="fake",
         object="chat.completion.chunk",
+        usage=usage,
     )
 
 
@@ -286,6 +296,140 @@ async def test_loop_executes_mcp_tool_and_completes(monkeypatch: pytest.MonkeyPa
     assert second_msgs[-2]["role"] == "assistant"
     assert second_msgs[-2]["tool_calls"][0]["function"]["name"] == "fetch_url"
     assert second_msgs[-1] == {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+
+
+class _FakeSearchPool(_FakePool):
+    """A pool that owns ``web_search`` and buffers hits like the real search backend.
+
+    ``take_last_results`` is what marks it as the gateway's own search rather than
+    an MCP server that happens to expose the same tool name.
+    """
+
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__(tool_names=["web_search"], results={"web_search": "[1] Result\nhttps://a"})
+        self._fail = fail
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        if self._fail:
+            self.calls.append((name, arguments))
+            raise RuntimeError("backend down")
+        return await super().call_tool(name, arguments)
+
+    def take_last_results(self) -> list[dict[str, Any]]:
+        return [{"url": "https://a", "title": "A"}]
+
+
+def _search_call(call_id: str, query: str) -> tuple[str, str, str]:
+    return (call_id, "web_search", json.dumps({"query": query}))
+
+
+@pytest.mark.asyncio
+async def test_max_uses_stops_further_searches_and_reports_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap is a spend control, so it applies to a format with no native error shape.
+
+    The refusal reaches the model as the ``[tool error]`` string this format already
+    uses for a failed tool, since there is no ``web_search_tool_result`` to send.
+    """
+    responses = iter(
+        [
+            _completion(finish="tool_calls", tool_calls=[_search_call("c1", "first")]),
+            _completion(finish="tool_calls", tool_calls=[_search_call("c2", "second")]),
+            _completion(finish="stop", content="done"),
+        ]
+    )
+    captured_messages: list[list[dict[str, Any]]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> ChatCompletion:
+        captured_messages.append(kwargs["messages"])
+        return next(responses)
+
+    monkeypatch.setattr(mcp_loop_module, "acompletion", fake_acompletion)
+    pool = _FakeSearchPool()
+
+    await mcp_tool_loop(
+        completion_kwargs={"model": "fake", "messages": [{"role": "user", "content": "hi"}]},
+        pool=cast(Any, pool),
+        max_iterations=5,
+        use_budget=_use_budget(1),
+    )
+
+    assert pool.calls == [("web_search", {"query": "first"})]
+    assert captured_messages[2][-1] == {
+        "role": "tool",
+        "tool_call_id": "c2",
+        "content": "[tool error] max_uses_exceeded",
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_max_uses_stops_further_searches(monkeypatch: pytest.MonkeyPatch) -> None:
+    streams = iter(
+        [
+            [
+                _chunk(tool_calls=[(0, "c1", "web_search", '{"query": "first"}')]),
+                _chunk(finish="tool_calls"),
+            ],
+            [
+                _chunk(tool_calls=[(0, "c2", "web_search", '{"query": "second"}')]),
+                _chunk(finish="tool_calls"),
+            ],
+            [_chunk(content="done"), _chunk(finish="stop")],
+        ]
+    )
+
+    async def fake_acompletion(**kwargs: Any) -> AsyncIterator[ChatCompletionChunk]:
+        async def gen() -> AsyncIterator[ChatCompletionChunk]:
+            for chunk in next(streams):
+                yield chunk
+
+        return gen()
+
+    monkeypatch.setattr(mcp_loop_module, "acompletion", fake_acompletion)
+    pool = _FakeSearchPool()
+
+    async for _ in mcp_tool_loop_stream(
+        completion_kwargs={"model": "fake", "messages": [{"role": "user", "content": "hi"}]},
+        pool=cast(Any, pool),
+        max_iterations=5,
+        use_budget=_use_budget(1),
+    ):
+        pass
+
+    assert pool.calls == [("web_search", {"query": "first"})]
+
+
+@pytest.mark.asyncio
+async def test_max_uses_is_not_spent_by_a_failed_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A search that errored was never billed, so it does not consume the cap.
+
+    ``max_tool_iterations`` is what bounds a model that keeps retrying a broken
+    backend; charging the spend cap for an unbilled call would answer a different
+    question than the caller asked.
+    """
+    responses = iter(
+        [
+            _completion(finish="tool_calls", tool_calls=[_search_call("c1", "first")]),
+            _completion(finish="tool_calls", tool_calls=[_search_call("c2", "second")]),
+            _completion(finish="stop", content="done"),
+        ]
+    )
+
+    async def fake_acompletion(**kwargs: Any) -> ChatCompletion:
+        return next(responses)
+
+    monkeypatch.setattr(mcp_loop_module, "acompletion", fake_acompletion)
+    pool = _FakeSearchPool(fail=True)
+
+    await mcp_tool_loop(
+        completion_kwargs={"model": "fake", "messages": [{"role": "user", "content": "hi"}]},
+        pool=cast(Any, pool),
+        max_iterations=5,
+        use_budget=_use_budget(1),
+    )
+
+    assert pool.calls == [("web_search", {"query": "first"}), ("web_search", {"query": "second"})]
 
 
 @pytest.mark.asyncio
@@ -591,6 +735,71 @@ async def test_stream_loop_runs_mcp_tool_and_continues(monkeypatch: pytest.Monke
     # `tool_calls` terminal is suppressed.
     assert finishes == ["stop"]
     assert pool.calls == [("fetch_url", {})]
+
+
+def _usage_only_chunk(usage: CompletionUsage) -> ChatCompletionChunk:
+    """The ``include_usage`` chunk OpenAI sends after the finish chunk: usage, no choices."""
+    return ChatCompletionChunk(id="x", choices=[], created=0, model="fake", object="chat.completion.chunk", usage=usage)
+
+
+def _round_end(finish: _FinishReason, usage: CompletionUsage, *, trailing: bool) -> list[ChatCompletionChunk]:
+    if trailing:
+        return [_chunk(finish=finish), _usage_only_chunk(usage)]
+    return [_chunk(finish=finish, usage=usage)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trailing", [True, False], ids=["usage-only-chunk", "usage-on-finish-chunk"])
+async def test_stream_loop_accumulates_usage_across_rounds(monkeypatch: pytest.MonkeyPatch, trailing: bool) -> None:
+    """Each round reports its own usage, but the client sees one report for the loop:
+    the last chunk, carrying the sum across rounds, so a multi-round tool call is not
+    billed for the last round alone (otari#1772). OpenAI and any-llm's Anthropic
+    adapter report usage on a trailing chunk with no choices; some providers put it
+    on the finish chunk itself."""
+    round_one = CompletionUsage(
+        prompt_tokens=100,
+        completion_tokens=20,
+        total_tokens=120,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=30),
+    )
+    round_two = CompletionUsage(prompt_tokens=140, completion_tokens=5, total_tokens=145)
+    iter_streams = iter(
+        [
+            _async_iter(
+                _chunk(tool_calls=[(0, "call_1", "fetch_url", "{}")]),
+                *_round_end("tool_calls", round_one, trailing=trailing),
+            ),
+            _async_iter(
+                _chunk(content="all done"),
+                *_round_end("stop", round_two, trailing=trailing),
+            ),
+        ]
+    )
+
+    async def fake_acompletion(**kwargs: Any) -> AsyncIterator[ChatCompletionChunk]:
+        return next(iter_streams)
+
+    monkeypatch.setattr(mcp_loop_module, "acompletion", fake_acompletion)
+
+    pool = _FakePool(tool_names=["fetch_url"], results={"fetch_url": "ok"})
+    chunks = [
+        c
+        async for c in mcp_tool_loop_stream(
+            completion_kwargs={"model": "fake", "messages": [{"role": "user", "content": "go"}]},
+            pool=pool,
+            max_iterations=5,
+        )
+    ]
+
+    usages = [c.usage for c in chunks if c.usage is not None]
+    assert len(usages) == 1, "one usage report reaches the client for the whole loop"
+    assert chunks[-1].usage is usages[0]
+    assert [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason] == ["stop"]
+    assert usages[0].prompt_tokens == 240
+    assert usages[0].completion_tokens == 25
+    assert usages[0].total_tokens == 265
+    assert usages[0].prompt_tokens_details is not None
+    assert usages[0].prompt_tokens_details.cached_tokens == 30
 
 
 @pytest.mark.asyncio

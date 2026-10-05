@@ -1,5 +1,5 @@
 ---
-applyTo: "src/gateway/api/**/*.py,src/gateway/auth/**/*.py,src/gateway/services/**/*.py,src/gateway/core/config.py,src/gateway/models/**/*.py,src/gateway/streaming.py,alembic/versions/**/*.py"
+applyTo: "src/gateway/api/**/*.py,src/gateway/auth/**/*.py,src/gateway/services/**/*.py,src/gateway/core/config.py,src/gateway/core/settings/**/*.py,src/gateway/models/**/*.py,src/gateway/streaming.py,alembic/versions/**/*.py"
 ---
 
 # Security review instructions
@@ -34,6 +34,16 @@ through the deployment's default workspace, but accepting a cookie here would
 let any signed-in organization member spend that default workspace's provider
 credentials and budget without holding a data-plane key.
 Read-only catalog routes use `verify_catalog_reader`.
+
+The Playground's completion endpoint (`api/routes/playground.py`) is the single
+exception, and what makes it one is the work it does before the pipeline: it
+derives the billed user from the session (never from the request), resolves the
+named workspace through `resolve_workspace_in_organization` so one the caller
+does not belong to answers 404, and reads that user's own `allowed_models` as
+the effective allow-list. Review a change here against those three. A session
+principal that took a `user_id` from the body, defaulted the workspace without
+the membership check, or left the allow-list unset would each reopen exactly the
+escalation the rule above describes.
 
 Using the operator gate on a tenant route is also wrong; it prevents members
 from managing resources their role permits.
@@ -84,10 +94,12 @@ resources.
 Never log or return provider keys, API keys, master keys, bearer tokens, raw
 provider bodies, prompts, responses, or tool payloads.
 
-Caller-fixable upstream 400, 404, and 422 errors may pass through only after
-`redact_upstream_message` and length limiting. Credential failures, provider
-billing failures, 5xx responses, and unknown failures use fixed public text.
-Expanding the pass-through set is a security change.
+Upstream errors the caller can act on may pass through only after
+`redact_upstream_message` and length limiting: the caller-fixable 400, 404, and
+422, plus the 429 whose text names the exhausted quota and the retry window.
+Credential failures, provider billing failures, 5xx responses, and unknown
+failures use fixed public text. Expanding the pass-through set is a security
+change.
 
 API keys are stored as one-way SHA-256 hashes, never as plaintext. Recoverable
 provider and tool credentials are encrypted, and responses expose only safe

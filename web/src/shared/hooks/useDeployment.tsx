@@ -1,7 +1,7 @@
 /**
  * The deployment context the shell renders from, read once per page load.
  *
- * `main.tsx` fetches `/v1/bootstrap` before it mounts anything and hands the
+ * `main.tsx` fetches `/bootstrap` before it mounts anything and hands the
  * answer to `App`, which puts it here. That ordering is the point: which
  * deployment served this page decides whether a sign-in screen, a management
  * dashboard, or a data-plane landing page is the right first paint, so the app
@@ -79,13 +79,13 @@ export function DeploymentProvider({
     }
     const typed = masterKeyRetired ? PASSWORD_ONLY : value.sign_in_methods
     const withoutPasskey = typed.filter((method) => method !== PASSKEY)
-    const offered =
+    const isOffered =
       passkeysOffered === null
         ? value.sign_in_methods.includes(PASSKEY)
         : passkeysOffered
     return {
       ...value,
-      sign_in_methods: offered
+      sign_in_methods: isOffered
         ? [...withoutPasskey, PASSKEY].sort()
         : withoutPasskey,
     }

@@ -11,10 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from gateway.api.routes.chat import log_usage
-from gateway.core.config import GatewayConfig, PricingConfig
+from gateway.core.config import API_ROOT, GatewayConfig
+from gateway.core.settings.pricing import PricingConfig
 from gateway.db import ModelPricing, get_db
 from gateway.main import create_app
-from gateway.models.entities import UsageLog
+from gateway.models.usage import UsageLog
 
 from .conftest import build_async_session_override
 
@@ -194,6 +195,29 @@ def test_pricing_for_unlisted_provider_is_skipped_not_fatal(
     )
 
 
+def test_pricing_for_a_decision_provider_is_loaded(postgres_url: str, test_db: Session) -> None:
+    """A decisions provider prices its models in ``pricing`` although it is not under ``providers``."""
+    config = GatewayConfig(
+        database_url=postgres_url,
+        master_key="test-master-key",
+        host="127.0.0.1",
+        port=8000,
+        decision_providers={"typesafe": {"api_key": "test-key"}},
+        pricing={"typesafe:jev-latest": PricingConfig(input_price_per_million=2.0, output_price_per_million=10.0)},
+    )
+
+    app = create_app(config)
+    override_get_db, dispose_override = build_async_session_override(postgres_url)
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app):
+            loaded = test_db.query(ModelPricing).filter(ModelPricing.model_key == "typesafe:jev-latest").first()
+            assert loaded is not None
+            assert loaded.input_price_per_million == 2.0
+    finally:
+        dispose_override()
+
+
 def test_pricing_loaded_from_config_normalizes_legacy_slash_format(postgres_url: str, test_db: Session) -> None:
     """Test that pricing configured with legacy slash format is normalized to colon format."""
     config = GatewayConfig(
@@ -228,13 +252,14 @@ def test_pricing_loaded_from_config_normalizes_legacy_slash_format(postgres_url:
         dispose_override()
 
 
+@pytest.mark.filterwarnings("ignore:Model format 'provider/model' is deprecated:DeprecationWarning")
 def test_set_pricing_api_normalizes_legacy_slash_format(
     client: TestClient,
     master_key_header: dict[str, str],
 ) -> None:
     """Test that the pricing API normalizes legacy slash format to colon format."""
     response = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "gemini/gemini-2.5-flash",
             "input_price_per_million": 0.075,
@@ -251,9 +276,9 @@ def test_set_pricing_persists_cache_rates(
     client: TestClient,
     master_key_header: dict[str, str],
 ) -> None:
-    """Cache rates round-trip through /v1/pricing and are stored on the row."""
+    """Cache rates round-trip through /api/v1/pricing and are stored on the row."""
     resp = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "anthropic:claude-sonnet-4",
             "input_price_per_million": 3.0,
@@ -292,7 +317,7 @@ def test_set_pricing_persists_context_tiers_and_1h_cache_rate(
             }
         ],
     }
-    response = client.post("/v1/pricing", json=payload, headers=master_key_header)
+    response = client.post(f"{API_ROOT}/pricing", json=payload, headers=master_key_header)
 
     assert response.status_code == 200
     assert response.json()["cache_write_1h_price_per_million"] == 6.0
@@ -301,14 +326,14 @@ def test_set_pricing_persists_context_tiers_and_1h_cache_rate(
     # Omission preserves thresholds during a new price version, while explicit
     # null intentionally removes them.
     preserved = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={"model_key": key, "input_price_per_million": 4.0, "output_price_per_million": 16.0},
         headers=master_key_header,
     )
     assert preserved.json()["pricing_tiers"] == payload["pricing_tiers"]
 
     cleared = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": key,
             "input_price_per_million": 4.0,
@@ -325,7 +350,7 @@ def test_set_pricing_rejects_tier_without_rate_override(
     master_key_header: dict[str, str],
 ) -> None:
     response = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "anthropic:claude-sonnet-4",
             "input_price_per_million": 3.0,
@@ -347,7 +372,7 @@ def test_set_pricing_omitted_cache_rates_preserve_stored_values(
     (only an explicit null clears them). Guards the partial-update footgun."""
     key = "anthropic:claude-sonnet-4"
     client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": key,
             "input_price_per_million": 3.0,
@@ -360,7 +385,7 @@ def test_set_pricing_omitted_cache_rates_preserve_stored_values(
 
     # Update only input/output, omitting cache fields entirely.
     resp = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={"model_key": key, "input_price_per_million": 4.0, "output_price_per_million": 16.0},
         headers=master_key_header,
     )
@@ -372,7 +397,7 @@ def test_set_pricing_omitted_cache_rates_preserve_stored_values(
 
     # An explicit null still clears a rate.
     resp = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": key,
             "input_price_per_million": 4.0,
@@ -389,7 +414,7 @@ def test_pricing_history_endpoint_returns_entries(
     client: TestClient,
     master_key_header: dict[str, str],
 ) -> None:
-    """GET /v1/pricing/{model_key}/history returns versions in descending order."""
+    """GET /api/v1/pricing/{model_key}/history returns versions in descending order."""
 
     model_key = "openai:gpt-4"
     first_effective = datetime(2025, 1, 1, tzinfo=UTC)
@@ -397,7 +422,7 @@ def test_pricing_history_endpoint_returns_entries(
 
     for effective_at, input_price in [(first_effective, 20.0), (second_effective, 25.0)]:
         resp = client.post(
-            "/v1/pricing",
+            f"{API_ROOT}/pricing",
             json={
                 "model_key": model_key,
                 "input_price_per_million": input_price,
@@ -408,7 +433,7 @@ def test_pricing_history_endpoint_returns_entries(
         )
         assert resp.status_code == 200
 
-    history_resp = client.get(f"/v1/pricing/{model_key}/history", headers=master_key_header)
+    history_resp = client.get(f"{API_ROOT}/pricing/{model_key}/history", headers=master_key_header)
     assert history_resp.status_code == 200
     history = history_resp.json()
     assert [entry["effective_at"] for entry in history] == [
@@ -421,7 +446,7 @@ def test_get_pricing_respects_as_of(
     client: TestClient,
     master_key_header: dict[str, str],
 ) -> None:
-    """GET /v1/pricing/{model_key} returns the effective price at a timestamp."""
+    """GET /api/v1/pricing/{model_key} returns the effective price at a timestamp."""
 
     model_key = "anthropic:claude-3"
     early = datetime(2025, 3, 1, tzinfo=UTC)
@@ -429,7 +454,7 @@ def test_get_pricing_respects_as_of(
 
     for effective_at, input_price in [(early, 15.0), (later, 18.0)]:
         resp = client.post(
-            "/v1/pricing",
+            f"{API_ROOT}/pricing",
             json={
                 "model_key": model_key,
                 "input_price_per_million": input_price,
@@ -440,12 +465,12 @@ def test_get_pricing_respects_as_of(
         )
         assert resp.status_code == 200
 
-    latest_resp = client.get(f"/v1/pricing/{model_key}", headers=master_key_header)
+    latest_resp = client.get(f"{API_ROOT}/pricing/{model_key}", headers=master_key_header)
     assert latest_resp.status_code == 200
     assert latest_resp.json()["input_price_per_million"] == 18.0
 
     old_resp = client.get(
-        f"/v1/pricing/{model_key}",
+        f"{API_ROOT}/pricing/{model_key}",
         params={"as_of": early.isoformat()},
         headers=master_key_header,
     )
@@ -465,7 +490,7 @@ def test_delete_pricing_with_effective_at(
 
     for effective_at in (old_effective, new_effective):
         resp = client.post(
-            "/v1/pricing",
+            f"{API_ROOT}/pricing",
             json={
                 "model_key": model_key,
                 "input_price_per_million": 1.0,
@@ -477,13 +502,13 @@ def test_delete_pricing_with_effective_at(
         assert resp.status_code == 200
 
     delete_resp = client.delete(
-        f"/v1/pricing/{model_key}",
+        f"{API_ROOT}/pricing/{model_key}",
         params={"effective_at": old_effective.isoformat()},
         headers=master_key_header,
     )
     assert delete_resp.status_code == 204
 
-    history_resp = client.get(f"/v1/pricing/{model_key}/history", headers=master_key_header)
+    history_resp = client.get(f"{API_ROOT}/pricing/{model_key}/history", headers=master_key_header)
     assert history_resp.status_code == 200
     history = history_resp.json()
     assert len(history) == 1

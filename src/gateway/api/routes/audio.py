@@ -14,12 +14,17 @@ from gateway.api.routes._passthrough import BillingMeters, run_passthrough
 from gateway.api.routes._schema_derive import derive_request_base
 from gateway.api.routes._tools import _strip_gateway_fields
 from gateway.core.config import GatewayConfig
-from gateway.models.entities import APIKey, ModelPricing
+from gateway.models.api_keys import APIKey
+from gateway.models.pricing import ModelPricing
 from gateway.services.log_writer import LogWriter
 from gateway.services.pricing_service import flat_request_cost, per_request_meters
 from gateway.services.provider_kwargs import ResolvedProvider
 
-router = APIRouter(prefix="/v1", tags=["audio"])
+router = APIRouter(tags=["audio"])
+
+# See chat.USAGE_ENDPOINT.
+USAGE_ENDPOINT_TRANSCRIPTIONS = "/v1/audio/transcriptions"
+USAGE_ENDPOINT_SPEECH = "/v1/audio/speech"
 
 # Maximum upload size for audio files (25 MB, matching OpenAI's limit)
 _MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -103,7 +108,7 @@ async def create_transcription(
     # as gpt-4o-transcribe per million tokens, which this per-request convention
     # would misread as a per-million-request rate.
     outcome = await run_passthrough(
-        endpoint="/v1/audio/transcriptions",
+        endpoint=USAGE_ENDPOINT_TRANSCRIPTIONS,
         raw_request=raw_request,
         response=response,
         auth_result=auth_result,
@@ -205,7 +210,7 @@ async def create_speech(
     # tokens, which this per-request convention would misread as a
     # per-million-request rate.
     outcome = await run_passthrough(
-        endpoint="/v1/audio/speech",
+        endpoint=USAGE_ENDPOINT_SPEECH,
         raw_request=raw_request,
         response=None,
         auth_result=auth_result,

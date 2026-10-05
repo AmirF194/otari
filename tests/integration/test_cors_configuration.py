@@ -3,7 +3,7 @@
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from gateway.core.config import GatewayConfig
+from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.db import get_db
 from gateway.main import create_app
 
@@ -25,7 +25,7 @@ def test_cors_disabled_by_default(postgres_url: str, test_db: Session) -> None:
 
     try:
         with TestClient(app) as client:
-            response = client.get("/health", headers={"Origin": "https://evil.com"})
+            response = client.get(f"{API_ROOT}/health", headers={"Origin": "https://evil.com"})
             assert response.status_code == 200
             assert "access-control-allow-origin" not in response.headers
     finally:
@@ -49,15 +49,50 @@ def test_cors_with_specific_origins(postgres_url: str, test_db: Session) -> None
     try:
         with TestClient(app) as client:
             # Trusted origin should get CORS headers
-            response = client.get("/health", headers={"Origin": "https://trusted.com"})
+            response = client.get(f"{API_ROOT}/health", headers={"Origin": "https://trusted.com"})
             assert response.status_code == 200
             assert response.headers.get("access-control-allow-origin") == "https://trusted.com"
             assert response.headers.get("access-control-allow-credentials") == "true"
 
             # Untrusted origin should not get CORS headers
-            response = client.get("/health", headers={"Origin": "https://evil.com"})
+            response = client.get(f"{API_ROOT}/health", headers={"Origin": "https://evil.com"})
             assert response.status_code == 200
             assert response.headers.get("access-control-allow-origin") != "https://evil.com"
+    finally:
+        dispose_override()
+
+
+def test_cors_rejects_trace_context_headers(postgres_url: str, test_db: Session) -> None:
+    """Test that trace-context headers are not enabled for cross-origin requests."""
+    config = GatewayConfig(
+        database_url=postgres_url,
+        master_key="test-master-key",
+        host="127.0.0.1",
+        port=8000,
+        cors_allow_origins=["https://trusted.com"],
+        # Enabled so the assertion pins what it claims: even where the gateway
+        # honors propagation headers, a browser still cannot send them.
+        accept_incoming_trace_context=True,
+    )
+
+    app = create_app(config)
+    override_get_db, dispose_override = build_async_session_override(postgres_url)
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestClient(app) as client:
+            response = client.options(
+                f"{API_ROOT}/health",
+                headers={
+                    "Origin": "https://trusted.com",
+                    "Access-Control-Request-Method": "GET",
+                    "Access-Control-Request-Headers": "traceparent,tracestate",
+                },
+            )
+            assert response.status_code == 400
+            allow_headers = response.headers.get("access-control-allow-headers", "").lower()
+            assert "traceparent" not in allow_headers
+            assert "tracestate" not in allow_headers
     finally:
         dispose_override()
 
@@ -78,7 +113,7 @@ def test_cors_wildcard_disables_credentials(postgres_url: str, test_db: Session)
 
     try:
         with TestClient(app) as client:
-            response = client.get("/health", headers={"Origin": "https://any-site.com"})
+            response = client.get(f"{API_ROOT}/health", headers={"Origin": "https://any-site.com"})
             assert response.status_code == 200
             assert response.headers.get("access-control-allow-origin") == "*"
             # Credentials should NOT be allowed with wildcard

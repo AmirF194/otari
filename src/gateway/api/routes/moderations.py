@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gateway.api.deps import get_config, get_db, get_log_writer, verify_api_key_or_master_key
 from gateway.api.routes._passthrough import BillingMeters, run_passthrough
 from gateway.core.config import GatewayConfig
-from gateway.models.entities import APIKey, ModelPricing
+from gateway.models.api_keys import APIKey
+from gateway.models.pricing import ModelPricing
 from gateway.services.log_writer import LogWriter
 from gateway.services.pricing_service import flat_request_cost, per_request_meters
 from gateway.services.provider_kwargs import ResolvedProvider
@@ -20,7 +21,10 @@ from gateway.types.moderation import ModerationResponse
 # Locked phrasing — cross-SDK error contract. Do not reword.
 UNSUPPORTED_MODERATION_SUBSTRING = "does not support moderation"
 
-router = APIRouter(prefix="/v1", tags=["moderations"])
+router = APIRouter(tags=["moderations"])
+
+# See chat.USAGE_ENDPOINT.
+USAGE_ENDPOINT = "/v1/moderations"
 
 
 class ModerationRequest(BaseModel):
@@ -92,7 +96,7 @@ async def create_moderation(
         return await amoderation(**moderation_kwargs)
 
     outcome = await run_passthrough(
-        endpoint="/v1/moderations",
+        endpoint=USAGE_ENDPOINT,
         raw_request=raw_request,
         response=response,
         auth_result=auth_result,

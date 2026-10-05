@@ -1,10 +1,10 @@
-"""Runtime search-tool management for the dashboard (``/v1/search-tools``).
+"""Runtime search-tool management for the dashboard (``/api/v1/search-tools``).
 
-``POST /v1/search`` dispatches against the ``search_tools`` map. That map used to
+``POST /api/v1/search`` dispatches against the ``search_tools`` map. That map used to
 come only from a config file, so a deployment configured entirely through the
 dashboard and environment variables could not use the endpoint at all (issue
 #601). These endpoints are the missing route in, and they are deliberately the
-same shape as ``/v1/provider-credentials``: rows in ``search_tool_credentials``,
+same shape as ``/api/v1/provider-credentials``: rows in ``search_tool_credentials``,
 the API key encrypted at rest and never returned, merged over the config-file
 tools with the stored row winning on a name collision.
 
@@ -13,7 +13,7 @@ list endpoint so the dashboard can show every tool a request could name, not jus
 the editable ones.
 
 Operator-gated and standalone-only (the router is not mounted in hybrid). URL
-validation is structural, matching ``/v1/tool-settings`` rather than the provider
+validation is structural, matching ``/api/v1/tool-settings`` rather than the provider
 SSRF gate: the backend this most often points at is a SearXNG sidecar on a
 private address, which a deny-private gate would refuse.
 """
@@ -35,7 +35,7 @@ from gateway.core.config import (
     validate_search_tool_transport,
 )
 from gateway.log_config import logger
-from gateway.models.entities import SearchToolCredential
+from gateway.models.tools import SearchToolCredential
 from gateway.services.search_backend import default_api_base
 from gateway.services.search_tool_store_service import (
     UNSET,
@@ -56,7 +56,7 @@ from gateway.services.secret_box import (
 from gateway.services.tool_settings_service import validate_url
 
 router = APIRouter(
-    prefix="/v1/search-tools",
+    prefix="/search-tools",
     tags=["search-tools"],
     dependencies=[Depends(require_deployment_operator)],
 )
@@ -124,7 +124,7 @@ class ConfigSearchToolSchema(BaseModel):
 
 
 class SearchToolsResponse(BaseModel):
-    """Every search tool ``POST /v1/search`` can name, by where it came from."""
+    """Every search tool ``POST /api/v1/search`` can name, by where it came from."""
 
     stored: list[StoredSearchToolSchema]
     config: list[ConfigSearchToolSchema]
@@ -137,7 +137,7 @@ class CreateSearchToolRequest(BaseModel):
         json_schema_extra={"example": {"name": "local", "provider": "searxng", "api_base": "http://searxng:8080"}}
     )
 
-    name: str = Field(min_length=1, description="Name callers pass as 'search_tool_name' or in /v1/search/{tool}.")
+    name: str = Field(min_length=1, description="Name callers pass as 'search_tool_name' or in /api/v1/search/{tool}.")
     provider: str = Field(description=f"Search provider, one of: {', '.join(SEARCH_PROVIDERS)}.")
     api_base: str | None = Field(
         default=None,
@@ -170,6 +170,13 @@ class ReencryptSearchToolsResponse(BaseModel):
 
     reencrypted: int = Field(description="Number of stored search-tool keys re-encrypted.")
     unreadable: int = Field(description="Number of encrypted keys left untouched because they could not be decrypted.")
+    skipped: int = Field(
+        default=0,
+        description=(
+            "Number of rows whose stored key changed between the read and the write, so the "
+            "re-encryption was not applied. They already hold whoever wrote them last."
+        ),
+    )
 
 
 def _is_decryptable(row: SearchToolCredential) -> bool:
@@ -258,7 +265,7 @@ async def list_all_search_tools(
     db: Annotated[AsyncSession, Depends(get_db)],
     config: Annotated[GatewayConfig, Depends(get_config)],
 ) -> SearchToolsResponse:
-    """List every search tool ``POST /v1/search`` can name.
+    """List every search tool ``POST /api/v1/search`` can name.
 
     ``stored`` are the editable rows written through this API; ``config`` are the
     config-file entries, which are still honored and are reported so the operator
@@ -297,12 +304,12 @@ async def reencrypt_stored_search_tool_keys(
     """Re-encrypt stored search-tool keys with the primary OTARI_SECRET_KEY.
 
     The search-tool half of the ``OTARI_SECRET_KEY`` rotation procedure; run it
-    alongside ``POST /v1/provider-credentials/reencrypt``. Rows that cannot be
+    alongside ``POST /api/v1/provider-credentials/reencrypt``. Rows that cannot be
     decrypted are left untouched and must be recovered by replacing the affected
     tool's key.
     """
     try:
-        reencrypted, unreadable = await reencrypt_search_tools(db)
+        reencrypted, unreadable, skipped = await reencrypt_search_tools(db)
         await db.commit()
     except SecretBoxUnavailableError as exc:
         await db.rollback()
@@ -314,7 +321,7 @@ async def reencrypt_stored_search_tool_keys(
         await refresh_search_tool_cache(db, config)
     except SQLAlchemyError:
         logger.warning("Search tool overlay refresh failed after re-encrypting keys; converges within TTL")
-    return ReencryptSearchToolsResponse(reencrypted=reencrypted, unreadable=unreadable)
+    return ReencryptSearchToolsResponse(reencrypted=reencrypted, unreadable=unreadable, skipped=skipped)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -356,8 +363,7 @@ async def create_search_tool(
     shadows_config = name in config_file_search_tools(config)
     if shadows_config:
         logger.warning(
-            "Stored search tool '%s' shadows the config.yml search tool of the same name; "
-            "the stored entry now wins.",
+            "Stored search tool '%s' shadows the config.yml search tool of the same name; the stored entry now wins.",
             name,
         )
     await _apply_write(db, config, name)

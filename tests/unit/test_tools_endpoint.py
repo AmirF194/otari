@@ -1,4 +1,4 @@
-"""Endpoint tests for GET /v1/tools (gateway-run tool discovery)."""
+"""Endpoint tests for GET /api/v1/tools (gateway-run tool discovery)."""
 
 from collections.abc import Iterator
 from pathlib import Path
@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gateway.api.deps import reset_config
-from gateway.core.config import GatewayConfig
+from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.core.database import reset_db
 from gateway.main import create_app
 
@@ -37,21 +37,21 @@ def _client(tmp_path: Path, **overrides: Any) -> TestClient:
 
 
 def _tools(client: TestClient) -> dict[str, Any]:
-    body = client.get("/v1/tools", headers=AUTH).json()
+    body = client.get(f"{API_ROOT}/tools", headers=AUTH).json()
     assert body["object"] == "list"
     return {tool["id"]: tool for tool in body["data"]}
 
 
 def test_requires_auth(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
-        assert client.get("/v1/tools").status_code == 401
+        assert client.get(f"{API_ROOT}/tools").status_code == 401
 
 
-def test_lists_both_gateway_tools_with_schemas_and_examples(tmp_path: Path) -> None:
-    with _client(tmp_path) as client:
+def test_lists_gateway_tools_with_schemas_and_examples(tmp_path: Path) -> None:
+    with _client(tmp_path, web_fetch_enabled=True) as client:
         tools = _tools(client)
 
-    assert set(tools) == {"otari_web_search", "otari_code_execution"}
+    assert set(tools) == {"otari_web_search", "otari_web_fetch", "otari_code_execution"}
     web_search = tools["otari_web_search"]
     assert web_search["object"] == "tool"
     assert web_search["example"] == {"type": "otari_web_search"}
@@ -59,22 +59,33 @@ def test_lists_both_gateway_tools_with_schemas_and_examples(tmp_path: Path) -> N
     assert web_search["input_schema"]["required"] == ["query"]
     assert "query" in web_search["input_schema"]["properties"]
     assert tools["otari_code_execution"]["input_schema"]["required"] == ["code"]
+    web_fetch = tools["otari_web_fetch"]
+    assert web_fetch["available"] is True
+    assert web_fetch["accepted_types"] == ["otari_web_fetch"]
+    assert web_fetch["example"] == {"type": "otari_web_fetch"}
+    assert web_fetch["input_schema"]["required"] == ["url"]
 
 
 def test_unconfigured_tools_are_listed_as_unavailable(tmp_path: Path) -> None:
-    """Listed but unavailable is the actionable answer: the tool exists, the
-    operator has not wired up a backend."""
+    """Unavailable tools stay discoverable so the operator can enable or configure them."""
     with _client(tmp_path) as client:
         tools = _tools(client)
 
     assert tools["otari_web_search"]["available"] is False
+    assert tools["otari_web_fetch"]["available"] is False
     assert tools["otari_code_execution"]["available"] is False
 
 
-def test_configured_backends_report_available(tmp_path: Path) -> None:
-    with _client(tmp_path, web_search_url="http://searxng:8080", sandbox_url="http://sandbox:8000") as client:
+def test_configured_tools_report_available(tmp_path: Path) -> None:
+    with _client(
+        tmp_path,
+        web_fetch_enabled=True,
+        web_search_url="http://searxng:8080",
+        sandbox_url="http://sandbox:8000",
+    ) as client:
         tools = _tools(client)
 
+    assert tools["otari_web_fetch"]["available"] is True
     assert tools["otari_web_search"]["available"] is True
     assert tools["otari_code_execution"]["available"] is True
 
@@ -138,6 +149,16 @@ def test_not_registered_in_hybrid_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     this gateway's own configuration does not decide what the caller can call.
     """
     with _hybrid_client(monkeypatch, web_search_url="http://searxng:8080") as client:
-        response = client.get("/v1/tools", headers={"Authorization": "Bearer platform-user-token"})
+        response = client.get(f"{API_ROOT}/tools", headers={"Authorization": "Bearer platform-user-token"})
 
     assert response.status_code == 404, response.text
+
+
+def test_a_configured_sandbox_advertises_the_provider_keywords_it_may_claim(tmp_path: Path) -> None:
+    with _client(tmp_path, sandbox_url="http://sandbox:8080") as client:
+        auto = _tools(client)["otari_code_execution"]["accepted_types"]
+    with _client(tmp_path, sandbox_url="http://sandbox:8080", code_execution_executor="provider") as client:
+        provider_only = _tools(client)["otari_code_execution"]["accepted_types"]
+
+    assert auto == ["otari_code_execution", "code_execution", "code_interpreter", "code_execution_<date>"]
+    assert provider_only == ["otari_code_execution"]

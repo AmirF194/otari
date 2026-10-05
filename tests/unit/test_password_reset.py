@@ -17,10 +17,10 @@ from httpx2 import Response
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
-from gateway.core.config import GatewayConfig
+from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.log_config import logger as gateway_logger
 from gateway.main import create_app
-from gateway.models.entities import DashboardSession
+from gateway.models.tenancy import DashboardSession
 
 MASTER_KEY = "sk-test-master"
 PASSWORD = "a-real-password"  # pragma: allowlist secret
@@ -64,22 +64,25 @@ def _extract_token(text: str) -> str:
 
 def _claimed_and_verified(client: TestClient, caplog: pytest.LogCaptureFixture, *, email: str) -> None:
     """Get an identity onto the roster, signed up, and verified, ready to sign in."""
-    assert client.post(
-        "/v1/organizations/me/members",
-        json={"email": email, "role": "member"},
-        headers={"Otari-Key": MASTER_KEY},
-    ).status_code == 201
+    assert (
+        client.post(
+            f"{API_ROOT}/organizations/me/members",
+            json={"email": email, "role": "member"},
+            headers={"Otari-Key": MASTER_KEY},
+        ).status_code
+        == 201
+    )
 
     signup = _with_logs(
-        client, caplog, lambda: client.post("/v1/auth/signup", json={"email": email, "password": PASSWORD})
+        client, caplog, lambda: client.post(f"{API_ROOT}/auth/signup", json={"email": email, "password": PASSWORD})
     )
     assert signup.status_code == 200, signup.text
     token = _extract_token(caplog.text)
-    assert client.post("/v1/auth/verify-email", json={"token": token}).status_code == 200
+    assert client.post(f"{API_ROOT}/auth/verify-email", json={"token": token}).status_code == 200
 
 
 def _request_reset(client: TestClient, caplog: pytest.LogCaptureFixture, *, email: str) -> tuple[int, str]:
-    response = _with_logs(client, caplog, lambda: client.post("/v1/auth/password/reset", json={"email": email}))
+    response = _with_logs(client, caplog, lambda: client.post(f"{API_ROOT}/auth/password/reset", json={"email": email}))
     return response.status_code, caplog.text
 
 
@@ -98,30 +101,37 @@ def test_reset_round_trips_end_to_end(tmp_path: Path, caplog: pytest.LogCaptureF
         token = _extract_token(log_text)
 
         confirmed = client.post(
-            "/v1/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
+            f"{API_ROOT}/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
         )
         assert confirmed.status_code == 204, confirmed.text
 
-        assert client.post(
-            "/v1/auth/session", json={"email": "ada@example.com", "password": NEW_PASSWORD}
-        ).status_code == 200
-        assert client.post(
-            "/v1/auth/session", json={"email": "ada@example.com", "password": PASSWORD}
-        ).status_code == 401
+        assert (
+            client.post(
+                f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": NEW_PASSWORD}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": PASSWORD}).status_code
+            == 401
+        )
 
 
 def test_reset_works_before_the_address_is_verified(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """Forgetting a password predates ever verifying it."""
     with _client(tmp_path) as client:
-        assert client.post(
-            "/v1/organizations/me/members",
-            json={"email": "ada@example.com", "role": "member"},
-            headers={"Otari-Key": MASTER_KEY},
-        ).status_code == 201
+        assert (
+            client.post(
+                f"{API_ROOT}/organizations/me/members",
+                json={"email": "ada@example.com", "role": "member"},
+                headers={"Otari-Key": MASTER_KEY},
+            ).status_code
+            == 201
+        )
         signup = _with_logs(
             client,
             caplog,
-            lambda: client.post("/v1/auth/signup", json={"email": "ada@example.com", "password": PASSWORD}),
+            lambda: client.post(f"{API_ROOT}/auth/signup", json={"email": "ada@example.com", "password": PASSWORD}),
         )
         assert signup.status_code == 200
 
@@ -130,7 +140,7 @@ def test_reset_works_before_the_address_is_verified(tmp_path: Path, caplog: pyte
         token = _extract_token(log_text)
 
         confirmed = client.post(
-            "/v1/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
+            f"{API_ROOT}/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
         )
         assert confirmed.status_code == 204, confirmed.text
 
@@ -138,14 +148,15 @@ def test_reset_works_before_the_address_is_verified(tmp_path: Path, caplog: pyte
 def test_reset_revokes_the_identity_s_other_sessions(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     with _client(tmp_path) as client:
         _claimed_and_verified(client, caplog, email="ada@example.com")
-        assert client.post(
-            "/v1/auth/session", json={"email": "ada@example.com", "password": PASSWORD}
-        ).status_code == 200
+        assert (
+            client.post(f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": PASSWORD}).status_code
+            == 200
+        )
 
         status_code, log_text = _request_reset(client, caplog, email="ada@example.com")
         assert status_code == 200
         token = _extract_token(log_text)
-        client.post("/v1/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD})
+        client.post(f"{API_ROOT}/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD})
 
     assert _sessions(tmp_path, "reset-test.db") == []
 
@@ -157,11 +168,13 @@ def test_a_reused_reset_token_is_refused(tmp_path: Path, caplog: pytest.LogCaptu
         _, log_text = _request_reset(client, caplog, email="ada@example.com")
         token = _extract_token(log_text)
 
-        first = client.post("/v1/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD})
+        first = client.post(
+            f"{API_ROOT}/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
+        )
         assert first.status_code == 204
 
         second = client.post(
-            "/v1/auth/password/reset/confirm", json={"token": token, "new_password": "yet-another-password"}
+            f"{API_ROOT}/auth/password/reset/confirm", json={"token": token, "new_password": "yet-another-password"}
         )
         assert second.status_code == 400
 
@@ -169,7 +182,7 @@ def test_a_reused_reset_token_is_refused(tmp_path: Path, caplog: pytest.LogCaptu
 def test_an_unknown_reset_token_is_refused(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         response = client.post(
-            "/v1/auth/password/reset/confirm", json={"token": "not-a-real-token", "new_password": NEW_PASSWORD}
+            f"{API_ROOT}/auth/password/reset/confirm", json={"token": "not-a-real-token", "new_password": NEW_PASSWORD}
         )
         assert response.status_code == 400
 
@@ -189,7 +202,7 @@ def test_an_expired_reset_token_is_refused(tmp_path: Path, caplog: pytest.LogCap
 
     with _client(tmp_path) as client:
         response = client.post(
-            "/v1/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
+            f"{API_ROOT}/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
         )
         assert response.status_code == 400
 
@@ -213,7 +226,7 @@ def test_a_reset_token_is_refused_once_the_identity_is_deactivated(
 
     with _client(tmp_path) as client:
         response = client.post(
-            "/v1/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
+            f"{API_ROOT}/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
         )
         assert response.status_code == 400
 
@@ -235,16 +248,16 @@ def test_a_password_change_elsewhere_invalidates_an_outstanding_reset_token(
 
         # The account owner changes their password through the ordinary,
         # session-authenticated channel while the reset link is still live.
-        signed_in = client.post("/v1/auth/session", json={"email": "ada@example.com", "password": PASSWORD})
+        signed_in = client.post(f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": PASSWORD})
         assert signed_in.status_code == 200
         changed = client.put(
-            "/v1/auth/password",
+            f"{API_ROOT}/auth/password",
             json={"current_password": PASSWORD, "new_password": "an-unrelated-change"},
         )
         assert changed.status_code == 200, changed.text
 
         confirmed = client.post(
-            "/v1/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
+            f"{API_ROOT}/auth/password/reset/confirm", json={"token": token, "new_password": NEW_PASSWORD}
         )
         assert confirmed.status_code == 400
 
@@ -281,23 +294,57 @@ def test_request_reset_for_a_deactivated_identity_sends_nothing(
         assert "mail:console" not in log_text
 
 
+def test_request_reset_for_a_verified_identity_with_no_password_sends_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with _client(tmp_path) as client:
+        assert (
+            client.post(
+                f"{API_ROOT}/organizations/me/members",
+                json={"email": "ada@example.com", "role": "member"},
+                headers={"Otari-Key": MASTER_KEY},
+            ).status_code
+            == 201
+        )
+        engine = create_engine(f"sqlite:///{tmp_path / 'reset-test.db'}")
+        with engine.begin() as connection:
+            connection.execute(
+                text('UPDATE "user" SET email_verified_at = CURRENT_TIMESTAMP WHERE email = :email'),
+                {"email": "ada@example.com"},
+            )
+        engine.dispose()
+
+        status_code, log_text = _request_reset(client, caplog, email="ada@example.com")
+
+        assert status_code == 200
+        assert "mail:console" not in log_text
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'reset-test.db'}")
+    with engine.begin() as connection:
+        token_hash = connection.execute(
+            text('SELECT password_reset_token_hash FROM "user" WHERE email = :email'), {"email": "ada@example.com"}
+        ).scalar_one()
+    engine.dispose()
+    assert token_hash is None
+
+
 def test_request_reset_without_mail_configured_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     with _client(tmp_path) as client:
         _claimed_and_verified(client, caplog, email="ada@example.com")
 
     with _client(tmp_path, mail_transport="none", public_base_url=None) as client:
-        response = client.post("/v1/auth/password/reset", json={"email": "ada@example.com"})
+        response = client.post(f"{API_ROOT}/auth/password/reset", json={"email": "ada@example.com"})
         assert response.status_code == 503
         # Not the central tenancy handler's generic 5xx body: this refusal has
-        # to name what is missing, the same as GET /v1/settings/mail's own.
+        # to name what is missing, the same as GET /api/v1/settings/mail's own.
         assert "mail_transport" in response.json()["detail"]
 
 
 def test_repeated_reset_requests_get_throttled(tmp_path: Path) -> None:
     with TestClient(create_app(_config(tmp_path, dashboard_login_rate_limit_per_minute=2))) as client:
         for _ in range(2):
-            response = client.post("/v1/auth/password/reset", json={"email": "nobody@example.com"})
+            response = client.post(f"{API_ROOT}/auth/password/reset", json={"email": "nobody@example.com"})
             assert response.status_code == 200
 
-        throttled = client.post("/v1/auth/password/reset", json={"email": "nobody@example.com"})
+        throttled = client.post(f"{API_ROOT}/auth/password/reset", json={"email": "nobody@example.com"})
         assert throttled.status_code == 429

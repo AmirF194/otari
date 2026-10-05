@@ -3,7 +3,7 @@
 `api/deps.verify_master_key` answers *authenticated*, not *authorized*: a
 dashboard session clears it for any active identity. Two families of router
 declare it, and only one of them re-checks the caller afterwards. The
-tenant-scoped family (organizations, workspaces, org provider keys, `/v1/admin`)
+tenant-scoped family (organizations, workspaces, org provider keys, `/api/v1/admin`)
 resolves `CurrentIdentity` and asks a service whether that identity may act on
 the organization, workspace or deployment named; the deployment-wide family does
 not, so clearing the credential check *was* the whole authorization there.
@@ -32,9 +32,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 from sqlmodel import col
 
-from gateway.core.config import GatewayConfig
-from gateway.models.entities import DashboardSession
-from gateway.models.tenancy import Organization, OrganizationMember, User
+from gateway.core.config import API_ROOT, GatewayConfig
+from gateway.models.tenancy import DashboardSession, Organization, OrganizationMember, User
 from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME, hash_session_token
 
 # One probe per deployment-wide router family, each the cheapest request that
@@ -43,33 +42,33 @@ from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME, hash
 # router is one (`pricing` reads are deliberately open to any API key, so only
 # its writes belong here).
 _DEPLOYMENT_WIDE_PROBES: list[tuple[str, str]] = [
-    ("GET", "/v1/keys"),
-    ("GET", "/v1/users"),
-    ("GET", "/v1/budgets"),
-    ("GET", "/v1/scoped-budgets"),
-    ("GET", "/v1/usage"),
-    ("GET", "/v1/agent-telemetry/summary"),
-    ("GET", "/v1/aliases"),
-    ("GET", "/v1/routing/policies"),
-    ("GET", "/v1/routing/status"),
-    ("GET", "/v1/models/discoverable"),
-    ("GET", "/v1/provider-credentials"),
-    ("GET", "/v1/search-tools"),
-    ("GET", "/v1/settings"),
-    ("GET", "/v1/settings/mail"),
-    ("GET", "/v1/settings/maintenance-mode"),
-    ("POST", "/v1/pricing"),
+    ("GET", f"{API_ROOT}/keys"),
+    ("GET", f"{API_ROOT}/users"),
+    ("GET", f"{API_ROOT}/budgets"),
+    ("GET", f"{API_ROOT}/scoped-budgets"),
+    ("GET", f"{API_ROOT}/usage"),
+    ("GET", f"{API_ROOT}/agent-telemetry/summary"),
+    ("GET", f"{API_ROOT}/aliases"),
+    ("GET", f"{API_ROOT}/routing/policies"),
+    ("GET", f"{API_ROOT}/routing/status"),
+    ("GET", f"{API_ROOT}/models/discoverable"),
+    ("GET", f"{API_ROOT}/provider-credentials"),
+    ("GET", f"{API_ROOT}/search-tools"),
+    ("GET", f"{API_ROOT}/settings"),
+    ("GET", f"{API_ROOT}/settings/mail"),
+    ("GET", f"{API_ROOT}/settings/maintenance-mode"),
+    ("POST", f"{API_ROOT}/pricing"),
 ]
 
 # The subset whose reach is worse than reading somebody else's rows: two that
 # take the deployment away from its operator, and the three that make the
 # gateway issue an outbound request to an address the caller supplies.
 _ESCALATION_PROBES: list[tuple[str, str]] = [
-    ("POST", "/v1/settings/master-key/rotate"),
-    ("PATCH", "/v1/settings/maintenance-mode"),
-    ("POST", "/v1/provider-credentials/test"),
-    ("POST", "/v1/tool-settings/web_search/test"),
-    ("POST", "/v1/settings/mail/test"),
+    ("POST", f"{API_ROOT}/settings/master-key/rotate"),
+    ("PATCH", f"{API_ROOT}/settings/maintenance-mode"),
+    ("POST", f"{API_ROOT}/provider-credentials/test"),
+    ("POST", f"{API_ROOT}/tool-settings/web_search/test"),
+    ("POST", f"{API_ROOT}/settings/mail/test"),
 ]
 
 # The data plane: a provider is called with somebody's credentials and a usage
@@ -78,23 +77,27 @@ _ESCALATION_PROBES: list[tuple[str, str]] = [
 # reach any of it. 401, not 403: with the cookie ignored the request simply
 # carries no credential this plane recognizes.
 _DATA_PLANE_PROBES: list[tuple[str, str]] = [
-    ("POST", "/v1/embeddings"),
-    ("POST", "/v1/moderations"),
-    ("POST", "/v1/rerank"),
-    ("POST", "/v1/search"),
-    ("POST", "/v1/images/generations"),
-    ("POST", "/v1/usage/external-events"),
-    ("GET", "/v1/files"),
-    ("GET", "/v1/batches"),
+    ("POST", f"{API_ROOT}/embeddings"),
+    ("POST", f"{API_ROOT}/moderations"),
+    ("POST", f"{API_ROOT}/rerank"),
+    ("POST", f"{API_ROOT}/search"),
+    ("POST", f"{API_ROOT}/images/generations"),
+    ("POST", f"{API_ROOT}/usage/external-events"),
+    ("GET", f"{API_ROOT}/files"),
+    ("GET", f"{API_ROOT}/batches"),
 ]
 
 # The exception, and the reason the data-plane dependency was split rather than
 # just tightened: these describe the deployment instead of acting on it, and the
-# dashboard's Models and Pricing pages are built on them.
+# dashboard's Models and Pricing pages are built on them. The built-in guardrail
+# catalog joins them because it describes the installed any-guardrail and dials
+# nothing; the profiles read beside it does dial the deployment's own guardrails
+# service, so that one is not here.
 _CATALOG_PROBES: list[tuple[str, str]] = [
-    ("GET", "/v1/models"),
-    ("GET", "/v1/pricing"),
-    ("GET", "/v1/tools"),
+    ("GET", f"{API_ROOT}/models"),
+    ("GET", f"{API_ROOT}/pricing"),
+    ("GET", f"{API_ROOT}/tools"),
+    ("GET", f"{API_ROOT}/tool-settings/guardrails/catalog"),
 ]
 
 # Routers that resolve the caller and check their standing themselves. A plain
@@ -105,7 +108,7 @@ _CATALOG_PROBES: list[tuple[str, str]] = [
 # joined them in otari-ai#1944), and their own 403 is indistinguishable here
 # from the one this file is about.
 #
-# ``GET /v1/tool-settings`` sits here because it *narrows* rather than refuses,
+# ``GET /api/v1/tool-settings`` sits here because it *narrows* rather than refuses,
 # withholding the three service-endpoint fields from a non-operator
 # (otari-ai#1969). It rides its own ``reader_router`` for that, since a
 # router-level gate always runs and a route cannot opt out of one in place, which
@@ -114,16 +117,16 @@ _CATALOG_PROBES: list[tuple[str, str]] = [
 # withholds is pinned in ``test_tool_settings_tenant_read.py``; this file only
 # pins that it answers.
 _TENANT_SCOPED_PROBES: list[tuple[str, str]] = [
-    ("GET", "/v1/organizations/me"),
-    ("GET", "/v1/workspaces"),
-    ("GET", "/v1/admin/access"),
-    ("GET", "/v1/tool-settings"),
+    ("GET", f"{API_ROOT}/organizations/me"),
+    ("GET", f"{API_ROOT}/workspaces"),
+    ("GET", f"{API_ROOT}/admin/access"),
+    ("GET", f"{API_ROOT}/tool-settings"),
 ]
 
 
 def _provision(client: TestClient, master_key_header: dict[str, str]) -> None:
     """Make one master-key request, which provisions the tenancy root."""
-    assert client.get("/v1/organizations/me", headers=master_key_header).status_code == 200
+    assert client.get(f"{API_ROOT}/organizations/me", headers=master_key_header).status_code == 200
 
 
 def _default_organization_id(session_factory: Callable[[], Session]) -> uuid.UUID:
@@ -154,9 +157,7 @@ def _session_for(
         session.add(user)
         session.commit()
         session.refresh(user)
-        session.add(
-            OrganizationMember(organization_id=organization_id, user_id=user.id, role=role, status="active")
-        )
+        session.add(OrganizationMember(organization_id=organization_id, user_id=user.id, role=role, status="active"))
         token = f"otari-sess-{email}"
         session.add(
             DashboardSession(
@@ -194,7 +195,7 @@ def test_a_plain_member_session_is_refused_by_every_deployment_wide_route(
 ) -> None:
     """otari-ai#1880: this is the whole of the cross-organization breach.
 
-    403 rather than 404: unlike `/v1/admin`, these routes are no secret, and the
+    403 rather than 404: unlike `/api/v1/admin`, these routes are no secret, and the
     dashboard has to tell "you may not" apart from "there is nothing here" to
     decide whether to keep the caller signed in.
     """
@@ -231,21 +232,61 @@ def test_an_organization_owner_is_still_not_a_deployment_operator(
 
     client.cookies.set(SESSION_COOKIE_NAME, token)
     try:
-        refused = _call(client, "GET", "/v1/keys")
+        refused = _call(client, "GET", f"{API_ROOT}/keys")
         # ...while the organization they do own answers as before.
-        own = _call(client, "GET", "/v1/organizations/me")
+        own = _call(client, "GET", f"{API_ROOT}/organizations/me")
         # Probed at owner rather than member because the provider-keys list is
         # organization-management-gated (otari-ai#1944), which is what took it
         # out of `_TENANT_SCOPED_PROBES`. Its own 403 would be
         # indistinguishable there from this file's; here it says the
         # deployment-operator gate is still off that router.
-        keys = _call(client, "GET", "/v1/organizations/me/provider-keys")
+        keys = _call(client, "GET", f"{API_ROOT}/organizations/me/provider-keys")
     finally:
         client.cookies.clear()
 
     assert refused == 403
     assert own == 200
     assert keys == 200
+
+
+def test_a_member_reads_the_provider_catalog_the_byo_form_offers(
+    client: TestClient,
+    master_key_header: dict[str, str],
+    db_session_factory: Callable[[], Session],
+) -> None:
+    """The registry read the organization provider-key form cannot do without.
+
+    It names the providers any-llm knows, which is a property of the build and
+    not of this deployment, so it is a catalog read like ``/api/v1/models``
+    rather than a description of the gateway's own configuration. It sat on the
+    operator router regardless, which left the form's provider picker empty for
+    every caller entitled to fill it: an owner or admin passes the
+    organization-management gate on the keys themselves and then had nothing to
+    choose from. The detail route goes with it, since picking a provider is what
+    asks for the autofill hints.
+
+    Probed at member because the gate being tested is the deployment one; the
+    form's own owner/admin check lives on the provider-keys router and is
+    asserted above.
+    """
+    _provision(client, master_key_header)
+    organization_id = _default_organization_id(db_session_factory)
+    token = _session_for(db_session_factory, organization_id=organization_id, email="ada@example.com")
+
+    client.cookies.set(SESSION_COOKIE_NAME, token)
+    try:
+        listed = client.get(f"{API_ROOT}/providers/catalog")
+        detail = _call(client, "GET", f"{API_ROOT}/providers/catalog/openai")
+        # The rest of the module stays operator-gated: the catalog moving off it
+        # is a route split, not the router opening up.
+        configured = _call(client, "GET", f"{API_ROOT}/providers")
+    finally:
+        client.cookies.clear()
+
+    assert listed.status_code == 200
+    assert any(entry["id"] == "openai" for entry in listed.json())
+    assert detail == 200
+    assert configured == 403
 
 
 # =============================================================================
@@ -295,12 +336,12 @@ def test_the_master_key_reaches_every_deployment_wide_route(
 def test_the_master_key_still_lists_keys(client: TestClient, master_key_header: dict[str, str]) -> None:
     """One probe asserted at its real status, so `!= 403` above is not the only claim."""
     _provision(client, master_key_header)
-    assert client.get("/v1/keys", headers=master_key_header).status_code == 200
+    assert client.get(f"{API_ROOT}/keys", headers=master_key_header).status_code == 200
 
 
 def test_an_unauthenticated_request_is_still_401_and_not_403(client: TestClient) -> None:
     """The gate runs after the credential check, so no-credential keeps its status."""
-    assert client.get("/v1/keys").status_code == 401
+    assert client.get(f"{API_ROOT}/keys").status_code == 401
 
 
 # =============================================================================
@@ -334,7 +375,7 @@ def test_the_admin_router_keeps_its_own_404_rather_than_the_gate_403(
     db_session_factory: Callable[[], Session],
     test_config: GatewayConfig,
 ) -> None:
-    """`/v1/admin` hides itself from a non-operator on purpose, and still does.
+    """`/api/v1/admin` hides itself from a non-operator on purpose, and still does.
 
     Its refusal is a 404 so the surface does not confirm it exists, and
     `GET /access` answers 200 either way so the dashboard has something to gate
@@ -346,8 +387,8 @@ def test_the_admin_router_keeps_its_own_404_rather_than_the_gate_403(
 
     client.cookies.set(SESSION_COOKIE_NAME, token)
     try:
-        listed = client.get("/v1/admin/users")
-        access = client.get("/v1/admin/access")
+        listed = client.get(f"{API_ROOT}/admin/users")
+        access = client.get(f"{API_ROOT}/admin/access")
     finally:
         client.cookies.clear()
 
@@ -394,11 +435,11 @@ def test_a_session_cookie_does_not_authenticate_the_data_plane(
     ("path", "body"),
     [
         (
-            "/v1/chat/completions",
+            f"{API_ROOT}/chat/completions",
             {"model": "openai:gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
         ),
         (
-            "/v1/messages/count_tokens",
+            f"{API_ROOT}/messages/count_tokens",
             {"model": "openai:gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
         ),
     ],
@@ -453,7 +494,7 @@ def test_even_a_superuser_session_does_not_authenticate_the_data_plane(
 
     client.cookies.set(SESSION_COOKIE_NAME, token)
     try:
-        assert _call(client, "POST", "/v1/embeddings") == 401
+        assert _call(client, "POST", f"{API_ROOT}/embeddings") == 401
     finally:
         client.cookies.clear()
 
@@ -484,10 +525,10 @@ def test_an_api_key_still_reaches_the_data_plane(
 ) -> None:
     """The control for the refusals above: nothing changed for a real credential."""
     _provision(client, master_key_header)
-    created = client.post("/v1/keys", json={"key_name": "data-plane"}, headers=master_key_header)
+    created = client.post(f"{API_ROOT}/keys", json={"key_name": "data-plane"}, headers=master_key_header)
     assert created.status_code == 200, created.text
     secret = created.json()["key"]
 
-    listed = client.get("/v1/files", headers={"Otari-Key": secret})
+    listed = client.get(f"{API_ROOT}/files", headers={"Otari-Key": secret})
 
     assert listed.status_code == 200, listed.text

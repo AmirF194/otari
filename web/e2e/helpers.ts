@@ -4,9 +4,22 @@ import {
   type Locator,
   type Page,
 } from "@playwright/test"
+import { API_ROOT } from "@/shared/api/client"
 
 // Matches web/e2e/otari.yml. The login step needs a known key.
 export const MASTER_KEY = "e2e-master-key"
+
+// Mirrors API_KEY_PREFIX in src/gateway/auth/models.py, which stamps every key
+// the open-source format mints.
+export const API_KEY_PREFIX = "tk-"
+// The fingerprint the default adapter stores: the prefix plus seven random
+// characters (FINGERPRINT_RANDOM_CHARS in src/gateway/adapters/api_key_format_adapter.py).
+const FINGERPRINT_LENGTH = API_KEY_PREFIX.length + 7
+
+// Independent of the UI helper so these assertions can catch its regressions.
+export function expectedKeyFingerprint(key: string): string {
+  return `${key.slice(0, FINGERPRINT_LENGTH)}${"•".repeat(8)}${key.slice(-4)}`
+}
 
 // Scope link lookups to the sidebar navigation landmark. The Overview landing
 // page has tile-links whose names substring-collide with sidebar items
@@ -26,17 +39,26 @@ export const nav = (page: Page): Locator =>
  * the page's `h1` and fails strict mode with two elements. Scoping to `main` is
  * what `nav()` does in the other direction, and it stays right however the rail's
  * markup changes.
+ *
+ * Matched exactly, because the Budgets onboarding heading ("No budgets yet")
+ * would otherwise also substring-match that page's title.
  */
 export const pageHeading = (page: Page, name: string): Locator =>
   page.getByRole("main").getByRole("heading", { name, exact: true })
 
 export async function login(page: Page): Promise<void> {
   await page.goto("/")
-  await page.locator('input[type="password"]').fill(MASTER_KEY)
-  await page.locator('input[type="password"]').press("Enter")
+  // Once any member holds a password (the tenancy spec's invitee does), the
+  // screen offers both credentials and defaults to email and password.
+  const field = page.locator('input[type="password"]')
+  await expect(field.first()).toBeVisible()
+  const useMasterKey = page.getByRole("button", { name: "Use your master key" })
+  if (await useMasterKey.isVisible()) await useMasterKey.click()
+  await field.fill(MASTER_KEY)
+  await field.press("Enter")
   // The sidebar appears once authenticated, regardless of the index landing
   // page.
-  await expect(nav(page).getByRole("link", { name: "Providers" })).toBeVisible()
+  await expect(nav(page).getByRole("link", { name: "Overview" })).toBeVisible()
 }
 
 // The dashboard authenticates with a session cookie, but the seeding and
@@ -55,6 +77,23 @@ export async function openOrganization(page: Page): Promise<void> {
   await expect(
     nav(page).getByRole("link", { name: "Members & roles" }),
   ).toBeVisible()
+}
+
+/**
+ * Open the account menu at the foot of the sidebar.
+ *
+ * The one way to the deployment's own pages: they are registry entries like any
+ * other, but the shell draws them here rather than as rail rows, so a spec that
+ * only walks the rails never reaches them.
+ *
+ * The trigger's accessible name carries whoever is signed in, so it is matched
+ * on the prefix it always starts with rather than in full.
+ */
+export async function openAccountMenu(page: Page): Promise<Locator> {
+  await page.getByRole("button", { name: /^Account:/ }).click()
+  const menu = page.getByRole("dialog", { name: "Account" })
+  await expect(menu).toBeVisible()
+  return menu
 }
 
 /**
@@ -91,9 +130,12 @@ export const authHeaders = {
  * fine.
  */
 export async function dismissSetupGuide(page: Page): Promise<void> {
-  const listed = await page.request.get("/v1/workspaces?skip=0&limit=1000", {
-    headers: authHeaders,
-  })
+  const listed = await page.request.get(
+    `${API_ROOT}/workspaces?skip=0&limit=1000`,
+    {
+      headers: authHeaders,
+    },
+  )
   await expectOk(listed, "list workspaces")
   const { data, count } = (await listed.json()) as {
     data: { id: string }[]
@@ -109,7 +151,7 @@ export async function dismissSetupGuide(page: Page): Promise<void> {
   ).toBe(count)
   for (const workspace of data) {
     const dismissed = await page.request.post(
-      `/v1/workspaces/${workspace.id}/activation/dismiss`,
+      `${API_ROOT}/workspaces/${workspace.id}/activation/dismiss`,
       { headers: authHeaders },
     )
     await expectOk(dismissed, `dismiss the setup guide in ${workspace.id}`)
@@ -173,6 +215,26 @@ export function filterChip(page: Page, label: string, value: string): Locator {
 export async function dismissComboBox(box: Locator): Promise<void> {
   await box.press("Escape")
   await box.blur()
+  await expect(box).not.toHaveAttribute("aria-expanded", "true")
+}
+
+// The same, for a combobox inside a dialog. Two differences, and the second one
+// is why this is a separate helper rather than a flag.
+//
+// No `blur()`: a modal contains focus, so it lands straight back on the box and
+// the box re-opens on focus. Escape alone closes the popover.
+//
+// And the Escape is sent only when there is a popover to close. Otherwise it
+// reaches the dialog, and a dirty form answers that by arming its
+// unsaved-changes guard, which takes the submit out of the footer, so the next
+// lookup fails on a missing button rather than on the real cause. The wait
+// cannot prevent that: a closed popover satisfies it instantly, by which point
+// the keystroke has already landed. It is kept for what it does cover, a
+// popover that closes asynchronously.
+export async function dismissComboBoxInDialog(box: Locator): Promise<void> {
+  if ((await box.getAttribute("aria-expanded")) === "true") {
+    await box.press("Escape")
+  }
   await expect(box).not.toHaveAttribute("aria-expanded", "true")
 }
 

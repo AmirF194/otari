@@ -6,8 +6,8 @@ is about the shape of the code inside a feature.
 
 ## File size is a design signal
 
-The largest pages here are past two thousand lines (`features/activity/ActivityPage.tsx`,
-`features/models/ModelsPage.tsx`), and their tests are larger still. Nothing about the domains
+The largest pages here are past two thousand lines (`features/activity/ActivityPage.tsx`),
+and their tests are larger still. Nothing about the domains
 requires that: it is what happens when every dialog, row renderer, and derived table lives in
 the file that renders the page.
 
@@ -58,9 +58,11 @@ their markup will not stay in step.
 
 ## Check the primitives before writing one
 
-`shared/components/` already holds the recurring pieces, in a directory per design topic:
+`design-system/` already holds the recurring pieces, in a directory per design topic:
 `layout/`, `metrics/`, `feedback/`, `forms/`, `actions/`, `data/`, `navigation/`,
-`indicators/`, `access/`, plus `deprecated/` for the four that must not be used in new code.
+`indicators/`, `overlays/`. Two directories stayed in `shared/components/` and are not part
+of it: `access/` (which reads the deployment) and `deprecated/` (the three that must not be
+used in new code).
 `web/design/DESIGN.md` maps every export to its module and is the inventory. Extend a
 primitive rather than forking it, and add it to that table in the same change when you add
 one.
@@ -97,8 +99,8 @@ imports, pulls that route's whole component graph into the **entry** chunk, whic
 visitor downloads on first paint, including for pages their deployment does not serve.
 
 ```tsx
-// src/routes/models.tsx: the whole file
-export const Route = createFileRoute("/models")({ component: ModelsPage })
+// src/routes/routing.tsx: the whole file
+export const Route = createFileRoute("/routing")({ component: RoutingPage })
 ```
 
 The page component lives in `features/<domain>/`, and anything else the route needs

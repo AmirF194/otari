@@ -11,7 +11,7 @@ topic guide it points to for the work at hand.
 
 [design/DESIGN.md](design/DESIGN.md) is the design system: what to reach for, which
 variant applies where, which token layer is allowed, and which components exist but
-must not be used in new code. It is ten short topic files, so load only the one
+must not be used in new code. It is eleven short topic files, so load only the one
 covering what you are building. Written for a reader who cannot ask a question,
 which is what an agent is.
 
@@ -20,8 +20,14 @@ foundations, components with their states, and the page archetypes as artboards.
 
 ## Runtime contract
 
-`src/main.tsx` fetches unauthenticated `GET /v1/bootstrap` before mounting
+`src/main.tsx` fetches unauthenticated `GET /api/v1/bootstrap` before mounting
 React. Do not guess a deployment when that request fails.
+
+A gateway older than a bootstrap field does not send it, whatever the generated
+type promises, so `App` completes the payload once through
+`shared/helpers/bootstrap.ts` before anything below reads a field. Add a field
+to the bootstrap and that module stops compiling until it is given a default.
+The two fields naming the deployment take none, for the reason above.
 
 The bootstrap selects standalone, hosted, or hybrid presentation and publishes:
 
@@ -52,11 +58,20 @@ Biome enforces these dependencies:
 
 | Layer | May import |
 | --- | --- |
-| `shared/` | `client/` and itself |
-| `features/` | `shared/`, `client/`, and other features |
+| `design-system/` | **nothing under `src/`.** React, HeroUI, react-aria, react-icons, recharts, react-markdown, and itself |
+| `shared/` | `design-system/`, `client/`, and itself |
+| `features/` | `design-system/`, `shared/`, `client/`, and other features |
 | `app/` | any dashboard layer |
 | `routes/` | feature pages and shared composition |
 | `tests/` | any layer |
+
+`design-system/` is the odd one, and its rule is the inverse of the others: they
+name the few layers a layer may not reach, it names all of them. The question it
+answers is not "does this import point the wrong way" but "would this directory
+still compile with the rest of `src/` deleted", because it is the one layer here
+meant to leave as a package. See [design/DESIGN.md](design/DESIGN.md), "The
+extraction contract", for what that buys and what it costs; the probes are in
+`src/architecture.test.ts`.
 
 Do not import an overlay tree from the base dashboard. Otari.ai composes its UI
 through the explicit overlay seams.
@@ -73,12 +88,20 @@ These gates combine with AND. Organization and workspace authorization still
 comes from server responses.
 
 The workspace and organization rails have separate registries. A sidebar item
-points to a real page, never a redirect. `/docs` and `/account` are chrome
+points to a real page, never a redirect. `/playground`, `/docs`, and `/account` are chrome
 destinations and do not belong in a rail.
 
 Overlay navigation uses the empty seam modules under `src/app/nav/` for new
 sections, items inserted into base sections, and label overrides. Keep their
 types aligned with otari-ai.
+
+Three more seams let a build whose one dashboard reaches several deployments
+say which: `shared/api/overlayRequestPolicy.ts` (the origin and credential every
+management request uses, settled before the bootstrap is read),
+`features/auth/overlayPublicAuthFields.tsx` (a control above the address on the
+pages that post one), and `app/nav/overlayAccountBadge.tsx` (the mark on the
+account control, the monogram here). Each ships inert; `src/overlaySeams.test.ts`
+lists every seam and checks it is reached by its `@/…` specifier.
 
 ## Icons
 
@@ -96,6 +119,22 @@ and loading behavior follow the frontend standards topic guides.
 Import API shapes from `@/client`, not directly from the generated schema.
 `src/client/schema.ts` is generated from `docs/public/openapi.json` and
 committed. Keep `src/client/local.ts` limited to shapes OpenAPI cannot own.
+
+A field added to a gateway response model without a default lands in OpenAPI's
+`required`, so it is non-optional in the regenerated client, and every
+hand-written call site that builds that shape literally stops typechecking until
+it carries the field. The generated file is where the diff stops, not where the
+change stops, so a clean regeneration of a few added lines is not evidence that
+the change is contained. `pnpm run lint` is Biome and does not typecheck, so
+`pnpm run typecheck` is the gate that catches this; the usual call sites are the
+builders in `src/tests/fixtures.ts` and the per-feature test files.
+
+`apiFetch` in `shared/api/client.ts` prepends `API_ROOT` to every request. A
+call site passes the resource only, `apiFetch("/keys")`, and never spells
+`/api/v1`. A test that stubs `fetch` sees the whole URL; one that spies on
+`apiFetch` sees the resource. The gateway's
+`tests/integration/test_api_prefix_contract.py` fails on a doubled root
+anywhere under `src/`.
 
 File routes live in `src/routes/`. Each route file exports `Route` and
 nothing else so automatic code splitting works. The generated
@@ -125,6 +164,12 @@ Two build inputs are committed when changed:
 - `web/src/client/schema.ts`
 - `web/src/routeTree.gen.ts`
 
+`storybook-static/` is the third generated directory and is **not** committed,
+like the dashboard bundle: `.github/workflows/otari-design-system.yml` builds it
+and publishes it to Pages from `main`. `STORYBOOK_BASE_PATH` is what makes the
+published build resolve its assets under `/<repo>/`, since the merged
+`vite.config.ts` carries the app's own `base: "/"`.
+
 The bundled dashboard guide imports `docs/dashboard.md`. It remains available
 at `/#/docs` even when `docs_url` points the visible links elsewhere.
 
@@ -143,11 +188,36 @@ aspect so it is never stretched.
 ## Checks
 
 ```bash
-pnpm --dir web run lint
-pnpm --dir web run typecheck
+make lint-web
+make typecheck-web
 pnpm --dir web test
 pnpm --dir web run build
 ```
+
+**`nav[aria-label="Sidebar"]` is not the whole rail.** The scope band above it
+(the workspace switcher, the back row) and the footer below it (the Organization
+switch, the account control) are siblings of the landmark inside the `<aside>`,
+not children of it. A query scoped to the landmark misses them while they sit
+visibly in the rail, and the failure reads as the element not rendering rather
+than as the query looking in the wrong place. Query the page for anything in the
+band or the footer.
+
+**After resolving a conflict, go looking by name for every fix that landed in
+that file since the merge base.** A conflict resolution reverts a review fix more
+easily than anything else in the file: it is typically one line, it has no test
+behind it, and it lives in a state no test reaches, while whoever is resolving is
+holding the structural change in their head. Re-reading the diff does not catch
+it, because an absent line has no shape. Grep the resolved file for the guard, the
+flag or the narrowing you know should be there, and then re-run whatever
+established it in the first place.
+
+**A CI green and a local green answer different questions.** CI builds the pull
+request's merge ref, so its run is the branch merged into `main` as it stood when
+the run was created; a local run is the branch alone. The suites are therefore
+different sets, CI's result can move with no change on the branch, and a test can
+fail there against a combination nobody has run here. Before reading a CI green as
+a statement about what you wrote, `git fetch origin main` and count
+`HEAD..origin/main`: that is how far the tested thing is from the written thing.
 
 Playwright behavioral tests run against a real built gateway and scope
 assertions to the rows they create. Dismiss React Aria popovers before asserting
@@ -237,6 +307,44 @@ config that owns no files and exits clean over a tree the real typecheck rejects
 test files included. Use the command in Checks above. The tell that found this:
 an `@ts-expect-error` whose error had been deliberately removed still reported
 success, where `pnpm --dir web run typecheck` reports `TS2578`.
+
+**Two instances of one control measuring differently is a sizing bug, not a
+measurement.** Each is following the length of the prose beside it, so a control
+sized by its neighbor's wording was never sized. The rule that prevents it is
+`design/layout.md`, "Repeated rows": a trailing action takes `shrink-0` in any
+flex row.
+
+**Read the table's own block in `globals.css` before measuring anything.** Ten of
+the sixteen per-table classes declare widths on some of their columns, keyed on
+`data-key`, and `.otari-keys-table` is `table-layout: fixed` outright
+(`globals.css:2731`, "Key lanes stay fixed while the name absorbs the available
+width"). So a width is often written down rather than solved, and measuring the
+live table to rediscover it is the slower route to a worse answer. Read both
+blocks before changing one: `.otari-breakdown`'s columns are specified in two
+places, as `min-width` at `globals.css:2279` and as `width` at `globals.css:2827`,
+550 lines apart, and neither mentions the other.
+
+What is still true is the part that made the advice worth having. A table is
+`table-layout: auto` unless its block says otherwise, with 16px cell padding, so
+**the columns nothing specifies are re-solved from content on every render** and
+"take the width from column X" is a guess for those. Measure a change to one of
+them by injecting the new cell into the live table and reading the result back.
+
+- Give every part of an injected cell `flex: 0 0 auto`. Without it the parts
+  shrink to fit and overflow their own element with no error, leaving column
+  widths that look plausible and are not.
+- Overwrite `last_used` with a real timestamp first. Every row in the seed says
+  "never", and that one substitution moves a measured overflow from 0 to 23px.
+
+**A dialog's bounding box is a few percent large while it opens.** The overlay
+animates in on a scale transform, so `getBoundingClientRect()` read right after
+the frame becomes visible returns the box mid-animation: a 928px dialog measured
+963, and its container measured 1336 on a 1280 viewport, both the same 1.0438
+factor. It reads as a width rule that lost a cascade fight, which is the thing
+anyone measuring a dialog is usually there to check. `getComputedStyle(el).width`
+is unaffected by the transform and is the number a width assertion wants;
+`e2e/dashboard.spec.ts`'s share frame is the worked example. The background-tab
+entry above is the same instrument failing from the other direction.
 
 **And absence from the built CSS proves nothing on its own.** Tailwind emits
 only the utilities something in the tree asks for, so checking whether a

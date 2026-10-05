@@ -13,8 +13,9 @@ from any_llm.types.completion import ChatCompletion, ChatCompletionMessage, Choi
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from gateway.core.config import API_KEY_HEADER
-from gateway.models.entities import UsageLog, User
+from gateway.core.config import API_KEY_HEADER, API_ROOT
+from gateway.models.usage import UsageLog
+from gateway.models.users import User
 
 from .conftest import MODEL_NAME
 
@@ -26,24 +27,26 @@ def _mock_completion() -> ChatCompletion:
         object="chat.completion",
         created=0,
         model=MODEL_NAME,
-        choices=[
-            Choice(index=0, message=ChatCompletionMessage(role="assistant", content="hi"), finish_reason="stop")
-        ],
+        choices=[Choice(index=0, message=ChatCompletionMessage(role="assistant", content="hi"), finish_reason="stop")],
         usage=CompletionUsage(prompt_tokens=1_000_000, completion_tokens=500_000, total_tokens=1_500_000),
     )
 
 
 def _seed(client: TestClient, master_key_header: dict[str, str]) -> None:
-    client.post("/v1/pricing", json={
-        "model_key": MODEL_NAME, "input_price_per_million": 2.5, "output_price_per_million": 10.0,
-    }, headers=master_key_header)
+    client.post(
+        f"{API_ROOT}/pricing",
+        json={
+            "model_key": MODEL_NAME,
+            "input_price_per_million": 2.5,
+            "output_price_per_million": 10.0,
+        },
+        headers=master_key_header,
+    )
 
 
-def _make_key(
-    client: TestClient, master_key_header: dict[str, str], user_id: str, *, exclude: bool
-) -> dict[str, str]:
+def _make_key(client: TestClient, master_key_header: dict[str, str], user_id: str, *, exclude: bool) -> dict[str, str]:
     resp = client.post(
-        "/v1/keys",
+        f"{API_ROOT}/keys",
         json={"key_name": user_id, "user_id": user_id, "exclude_from_budget": exclude},
         headers=master_key_header,
     )
@@ -59,7 +62,7 @@ def _chat(client: TestClient, headers: dict[str, str]) -> Any:
     with patch("gateway.api.routes.chat.acompletion") as mock:
         mock.side_effect = _mock_acompletion
         return client.post(
-            "/v1/chat/completions",
+            f"{API_ROOT}/chat/completions",
             json={"model": MODEL_NAME, "messages": [{"role": "user", "content": "hi"}]},
             headers=headers,
         )
@@ -72,10 +75,10 @@ def test_excluded_key_logged_but_not_billed_or_gated(
     _seed(client, master_key_header)
     # A tiny budget that a normal $7.50 request could never pass.
     budget = client.post(
-        "/v1/budgets", json={"max_budget": 0.01, "budget_duration_sec": 86400}, headers=master_key_header
+        f"{API_ROOT}/budgets", json={"max_budget": 0.01, "budget_duration_sec": 86400}, headers=master_key_header
     ).json()
     client.post(
-        "/v1/users",
+        f"{API_ROOT}/users",
         json={"user_id": "exempt-user", "budget_id": budget["budget_id"]},
         headers=master_key_header,
     )
@@ -101,7 +104,7 @@ def test_normal_key_still_bills_spend(
 ) -> None:
     """Regression: a normal (non-exempt) key still reconciles cost into spend."""
     _seed(client, master_key_header)
-    client.post("/v1/users", json={"user_id": "billed-user"}, headers=master_key_header)
+    client.post(f"{API_ROOT}/users", json={"user_id": "billed-user"}, headers=master_key_header)
     headers = _make_key(client, master_key_header, "billed-user", exclude=False)
 
     assert _chat(client, headers).status_code == 200

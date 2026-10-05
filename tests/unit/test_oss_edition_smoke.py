@@ -20,6 +20,8 @@ from typing import Any
 import pytest
 import yaml
 
+from gateway.core.config import API_ROOT
+
 _SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "oss_edition_smoke.py"
 
 
@@ -52,6 +54,17 @@ def _post(url: str, *, headers: dict[str, str] | None = None) -> tuple[int, Any]
 # --------------------------------------------------------------------------- #
 
 
+def test_the_gate_walks_the_root_the_app_actually_serves() -> None:
+    """The gate carries its own copy of the API root, and this is what keeps it honest.
+
+    It has to: importing the app would give up the standard-library-only
+    property that lets this gate catch a dev-only import reaching an OSS code
+    path. So the copy is deliberate, and a drift between the two would send
+    every request in the gate to a path the app does not serve.
+    """
+    assert smoke.API_ROOT == API_ROOT
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -67,14 +80,19 @@ def _post(url: str, *, headers: dict[str, str] | None = None) -> tuple[int, Any]
     ],
 )
 def test_gateway_env_settings_are_dropped(name: str) -> None:
-    env = smoke.oss_edition_env({name: "set-by-the-developer-shell", "PATH": "/usr/bin"}, "secret")
+    env = smoke.oss_edition_env({name: "set-by-the-developer-shell", "PATH": "/usr/bin"}, "secret", "pepper")
     assert name not in env
     assert env["PATH"] == "/usr/bin", "only the gateway's own settings are scrubbed"
 
 
 def test_secret_key_is_set_for_credential_storage() -> None:
-    env = smoke.oss_edition_env({}, "a-generated-fernet-key")
+    env = smoke.oss_edition_env({}, "a-generated-fernet-key", "pepper")
     assert env["OTARI_SECRET_KEY"] == "a-generated-fernet-key"
+
+
+def test_the_provider_account_pepper_is_set_for_provider_copies() -> None:
+    env = smoke.oss_edition_env({"OTARI_PROVIDER_ACCOUNT_PEPPER": "from-the-shell"}, "key", "a-generated-pepper")
+    assert env["OTARI_PROVIDER_ACCOUNT_PEPPER"] == "a-generated-pepper"
 
 
 # --------------------------------------------------------------------------- #

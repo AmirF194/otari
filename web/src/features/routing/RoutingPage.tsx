@@ -1,70 +1,47 @@
 import { Button } from "@heroui/react"
-import { Link } from "@tanstack/react-router"
-import { useCallback, useMemo, useState } from "react"
+import { useCallback, useMemo, useRef, useState } from "react"
+import { FiEdit2, FiList, FiTrash2 } from "react-icons/fi"
 
-import type {
-  AliasResponse,
-  PolicyGuardrail,
-  PolicySpec,
-  RoutingPolicyResponse,
-} from "@/client"
-import { ModelComboBox } from "@/features/models/ModelComboBox"
-import { canManage, isDeploymentOperator } from "@/features/organization/roles"
+import type { AliasResponse, PolicySpec, RoutingPolicyResponse } from "@/client"
+import { CopyableValue } from "@/design-system/actions/CopyField"
+import { RowAction, RowActionRow } from "@/design-system/actions/RowAction"
+import { DataTable, type DataTableColumn } from "@/design-system/data/DataTable"
+import { ConfirmDialog } from "@/design-system/feedback/ConfirmDialog"
+import { EmptyState } from "@/design-system/feedback/EmptyState"
+import { ErrorBanner } from "@/design-system/feedback/ErrorBanner"
+import { Dot } from "@/design-system/indicators/Dot"
+import { PageIntro } from "@/design-system/layout/PageIntro"
+import { TableScrollFrame } from "@/design-system/layout/TableScrollFrame"
+import { canManage } from "@/features/organization/roles"
 import { RouterReadiness } from "@/features/routing/RouterReadiness"
-import { UserComboBox } from "@/features/users/UserComboBox"
-import { useOrganizationContext } from "@/shared/api/organizations"
+import {
+  useDeploymentOperator,
+  useOrganizationContext,
+} from "@/shared/api/organizations"
 import {
   useAliases,
-  useCreateAlias,
-  useCreateOrganizationAlias,
   useDeleteAlias,
   useDeleteOrganizationAlias,
   useDeleteOrganizationRoutingPolicy,
   useDeleteRoutingPolicy,
-  useOrganizationAliases,
-  useOrganizationRoutingPolicies,
   useRoutingPolicies,
-  useSetOrganizationRoutingPolicy,
-  useSetRoutingPolicy,
 } from "@/shared/api/routing"
-import { useToolSettings } from "@/shared/api/tools"
-import { useUsers } from "@/shared/api/users"
-import { ConfirmRowAction } from "@/shared/components/actions/ConfirmRowAction"
-import { CopyableValue } from "@/shared/components/actions/CopyField"
-import { RowAction, RowActionRow } from "@/shared/components/actions/RowAction"
-import {
-  DataTable,
-  type DataTableColumn,
-} from "@/shared/components/data/DataTable"
-import { EmptyState } from "@/shared/components/feedback/EmptyState"
-import { ErrorBanner } from "@/shared/components/feedback/ErrorBanner"
-import { Field } from "@/shared/components/forms/Field"
-import { ControlField } from "@/shared/components/forms/FieldMessages"
-import { Dot } from "@/shared/components/indicators/Dot"
-import { PageIntro } from "@/shared/components/layout/PageIntro"
-import { Section } from "@/shared/components/layout/Section"
-import { TableScrollFrame } from "@/shared/components/layout/TableScrollFrame"
-import { Tab, TabRow } from "@/shared/components/navigation/TabRow"
 import { useUrlValue } from "@/shared/helpers/urlState"
 import { useSelectedWorkspace } from "@/shared/hooks/SelectedWorkspace"
 
-/** A row on this page: either a routing policy or a stored/config alias.
- *
- *  An alias is the one-target case of a policy, so the two are listed together
- *  and this page is the single place either is managed. They still live in
- *  different tables behind different endpoints, so `kind` decides which API a
- *  write goes to; it is not cosmetic.
- */
-type RoutingRow = RoutingPolicyResponse & { kind: "policy" | "alias" }
-
-/** The router backends the form can write. Any other is shown read-only rather
- *  than rewritten as one of these on save. */
-const KNN_BACKEND = "knn"
-const WEIGHTED_BACKEND = "weighted"
-type RouterBackend = typeof KNN_BACKEND | typeof WEIGHTED_BACKEND
-
-/** Server-side cap on a compiled plan (`MAX_CANDIDATES` in models/routing.py). */
-const MAX_CANDIDATES = 5
+import { PolicyForm } from "./PolicyForm"
+import {
+  computeShares,
+  findCandidates,
+  findFallthroughTarget,
+  findRouterBackend,
+  findWeights,
+  KNN_BACKEND,
+  normalizeBackend,
+  PRIORITY_BACKEND,
+  type RoutingRow,
+  WEIGHTED_BACKEND,
+} from "./policyModel"
 
 /** Present an alias as the one-target policy it is. */
 function aliasAsRow(alias: AliasResponse): RoutingRow {
@@ -89,33 +66,6 @@ function aliasAsRow(alias: AliasResponse): RoutingRow {
 // collapse those rows into one. Same reasoning (and encoding) as the alias table.
 const rowKeyOf = (row: RoutingRow): string =>
   JSON.stringify([row.kind, row.user_id, row.name])
-
-/** Whether a guardrails service is configured for this gateway.
- *
- *  A policy guardrail is a request to a separate service (`guardrails_url`). With
- *  no service configured there is nothing to call, so mandating a check would
- *  either fail every request through the policy (mode block, on_unavailable block)
- *  or silently do nothing. Neither is a state to let an operator build by accident,
- *  so the affordance is disabled until a service exists.
- *
- *  While the settings are still loading this returns `true`: a control that starts
- *  enabled and stays enabled is better than one that flickers from disabled to
- *  enabled, which reads as a bug.
- */
-function useGuardrailsConfigured(): {
-  configured: boolean
-  isLoading: boolean
-} {
-  const settings = useToolSettings()
-  const field = settings.data?.fields.find(
-    (entry) => entry.key === "guardrails_url",
-  )
-  const value = typeof field?.value === "string" ? field.value.trim() : ""
-  return {
-    configured: settings.isLoading || value !== "",
-    isLoading: settings.isLoading,
-  }
-}
 
 /** Whether this form can represent a spec without losing part of it.
  *
@@ -153,8 +103,8 @@ function isEditableInForm(spec: PolicySpec): boolean {
     // controls would silently rewrite it as a backend the operator did not choose.
     if (entry.router !== undefined) {
       if ((entry.candidates?.length ?? 0) === 0) return false
-      const backend = normalizedBackend(entry.router)
-      if (backend === KNN_BACKEND) return true
+      const backend = normalizeBackend(entry.router)
+      if (backend === KNN_BACKEND || backend === PRIORITY_BACKEND) return true
       // A weighted entry without weights cannot be saved back (the API refuses it),
       // so the form would have to invent a split. Read-only says so instead.
       return (
@@ -173,57 +123,6 @@ function isEditableInForm(spec: PolicySpec): boolean {
   })
 }
 
-/** The fallthrough target of a spec, which every valid spec has exactly one of. */
-function defaultTargetOf(spec: PolicySpec): string {
-  return spec.select.find((entry) => entry.default !== undefined)?.default ?? ""
-}
-
-/** The router's candidate pool, or an empty list for a policy with no router. */
-function candidatesOf(spec: PolicySpec): string[] {
-  return (
-    spec.select.find((entry) => entry.router !== undefined)?.candidates ?? []
-  )
-}
-
-/** The pool the form edits: the router's candidates, with the default target in it.
- *
- *  The gateway appends the default target to the pool when a policy omits it, so a
- *  spec written through the API can list it or not. Normalizing here means the form
- *  shows the models that will actually be dispatched, in the order they were
- *  written, rather than a pool that is missing its own fallback.
- */
-function initialPool(spec: PolicySpec): string[] {
-  const candidates = candidatesOf(spec)
-  if (candidates.length === 0) return []
-  const fallthrough = defaultTargetOf(spec)
-  return candidates.includes(fallthrough)
-    ? candidates
-    : [...candidates, fallthrough]
-}
-
-/** Which entry of `initialPool` serves when the router declines. */
-function initialSafeIndex(spec: PolicySpec): number {
-  const index = initialPool(spec).indexOf(defaultTargetOf(spec))
-  return index === -1 ? 0 : index
-}
-
-/** A backend name as the server reads it.
- *
- *  The resolver matches on `name.strip().lower()`, so `" KNN "` selects the learned
- *  router. Comparing the raw string here would show a policy the gateway routes
- *  perfectly well as an unrecognized backend, read-only and mislabelled.
- */
-function normalizedBackend(name: string | undefined): string | undefined {
-  return name?.trim().toLowerCase()
-}
-
-/** The router backend a policy names, or undefined for a policy with no router. */
-function routerBackendOf(spec: PolicySpec): string | undefined {
-  return normalizedBackend(
-    spec.select.find((entry) => entry.router !== undefined)?.router,
-  )
-}
-
 /** What to call the backend that decides, for a chip or a one-line summary.
  *
  *  Named per backend rather than "Dynamic", because the backend's name is what tells
@@ -232,1037 +131,43 @@ function routerBackendOf(spec: PolicySpec): string | undefined {
  *  a guess about a backend added after this line was written.
  */
 function routerLabelOf(spec: PolicySpec): string {
-  const backend = routerBackendOf(spec)
+  const backend = findRouterBackend(spec)
   if (backend === WEIGHTED_BACKEND) return "Weighted"
   if (backend === KNN_BACKEND) return "Learned"
+  if (backend === PRIORITY_BACKEND) return "Priority"
   return "Routed"
-}
-
-/** The declared traffic split, empty unless the policy is weighted. */
-function weightsOf(spec: PolicySpec): Record<string, number> {
-  return spec.select.find((entry) => entry.router !== undefined)?.weights ?? {}
-}
-
-/** Each candidate's percentage of the traffic, normalized like the server does.
- *
- *  Weights are relative, so the form shows what the operator actually gets: 7 and 3
- *  read as 70% and 30%. A candidate with no weight takes none of the traffic and
- *  stays in the plan as a failover target, which is how a provider is drained.
- */
-function sharesOf(weights: number[]): number[] {
-  const total = weights.reduce((sum, weight) => sum + Math.max(0, weight), 0)
-  if (total <= 0) return weights.map(() => 0)
-  return weights.map((weight) => (Math.max(0, weight) * 100) / total)
-}
-
-/** The conditional entries, i.e. everything that is not the fallthrough. */
-function conditionsOf(
-  spec: PolicySpec,
-): { threshold: number; target: string }[] {
-  return spec.select
-    .filter(
-      (entry) =>
-        entry.when?.budget_used_pct?.gte !== undefined &&
-        entry.target !== undefined,
-    )
-    .map((entry) => ({
-      threshold: entry.when!.budget_used_pct!.gte!,
-      target: entry.target!,
-    }))
 }
 
 /** One line summarising what a policy serves, for the table. */
 function servesSummary(policy: RoutingPolicyResponse): string {
   const chain = policy.spec.on_failure ?? []
-  const pool = candidatesOf(policy.spec)
-  if (pool.length > 0 && routerBackendOf(policy.spec) === WEIGHTED_BACKEND) {
+  const pool = findCandidates(policy.spec)
+  if (pool.length > 0 && findRouterBackend(policy.spec) === WEIGHTED_BACKEND) {
     // The split shape, not the model names: two provider:model strings do not fit a
     // table cell, and the shares are what distinguishes one weighted policy from
     // another. The pool is spelled out in the editor and in explain.
-    const declared = weightsOf(policy.spec)
-    const target = defaultTargetOf(policy.spec)
+    const declared = findWeights(policy.spec)
+    const target = findFallthroughTarget(policy.spec)
     const full = pool.includes(target) ? pool : [...pool, target]
-    const split = sharesOf(full.map((selector) => declared[selector] ?? 0))
+    const split = computeShares(full.map((selector) => declared[selector] ?? 0))
       .map((share) => `${Math.round(share)}%`)
       .join(" / ")
     return `Weighted · ${split} across ${full.length} models`
   }
   if (pool.length > 0) {
-    return `${routerLabelOf(policy.spec)} · ${pool.length} candidates, ${defaultTargetOf(policy.spec)} by default`
+    return `${routerLabelOf(policy.spec)} · ${pool.length} candidates, ${findFallthroughTarget(policy.spec)} by default`
   }
   if (policy.is_dynamic) {
     const total = 1 + chain.length
     return `Chosen per request · ${total} candidate${total === 1 ? "" : "s"}`
   }
-  const target = defaultTargetOf(policy.spec)
+  const target = findFallthroughTarget(policy.spec)
   return chain.length > 0 ? `${target}  +${chain.length} on failure` : target
 }
 
 // ---------------------------------------------------------------------------
 // Editor
 // ---------------------------------------------------------------------------
-
-/** Who a policy applies to. Same control and wording as the alias scope picker,
- *  because it is the same decision. */
-function ScopePicker({
-  userId,
-  onChange,
-}: {
-  userId: string | null
-  onChange: (userId: string | null) => void
-}) {
-  const users = useUsers()
-  const scoped = userId !== null
-
-  const modeButton = (value: boolean, label: string) => (
-    <Tab
-      key={label}
-      isActive={scoped === value}
-      onPress={() => onChange(value ? "" : null)}
-    >
-      {label}
-    </Tab>
-  )
-
-  return (
-    <div className="flex flex-col gap-3">
-      <ControlField
-        label="Applies to"
-        description="A global policy resolves for every caller. A user-scoped one resolves only for that user, and takes precedence over a global policy of the same name."
-      />
-      <TabRow>
-        {modeButton(false, "Every caller")}
-        {modeButton(true, "One user")}
-      </TabRow>
-      {scoped ? (
-        <UserComboBox
-          label="User"
-          value={userId ?? ""}
-          onChange={onChange}
-          users={users.data ?? []}
-          placeholder="Pick a user…"
-          description="Only this user resolves the policy."
-          unknownHint={
-            <span className="text-danger">
-              No such user. Pick an existing one.
-            </span>
-          }
-        />
-      ) : null}
-    </div>
-  )
-}
-
-const MODE_VALUES = ["block", "monitor"] as const
-
-/** A two-value mode switch. The codebase has no Select component and four
- *  hand-rolled `aria-pressed` groups, so this follows that pattern rather than
- *  introducing a fifth idiom. */
-function ModeToggle({
-  label,
-  hint,
-  value,
-  onChange,
-}: {
-  label: string
-  hint?: string
-  value: "block" | "monitor"
-  onChange: (value: "block" | "monitor") => void
-}) {
-  return (
-    <div className="flex flex-col gap-1">
-      <span className="text-body">{label}</span>
-      <TabRow>
-        {MODE_VALUES.map((mode) => (
-          <Tab
-            key={mode}
-            isActive={value === mode}
-            onPress={() => onChange(mode)}
-          >
-            {mode}
-          </Tab>
-        ))}
-      </TabRow>
-      {hint === undefined ? null : <span className="text-caption">{hint}</span>}
-    </div>
-  )
-}
-
-/** Create or edit a policy.
- *
- *  Reading order mirrors the schema so the form and the YAML teach the same
- *  model: name and scope, then what serves a normal request, then what happens on
- *  failure, then what always runs. The failure and guardrail sections are absent
- *  until summoned rather than collapsed-and-empty, which keeps naming one model a
- *  three-field task.
- */
-function PolicyForm({
-  existing,
-  initialTarget = "",
-  workspaceId,
-  onClose,
-}: {
-  existing: RoutingRow | null
-  initialTarget?: string
-  /**
-   * The workspace a tenant admin's write lands in, or null for an operator.
-   *
-   * Null is the deployment-wide surface, which defaults the workspace itself;
-   * a string is the tenant-scoped one, which requires it named and refuses a
-   * user scope. Both mutation pairs are always created, as hooks must be, and
-   * only the pair this says is ever mutated.
-   */
-  workspaceId: string | null
-  onClose: () => void
-}) {
-  const save = useSetRoutingPolicy()
-  const saveAlias = useCreateAlias()
-  const saveOrgPolicy = useSetOrganizationRoutingPolicy()
-  const saveOrgAlias = useCreateOrganizationAlias()
-  const tenantScoped = workspaceId !== null
-  const editing = existing !== null
-  // Editing an alias writes back through the alias API: it is still a row in
-  // model_aliases, and silently rewriting it as a policy would leave the original
-  // behind under the same name.
-  const editingAlias = existing?.kind === "alias"
-  const guardrails_ = useGuardrailsConfigured()
-
-  const [name, setName] = useState(existing?.name ?? "")
-  const [userId, setUserId] = useState<string | null>(existing?.user_id ?? null)
-  const [target, setTarget] = useState(
-    existing ? defaultTargetOf(existing.spec) : initialTarget,
-  )
-  const [chain, setChain] = useState<string[]>(existing?.spec.on_failure ?? [])
-  const [conditions, setConditions] = useState(
-    existing ? conditionsOf(existing.spec) : [],
-  )
-  const [guardrails, setGuardrails] = useState<PolicyGuardrail[]>(
-    existing?.spec.guardrails ?? [],
-  )
-  // The learned router's pool, and which of its models serves when the router
-  // declines. One list rather than a pool plus a separate "Serves" field: the
-  // fallback is always one of the models the router may choose, so asking for it
-  // twice made an operator name the strong model in two places and invited them to
-  // disagree with themselves. This mirrors what the gateway does with the spec,
-  // where the default target joins the pool if it was left out.
-  const [candidates, setCandidates] = useState<string[]>(
-    existing ? initialPool(existing.spec) : [],
-  )
-  const [safeIndex, setSafeIndex] = useState<number>(
-    existing ? initialSafeIndex(existing.spec) : 0,
-  )
-  // Which backend orders the pool. The two share the pool control, because both are
-  // "these models, one of them per request"; they differ in what decides and in
-  // whether a share sits next to each entry.
-  const [backend, setBackend] = useState<RouterBackend>(
-    existing && routerBackendOf(existing.spec) === WEIGHTED_BACKEND
-      ? WEIGHTED_BACKEND
-      : KNN_BACKEND,
-  )
-  // Parallel to `candidates`, so a weight follows its model when one is removed.
-  // Held as the text the operator typed rather than as a number: re-rendering a
-  // parsed number swallows a half-typed decimal ("7." parses to 7 and renders back
-  // as "7") and turns a cleared field into a silent 0. Parsed once, below.
-  const [weights, setWeights] = useState<string[]>(() => {
-    if (existing === null) return []
-    const declared = weightsOf(existing.spec)
-    return initialPool(existing.spec).map((selector) =>
-      String(declared[selector] ?? 0),
-    )
-  })
-  const routed = candidates.length > 0
-  const weighted = routed && backend === WEIGHTED_BACKEND
-  // An empty field parses to NaN rather than 0, so a share the operator cleared is
-  // unfinished rather than a drain they did not ask for. "Infinity" and a negative
-  // are rejected here too, matching what the API refuses.
-  const weightValues = weights.map((text) =>
-    text.trim() === "" ? Number.NaN : Number(text),
-  )
-  const weightsWellFormed = weightValues.every(
-    (value) => Number.isFinite(value) && value >= 0,
-  )
-  const shares = sharesOf(
-    weightValues.map((value) =>
-      Number.isFinite(value) ? Math.max(0, value) : 0,
-    ),
-  )
-  // With a router, the fallthrough is the marked model; without one it is the single
-  // "Serves" field.
-  const effectiveTarget = routed ? (candidates[safeIndex] ?? "") : target
-
-  const nameHasDelimiter = /[:/]/.test(name)
-  // A policy's name is its key, so a rename is a move rather than an edit: the API
-  // takes it as `rename_from` on the same write as the spec. Aliases have no such
-  // verb, so their name stays fixed here.
-  const previousName = existing?.name ?? ""
-  const renaming =
-    editing &&
-    !editingAlias &&
-    name.trim() !== "" &&
-    name.trim() !== previousName
-  const scopeReady = userId === null || userId.trim() !== ""
-  const conditionsReady = conditions.every(
-    (c) => c.target.trim() !== "" && c.threshold > 0 && c.threshold < 100,
-  )
-  const guardrailsReady = guardrails.every((g) => g.profile.trim() !== "")
-  // A model named twice is refused by the API, and on a weighted policy it would
-  // also collapse in the weight map: two rows, one key, so the split submitted is
-  // not the split the form showed. Checked over the named rows only, so a pair of
-  // still-empty rows reads as unfinished rather than as a duplicate.
-  const namedCandidates = candidates
-    .map((entry) => entry.trim())
-    .filter((entry) => entry !== "")
-  const duplicateCandidate =
-    new Set(namedCandidates).size !== namedCandidates.length
-  // Two, not one: ranking a single model is not a decision, and the API refuses it.
-  const candidatesReady =
-    !routed ||
-    (candidates.length >= 2 &&
-      candidates.every((entry) => entry.trim() !== "") &&
-      !duplicateCandidate &&
-      effectiveTarget.trim() !== "")
-  // An all-zero split would select nothing and the policy would always serve its
-  // default, so the API refuses it. Caught here so the form cannot author it.
-  const splitReady =
-    !weighted || (weightsWellFormed && weightValues.some((value) => value > 0))
-  // The server caps the compiled plan at MAX_CANDIDATES, counting the routed pool
-  // plus the failure chain. Enforced here too so the form cannot author a policy it
-  // then fails to save: a rule the UI knows about should not arrive as a 400.
-  const plannedCandidates = (candidates.length || 1) + chain.length
-  const atCandidateCap = plannedCandidates >= MAX_CANDIDATES
-  const overCandidateCap = plannedCandidates > MAX_CANDIDATES
-  const canSubmit =
-    name.trim() !== "" &&
-    effectiveTarget.trim() !== "" &&
-    !nameHasDelimiter &&
-    scopeReady &&
-    conditionsReady &&
-    guardrailsReady &&
-    candidatesReady &&
-    splitReady &&
-    !overCandidateCap &&
-    chain.every((entry) => entry.trim() !== "")
-
-  // Built in plan order, with the fallthrough last, which is what the schema
-  // requires: an entry after the default could never be reached.
-  const spec: PolicySpec = useMemo(
-    () => ({
-      select: [
-        ...conditions.map((condition) => ({
-          when: { budget_used_pct: { gte: condition.threshold } },
-          target: condition.target.trim(),
-        })),
-        // After the conditions, before the fallthrough: an explicit tier-down is
-        // the operator overriding the router, and the router is what runs when no
-        // condition applies.
-        ...(routed
-          ? [
-              {
-                router: backend,
-                candidates: candidates.map((entry) => entry.trim()),
-                // Keyed by selector, which is how the server reads it. Only for the
-                // weighted backend: a weight map on a knn entry is refused, because
-                // it would read as a split and do nothing.
-                ...(weighted
-                  ? {
-                      weights: Object.fromEntries(
-                        candidates.map((entry, index) => {
-                          const value = weightValues[index] ?? 0
-                          return [
-                            entry.trim(),
-                            Number.isFinite(value) ? Math.max(0, value) : 0,
-                          ]
-                        }),
-                      ),
-                    }
-                  : {}),
-              },
-            ]
-          : []),
-        { default: effectiveTarget.trim() },
-      ],
-      ...(chain.length > 0
-        ? { on_failure: chain.map((entry) => entry.trim()) }
-        : {}),
-      ...(guardrails.length > 0 ? { guardrails } : {}),
-    }),
-    [
-      conditions,
-      candidates,
-      routed,
-      backend,
-      weighted,
-      weightValues,
-      effectiveTarget,
-      chain,
-      guardrails,
-    ],
-  )
-
-  // An alias has exactly one target, so growing one a chain, a condition, or a
-  // guardrail makes it a policy. Saving it as a policy alone would leave the alias
-  // row in place under the same name, and the API refuses that collision, so the
-  // form keeps an alias an alias and points the operator at the way across.
-  const outgrewAlias =
-    editingAlias &&
-    (chain.length > 0 ||
-      conditions.length > 0 ||
-      guardrails.length > 0 ||
-      candidates.length > 0)
-  const pending =
-    save.isPending ||
-    saveAlias.isPending ||
-    saveOrgPolicy.isPending ||
-    saveOrgAlias.isPending
-
-  const submit = () => {
-    if (!canSubmit || outgrewAlias) return
-    const scope = userId === null ? null : userId.trim()
-    if (editingAlias) {
-      if (workspaceId !== null) {
-        saveOrgAlias.mutate(
-          {
-            name: name.trim(),
-            target: effectiveTarget.trim(),
-            workspace_id: workspaceId,
-          },
-          { onSuccess: onClose },
-        )
-        return
-      }
-      saveAlias.mutate(
-        { name: name.trim(), target: effectiveTarget.trim(), user_id: scope },
-        { onSuccess: onClose },
-      )
-      return
-    }
-    if (workspaceId !== null) {
-      saveOrgPolicy.mutate(
-        {
-          name: name.trim(),
-          spec,
-          workspace_id: workspaceId,
-          ...(renaming ? { rename_from: previousName } : {}),
-        },
-        { onSuccess: onClose },
-      )
-      return
-    }
-    save.mutate(
-      {
-        name: name.trim(),
-        spec,
-        user_id: scope,
-        ...(renaming ? { rename_from: previousName } : {}),
-      },
-      { onSuccess: onClose },
-    )
-  }
-
-  return (
-    <div className="flex flex-col gap-4">
-      <Section
-        className="border-y border-border py-5"
-        contentClassName="flex flex-col gap-5"
-      >
-        {/* A heading, not a styled div: this panel is a section of the page and
-            the type role is what it looks like, not what it is. */}
-        <h2 className="text-title">
-          {editing ? (
-            <>
-              Edit {existing.kind === "alias" ? "alias" : "policy"}{" "}
-              <code>{existing.name}</code>
-              {existing.user_id ? (
-                <>
-                  {" "}
-                  for user <code>{existing.user_id}</code>
-                </>
-              ) : null}
-            </>
-          ) : (
-            "New routing policy"
-          )}
-        </h2>
-        {/* All four writers, not two: an organization-scoped save fails through
-            its own mutation, and with those two missing the refusal was
-            swallowed and the panel just sat there. */}
-        <ErrorBanner
-          error={
-            save.error ??
-            saveAlias.error ??
-            saveOrgPolicy.error ??
-            saveOrgAlias.error
-          }
-        />
-
-        <div className="grid gap-4 sm:grid-cols-2">
-          {editingAlias ? (
-            <div className="flex flex-col gap-1">
-              <span className="text-body">Alias name</span>
-              <code className="text-sm text-muted">{previousName}</code>
-              <span className="text-xs text-muted">
-                An alias name is its key and cannot be changed here. Delete and
-                recreate to change it.
-              </span>
-            </div>
-          ) : (
-            <Field
-              label="Policy name"
-              value={name}
-              onChange={setName}
-              placeholder="fast"
-              isRequired
-              // Only on create. Dropping an operator who clicked Edit to change a
-              // target into the name box invites a typo in the one field that is
-              // the policy's identity.
-              autoFocus={!editing}
-              description={
-                nameHasDelimiter ? (
-                  <span className="text-danger">
-                    A policy name cannot contain “:” or “/”.
-                  </span>
-                ) : renaming ? (
-                  <span>
-                    Renames <code>{previousName}</code> on save. Callers have to
-                    send the new name from then on, and usage already recorded
-                    keeps the old one.
-                  </span>
-                ) : editing ? (
-                  "What callers send as `model`. Change it to rename the policy."
-                ) : (
-                  "What callers send as `model`."
-                )
-              }
-            />
-          )}
-          {routed ? (
-            <div className="flex flex-col gap-1">
-              <span className="text-body">Serves</span>
-              <span className="text-sm text-foreground">
-                {effectiveTarget.trim() === "" ? (
-                  <span className="text-muted">
-                    whichever model you mark below
-                  </span>
-                ) : (
-                  <code>{effectiveTarget}</code>
-                )}
-              </span>
-              <span className="text-xs text-muted">
-                {weighted
-                  ? "The split picks per request, so this policy has no single target. The model marked below is what serves a caller who opts out."
-                  : "A router picks per request, so this policy has no single target. The model marked below is what serves when the router does not choose."}
-              </span>
-            </div>
-          ) : (
-            <ModelComboBox
-              label="Serves"
-              value={target}
-              onChange={setTarget}
-              isRequired
-              description="The model that serves a normal request. Callers never see it."
-            />
-          )}
-        </div>
-
-        {editing ? (
-          <p className="text-caption">
-            Who this applies to is the other half of the key. It cannot be
-            changed here: delete and recreate to move it between scopes.
-          </p>
-        ) : tenantScoped ? (
-          // Withheld rather than disabled: a user id is a deployment-wide
-          // identifier, so the tenant-scoped writer refuses one outright and
-          // an organization's entries are workspace-wide. Offering the picker
-          // here would take a value the API is going to reject.
-          <p className="text-caption">
-            This applies to everyone in the selected workspace.
-          </p>
-        ) : (
-          <ScopePicker userId={userId} onChange={setUserId} />
-        )}
-
-        {/* Conditional tier-down */}
-        {conditions.length > 0 ? (
-          <div className="flex flex-col gap-3 border border-control-border p-3">
-            <ControlField
-              label="Instead, when the budget fills up"
-              description="Checked before the model above. A threshold must be under 100: the budget gate refuses a request before selection once the cap is reached, so a rule at 100 could never fire."
-            />
-            {conditions.map((condition, index) => (
-              <div key={index} className="flex flex-wrap items-end gap-3">
-                <Field
-                  label="Budget used at least (%)"
-                  value={String(condition.threshold)}
-                  onChange={(value) =>
-                    setConditions((prev) =>
-                      prev.map((c, i) =>
-                        i === index
-                          ? { ...c, threshold: Number(value) || 0 }
-                          : c,
-                      ),
-                    )
-                  }
-                  description={
-                    condition.threshold >= 100 ? (
-                      <span className="text-danger">Must be under 100.</span>
-                    ) : undefined
-                  }
-                />
-                <div className="min-w-56 flex-1">
-                  <ModelComboBox
-                    label="Use instead"
-                    value={condition.target}
-                    onChange={(value) =>
-                      setConditions((prev) =>
-                        prev.map((c, i) =>
-                          i === index ? { ...c, target: value } : c,
-                        ),
-                      )
-                    }
-                    isRequired
-                  />
-                </div>
-                <Button
-                  variant="ghost"
-                  onPress={() =>
-                    setConditions((prev) => prev.filter((_, i) => i !== index))
-                  }
-                >
-                  Remove
-                </Button>
-              </div>
-            ))}
-          </div>
-        ) : null}
-
-        {/* The routed pool: one control for both backends, because both are "these
-              models, one of them per request". What differs is who decides, and
-              whether a share sits next to each entry. */}
-        {candidates.length > 0 ? (
-          <div className="flex flex-col gap-3 border border-control-border p-3">
-            <ControlField
-              label={
-                weighted
-                  ? "Split traffic between"
-                  : "The router chooses between"
-              }
-              description={
-                weighted
-                  ? "Each request goes to one of these, drawn in proportion to its share. Shares are relative, so 70 and 30 mean the same as 7 and 3. No pricing needed."
-                  : "For each request, the cheapest of these that past scoring says is good enough. Every model here needs pricing, because the router weighs quality against cost."
-              }
-            />
-            {candidates.map((entry, index) => (
-              <div key={index} className="flex flex-wrap items-end gap-3">
-                <div className="min-w-56 flex-1">
-                  <ModelComboBox
-                    label={`Model ${index + 1}`}
-                    value={entry}
-                    onChange={(value) =>
-                      setCandidates((prev) =>
-                        prev.map((c, i) => (i === index ? value : c)),
-                      )
-                    }
-                    isRequired
-                  />
-                </div>
-                {weighted ? (
-                  <div className="flex items-end gap-2">
-                    <Field
-                      label="Share"
-                      value={weights[index] ?? ""}
-                      onChange={(value) =>
-                        setWeights((prev) =>
-                          prev.map((weight, i) =>
-                            i === index ? value : weight,
-                          ),
-                        )
-                      }
-                      // The percentage, not the number they typed: relative weights
-                      // are easy to write and hard to read, and this is the line
-                      // that says a zero-weight model is drained rather than gone.
-                      description={
-                        !Number.isFinite(weightValues[index] ?? Number.NaN) ||
-                        (weightValues[index] ?? 0) < 0
-                          ? "A number, zero or more"
-                          : (weightValues[index] ?? 0) > 0
-                            ? `${Math.round(shares[index] ?? 0)}% of requests`
-                            : "No weighted traffic; still tried if another fails"
-                      }
-                    />
-                  </div>
-                ) : null}
-                <label className="flex items-center gap-2 pb-2 text-xs text-foreground">
-                  <input
-                    type="radio"
-                    name="router-safe-choice"
-                    checked={safeIndex === index}
-                    onChange={() => setSafeIndex(index)}
-                  />
-                  {weighted ? "Serves on opt-out" : "Serves when unsure"}
-                </label>
-                <Button
-                  variant="ghost"
-                  onPress={() => {
-                    setCandidates((prev) => prev.filter((_, i) => i !== index))
-                    setWeights((prev) => prev.filter((_, i) => i !== index))
-                    // Keep the mark on the same model where possible; if the marked
-                    // one went, fall back to the first, never to nothing.
-                    setSafeIndex((prev) =>
-                      index < prev ? prev - 1 : index === prev ? 0 : prev,
-                    )
-                  }}
-                >
-                  Remove
-                </Button>
-              </div>
-            ))}
-            <p className="text-caption">
-              {weighted ? (
-                <>
-                  The marked model serves a caller who sends{" "}
-                  <code>Otari-Router: off</code>, which is the way to pin
-                  traffic to one provider during an incident. A model that fails
-                  before responding moves the request to another model in this
-                  pool, by the same shares, before any fallback below.
-                </>
-              ) : (
-                <>
-                  The marked model serves whenever the router does not choose:
-                  too few scored examples, a weakly supported pick, a request
-                  carrying tools, or a caller sending{" "}
-                  <code>Otari-Router: off</code>. Mark the one you would have
-                  picked without a router.
-                </>
-              )}
-            </p>
-            {candidates.length < 2 ? (
-              <p className="text-caption text-danger">
-                Name at least two models.{" "}
-                {weighted ? "Splitting traffic one way" : "Ranking one"} is not
-                a routing decision.
-              </p>
-            ) : null}
-            {duplicateCandidate ? (
-              <p className="text-caption text-danger">
-                Name each model once.{" "}
-                {weighted
-                  ? "A model listed twice has one share, not two, so the split saved would not be the one shown."
-                  : "A pool that repeats a model is refused."}
-              </p>
-            ) : null}
-            {weighted && !weightsWellFormed ? (
-              <p className="text-caption text-danger">
-                Every share is a number of zero or more. Use 0 to drain a model
-                without removing it.
-              </p>
-            ) : weighted && !splitReady ? (
-              <p className="text-caption text-danger">
-                Give at least one model a share above zero, or this policy can
-                never send traffic anywhere but its marked model.
-              </p>
-            ) : null}
-            <div className="flex flex-wrap items-baseline gap-2">
-              <button
-                type="button"
-                disabled={atCandidateCap}
-                className={
-                  atCandidateCap
-                    ? "cursor-not-allowed text-sm text-muted opacity-60"
-                    : "text-sm text-link hover:underline"
-                }
-                onClick={() => {
-                  setCandidates((prev) => [...prev, ""])
-                  // Zero, not an invented share: adding a provider must not move
-                  // traffic onto it before the operator says how much.
-                  setWeights((prev) => [...prev, "0"])
-                }}
-              >
-                + Another model
-              </button>
-              {atCandidateCap ? (
-                <span className="text-xs text-muted">
-                  A policy dispatches at most {MAX_CANDIDATES} models, counting
-                  the fallback chain. Remove a fallback to add another.
-                </span>
-              ) : null}
-            </div>
-          </div>
-        ) : null}
-
-        {/* Failure chain */}
-        {chain.length > 0 ? (
-          <div className="flex flex-col gap-3 border border-control-border p-3">
-            <ControlField
-              label="If that fails, try"
-              description="Tried in order after a retryable failure. Not tried once tokens have started streaming, or after a 400/401/403, which every provider would reject the same way."
-            />
-            {chain.map((entry, index) => (
-              <div key={index} className="flex flex-wrap items-end gap-3">
-                <div className="min-w-56 flex-1">
-                  <ModelComboBox
-                    label={`Fallback ${index + 1}`}
-                    value={entry}
-                    onChange={(value) =>
-                      setChain((prev) =>
-                        prev.map((e, i) => (i === index ? value : e)),
-                      )
-                    }
-                    isRequired
-                  />
-                </div>
-                <Button
-                  variant="ghost"
-                  onPress={() =>
-                    setChain((prev) => prev.filter((_, i) => i !== index))
-                  }
-                >
-                  Remove
-                </Button>
-              </div>
-            ))}
-            <div className="flex flex-wrap items-baseline gap-2">
-              <button
-                type="button"
-                disabled={atCandidateCap}
-                className={
-                  atCandidateCap
-                    ? "cursor-not-allowed text-sm text-muted opacity-60"
-                    : "text-sm text-link hover:underline"
-                }
-                onClick={() => setChain((prev) => [...prev, ""])}
-              >
-                + Another fallback
-              </button>
-              {atCandidateCap ? (
-                <span className="text-xs text-muted">
-                  A policy dispatches at most {MAX_CANDIDATES} models in total.
-                </span>
-              ) : null}
-            </div>
-          </div>
-        ) : null}
-
-        {/* Guardrails */}
-        {guardrails.length > 0 ? (
-          <div className="flex flex-col gap-3 border border-control-border p-3">
-            <div>
-              <span className="text-body">Always check</span>
-              <p className="text-caption">
-                Runs on every request through this policy. Callers can add their
-                own guardrails but cannot weaken these.
-              </p>
-              {guardrails_.configured ? null : (
-                <p className="mt-1 text-caption text-warning">
-                  No guardrails service is configured, so these cannot run. With
-                  `if the service is down` set to block, every request through
-                  this policy is refused until one is configured.{" "}
-                  <Link to="/tools" className="underline">
-                    Set one up
-                  </Link>
-                  , or remove the guardrail.
-                </p>
-              )}
-            </div>
-            {guardrails.map((guardrail, index) => (
-              <div key={index} className="flex flex-col gap-3">
-                <div className="flex flex-wrap items-end gap-3">
-                  <Field
-                    label="Profile"
-                    value={guardrail.profile}
-                    onChange={(value) =>
-                      setGuardrails((prev) =>
-                        prev.map((g, i) =>
-                          i === index ? { ...g, profile: value } : g,
-                        ),
-                      )
-                    }
-                    placeholder="prompt-injection"
-                    isRequired
-                    description="A profile configured on the guardrails service."
-                  />
-                  <ModeToggle
-                    label="Mode"
-                    value={guardrail.mode}
-                    onChange={(mode) =>
-                      setGuardrails((prev) =>
-                        prev.map((g, i) => (i === index ? { ...g, mode } : g)),
-                      )
-                    }
-                    hint="block rejects a flagged request; monitor records it and serves anyway."
-                  />
-                  <ModeToggle
-                    label="If the service is down"
-                    value={guardrail.on_unavailable ?? "block"}
-                    onChange={(mode) =>
-                      setGuardrails((prev) =>
-                        prev.map((g, i) =>
-                          i === index ? { ...g, on_unavailable: mode } : g,
-                        ),
-                      )
-                    }
-                    hint="block fails closed, so a guardrails outage refuses every request through this policy."
-                  />
-                  <Button
-                    variant="ghost"
-                    onPress={() =>
-                      setGuardrails((prev) =>
-                        prev.filter((_, i) => i !== index),
-                      )
-                    }
-                  >
-                    Remove
-                  </Button>
-                </div>
-                {guardrail.mode === "block" &&
-                (guardrail.on_unavailable ?? "block") === "block" ? (
-                  <div className="text-caption text-warning">
-                    With both set to block, a guardrails-service outage rejects
-                    every request through this policy, ahead of any fallback
-                    above.
-                  </div>
-                ) : null}
-              </div>
-            ))}
-          </div>
-        ) : null}
-
-        {/* Complexity is summoned, never presented: naming one model stays a
-              three-field task. */}
-        <div className="flex flex-wrap gap-3 text-sm">
-          {conditions.length === 0 ? (
-            <button
-              type="button"
-              className="text-link hover:underline"
-              onClick={() => setConditions([{ threshold: 80, target: "" }])}
-            >
-              + Tier down when the budget fills up
-            </button>
-          ) : null}
-          {chain.length === 0 ? (
-            <button
-              type="button"
-              className="text-link hover:underline"
-              onClick={() => setChain([""])}
-            >
-              + Add a fallback chain
-            </button>
-          ) : null}
-          {candidates.length === 0 ? (
-            <button
-              type="button"
-              className="text-link hover:underline"
-              // Seeded with the policy's own target, marked as the safe choice, so
-              // the pool starts from the model this policy already serves and the
-              // operator adds the cheaper one rather than restating everything.
-              onClick={() => {
-                setBackend(KNN_BACKEND)
-                setCandidates([target.trim() || "", ""])
-                setWeights([])
-                setSafeIndex(0)
-              }}
-            >
-              + Let a router pick the cheapest good-enough model
-            </button>
-          ) : null}
-          {candidates.length === 0 ? (
-            <button
-              type="button"
-              className="text-link hover:underline"
-              // An even split of the policy's own target with one more provider:
-              // the neutral starting point for load balancing, which the operator
-              // then skews. Seeding 90/10 would be guessing at a canary.
-              onClick={() => {
-                setBackend(WEIGHTED_BACKEND)
-                setCandidates([target.trim() || "", ""])
-                setWeights(["50", "50"])
-                setSafeIndex(0)
-              }}
-            >
-              + Split traffic across providers by weight
-            </button>
-          ) : null}
-          {guardrails.length === 0 ? (
-            // Disabled rather than hidden, and never disabled silently: a hidden
-            // control teaches nothing, and a greyed-out one with no explanation
-            // is worse. The reason sits next to it with the route to fixing it,
-            // as text rather than a tooltip so it is readable on touch and by a
-            // screen reader.
-            <span className="flex flex-wrap items-baseline gap-2">
-              <button
-                type="button"
-                disabled={!guardrails_.configured}
-                aria-describedby={
-                  guardrails_.configured ? undefined : "guardrails-unavailable"
-                }
-                className={
-                  guardrails_.configured
-                    ? "text-link hover:underline"
-                    : "cursor-not-allowed text-muted opacity-60"
-                }
-                onClick={() =>
-                  setGuardrails([
-                    { profile: "", mode: "block", on_unavailable: "block" },
-                  ])
-                }
-              >
-                + Add guardrails
-              </button>
-              {guardrails_.configured ? null : (
-                <span id="guardrails-unavailable" className="text-caption">
-                  No guardrails service is configured, so there would be nothing
-                  to call.{" "}
-                  <Link to="/tools" className="text-link hover:underline">
-                    Set one up in Tools &amp; Guardrails
-                  </Link>
-                  .
-                </span>
-              )}
-            </span>
-          ) : null}
-        </div>
-
-        <div className="flex items-center gap-3">
-          <Button
-            variant="primary"
-            isDisabled={!canSubmit || pending || outgrewAlias}
-            onPress={submit}
-          >
-            {pending ? "Saving…" : editing ? "Save" : "Create policy"}
-          </Button>
-          <Button variant="ghost" onPress={onClose}>
-            Cancel
-          </Button>
-          <span className="text-xs text-muted">
-            In effect for new requests within 30s.
-          </span>
-          {routed && !weighted ? (
-            <span className="text-xs text-muted">
-              A new router serves the model above until it has scored examples.
-              Recording them is an API job for now (
-              <code>POST /v1/routing/preferences/rank</code>); open{" "}
-              <b>Examples</b> on the row afterwards to watch it warm up.
-            </span>
-          ) : null}
-          {weighted ? (
-            <span className="text-xs text-muted">
-              Each request is drawn independently, so the shares hold over
-              traffic rather than over any ten requests, and they behave the
-              same behind any number of replicas.
-            </span>
-          ) : null}
-          {outgrewAlias ? (
-            <span className="text-xs text-warning">
-              An alias holds one target. To add a fallback, a condition, or a
-              guardrail, delete this alias and create a policy with the same
-              name.
-            </span>
-          ) : null}
-        </div>
-      </Section>
-    </div>
-  )
-}
 
 // ---------------------------------------------------------------------------
 // Page
@@ -1279,59 +184,65 @@ function KindMark({ label }: { label: string }) {
 }
 
 export function RoutingPage() {
-  // Deliberately unscoped, unlike keys and usage. The gateway stores every
-  // policy and alias in the default workspace on purpose, because resolution
-  // reads a process-wide name-keyed cache: one stored elsewhere would be listed
-  // as scoped while it resolved for everyone. Filtering this list by the
-  // selected workspace would therefore show an empty page while those policies
-  // were live for that workspace's traffic, and hide a policy the moment it was
-  // created. Scope this when resolution is scoped, not before.
+  // Scoped to the selected workspace, like keys and usage (otari-ai#2087).
+  // Resolution is workspace-keyed (`services/policy_store`), so a stored policy
+  // decides the traffic of one workspace and belongs on that workspace's page.
+  // Left unscoped, the deployment-wide list showed an operator every tenant's
+  // rows and an admin every workspace of theirs, neither of which is what the
+  // page claims to be. Config-file entries have no workspace and are listed
+  // whatever the selection, being in force in all of them.
   //
-  // Which list is asked depends on who is signed in (otari-ai#1942): an
-  // operator reads the deployment-wide management view, and anyone else reads
-  // the tenant-scoped `/v1/organizations/me/*` pair. Both reads wait for the
-  // context to settle rather than taking "not yet an operator" as "member", so
-  // an operator's page does not fire a read it is about to drop.
+  // Which of the two surfaces answers depends on who is signed in
+  // (otari-ai#1942, otari-ai#1969), and `useRoutingScope` makes that choice once
+  // for both lists: an operator reads the deployment-wide pair, anyone else the
+  // tenant-scoped `/organizations/me/*` one. Both wait for the context to settle
+  // rather than taking "not yet an operator" as "member".
   const organization = useOrganizationContext()
-  const isOperator = isDeploymentOperator(organization.data)
-  const isContextSettled =
-    organization.data !== undefined || organization.isError
-  const policies = useRoutingPolicies(isOperator)
-  const memberPolicies = useOrganizationRoutingPolicies(
-    isContextSettled && !isOperator,
-  )
-  const aliases = useAliases(isOperator)
-  const memberAliases = useOrganizationAliases(isContextSettled && !isOperator)
+  const { isOperator, isSettled: isContextSettled } = useDeploymentOperator()
+  // The switcher is seeded from the caller's own memberships, not the
+  // organization's whole list (otari-ai#1969), so this is null only for somebody
+  // who belongs to no workspace: they have nothing of their own to see and
+  // nowhere to write, and are shown the config entries on a read-only page.
+  const { selected: selectedWorkspace } = useSelectedWorkspace()
+  const workspaceId = selectedWorkspace?.workspace_id
+  const policies = useRoutingPolicies(workspaceId)
+  const aliases = useAliases(workspaceId)
   const deletePolicy = useDeleteRoutingPolicy()
   const deleteAlias = useDeleteAlias()
   const deleteOrgPolicy = useDeleteOrganizationRoutingPolicy()
   const deleteOrgAlias = useDeleteOrganizationAlias()
-  // Where a tenant admin's write lands, and null for an operator, who writes
-  // deployment-wide. The tenant surface requires the workspace named, so an
-  // admin who belongs to none has nowhere to write and is shown the read-only
-  // page: the switcher is seeded from their own memberships, not the
-  // organization's whole list (otari-ai#1969).
-  const { selected: selectedWorkspace } = useSelectedWorkspace()
-  const writeWorkspaceId = isOperator
-    ? null
-    : (selectedWorkspace?.workspace_id ?? null)
+  // Where a create lands, on either surface. An operator's used to omit it and
+  // land in the deployment's default workspace, which is a row saved from one
+  // workspace's page and listed on another's. A write to an existing row uses
+  // that row's own workspace instead (`deleteWorkspaceFor` below, and the Edit
+  // form's `workspaceId`), so a list still being refetched through a switch
+  // cannot move a row between workspaces.
+  const writeWorkspaceId = workspaceId ?? null
   const canEdit =
     isOperator || (canManage(organization.data) && writeWorkspaceId !== null)
-  // An admin's list spans every workspace of the organization, not just the
-  // selected one, so a write to an existing row goes back to the workspace that
-  // row lives in (`rowWorkspace` below, and the Edit form's `workspaceId`).
-  // Using the selection would create a second policy of the same name in the
-  // selected workspace and leave the edited one untouched. Written inline at
-  // both sites rather than as a helper, so the columns memo keeps depending on
-  // two stable values instead of a function rebuilt every render.
   // A deep link may pre-fill the add form with ?target=provider:model.
   const initialTarget = useUrlValue("target")
   const [adding, setAdding] = useState(initialTarget !== "")
-  const [editing, setEditing] = useState<RoutingRow | null>(null)
+  // Where focus goes when nothing else claims it. React Aria restores focus to
+  // whatever had it when the dialog opened, which is right for the heading's own
+  // button and wrong for the empty state's: creating the first policy fills the
+  // table, so the empty state unmounts and the node react-aria stored is gone,
+  // leaving focus on `document.body` where the next Tab starts at the top of the
+  // document. `FormDialog` checks for that when the frame is actually gone.
+  const createButtonRef = useRef<HTMLButtonElement | null>(null)
+  const [createCount, setCreateCount] = useState(0)
+  const openCreate = () => {
+    setEditing(undefined)
+    setCreateCount((n) => n + 1)
+    setAdding(true)
+  }
+  const closeCreate = () => setAdding(false)
+  const [editing, setEditing] = useState<RoutingRow>()
+  const [pendingDelete, setPendingDelete] = useState<RoutingRow>()
   // Readiness opens inline under its own row (DataTable's accordion), because it
   // describes one policy and the operator clicked that policy. A card above the
   // table would put the panel nowhere near the control that opened it.
-  const [expanded, setExpanded] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<string>()
   // `adding` is seeded from ?target= before the membership context settles, so
   // the role is applied here rather than in the initializer: gating the
   // initializer would drop an operator's deep link, since `isOperator` is still
@@ -1341,20 +252,12 @@ export function RoutingPage() {
 
   // Aliases and policies are listed together: an alias is the one-target case,
   // and this page is the only place either is managed.
-  //
-  // Both operator lists are read through `isOperator` rather than relied on to
-  // be empty because their hooks are disabled: a disabled query still hands
-  // back whatever sits in the cache under its key, so a caller who was an
-  // operator earlier in the session would keep seeing the deployment-wide rows
-  // after being demoted. The gate belongs where the data is rendered.
   const rows: RoutingRow[] = [
-    ...((isOperator ? policies.data : memberPolicies.data) ?? []).map(
-      (policy) => ({
-        ...policy,
-        kind: "policy" as const,
-      }),
-    ),
-    ...((isOperator ? aliases.data : memberAliases.data) ?? []).map(aliasAsRow),
+    ...(policies.data ?? []).map((policy) => ({
+      ...policy,
+      kind: "policy" as const,
+    })),
+    ...(aliases.data ?? []).map(aliasAsRow),
   ].sort(
     (a, b) =>
       a.name.localeCompare(b.name) ||
@@ -1363,21 +266,18 @@ export function RoutingPage() {
   // The context counts as loading too: until it settles, neither list has been
   // asked, and an empty table would read as "no policies" rather than "not yet".
   const isListLoading =
-    !isContextSettled ||
-    (isOperator
-      ? policies.isLoading || aliases.isLoading
-      : memberPolicies.isLoading || memberAliases.isLoading)
+    !isContextSettled || policies.isLoading || aliases.isLoading
 
   // Stable so DataTable's row cache holds; see its docstring.
   const renderDetail = useCallback(
     (row: RoutingRow) => (
       <RouterReadiness
         policyName={row.name}
-        candidates={candidatesOf(row.spec)}
-        defaultTarget={defaultTargetOf(row.spec)}
-        backend={routerBackendOf(row.spec) ?? KNN_BACKEND}
+        candidates={findCandidates(row.spec)}
+        defaultTarget={findFallthroughTarget(row.spec)}
+        backend={findRouterBackend(row.spec) ?? KNN_BACKEND}
         scopedUserId={row.user_id ?? null}
-        onClose={() => setExpanded(null)}
+        onClose={() => setExpanded(undefined)}
       />
     ),
     [],
@@ -1404,7 +304,7 @@ export function RoutingPage() {
             {/* The kind of routing, as an affirmative mark: a fallback chain or
                 a learned router is a decision somebody made about this policy,
                 where a plain single-target policy is just the default shape. */}
-            {candidatesOf(policy.spec).length > 0 ? (
+            {findCandidates(policy.spec).length > 0 ? (
               <KindMark label={routerLabelOf(policy.spec)} />
             ) : policy.is_dynamic ? (
               <KindMark label="Dynamic" />
@@ -1474,25 +374,26 @@ export function RoutingPage() {
         // of scored examples is the one number in there that changes.
         //
         // Three outcomes, not two. Operator-only within an actions column an
-        // admin now also gets, because the panel reads `/v1/routing/status`,
+        // admin now also gets, because the panel reads `/routing/status`,
         // which is deployment-wide: an admin sees no readiness at all. Then an
         // em dash where a policy has no readiness to report, rather than an
         // empty cell, since a fallback chain has nothing to learn and that
         // absence is worth stating and is not the same as zero examples. Then
         // the control, for a backend that learns.
-        const readiness = !isOperator ? null : routerBackendOf(policy.spec) !==
-          KNN_BACKEND ? (
+        const readiness = !isOperator ? null : findRouterBackend(
+            policy.spec,
+          ) !== KNN_BACKEND ? (
           <span className="text-muted">—</span>
         ) : (
           <RowAction
+            icon={FiList}
+            label={expanded === rowKeyOf(policy) ? "Hide examples" : "Examples"}
             onPress={() =>
               setExpanded((current) =>
-                current === rowKeyOf(policy) ? null : rowKeyOf(policy),
+                current === rowKeyOf(policy) ? undefined : rowKeyOf(policy),
               )
             }
-          >
-            {expanded === rowKeyOf(policy) ? "Hide examples" : "Examples"}
-          </RowAction>
+          />
         )
         return policy.source === "config" ? (
           <RowActionRow>
@@ -1504,88 +405,72 @@ export function RoutingPage() {
             {readiness}
             {isEditableInForm(policy.spec) ? (
               <RowAction
+                icon={FiEdit2}
+                label="Edit"
                 onPress={() => {
-                  // The table stays mounted while the create form is open, so
-                  // Edit is still reachable from it. Closing the other panels
-                  // keeps this to one form: two stacked forms do not recover on
-                  // their own, since each only closes when cancelled.
+                  // `setAdding(false)` cannot fire while the create dialog is
+                  // open (its backdrop covers the table and `ariaHideOutside`
+                  // takes the rows out of the accessibility tree), so this is
+                  // belt and braces for a future surface that reaches a row
+                  // without going through the modal.
                   setAdding(false)
                   setEditing(policy)
                 }}
-              >
-                Edit
-              </RowAction>
+              />
             ) : (
               <span className="max-w-xs text-xs text-muted">
                 Uses options this form cannot show yet. Edit it through the API
                 so nothing is lost.
               </span>
             )}
-            <ConfirmRowAction
-              confirmLabel="Confirm"
-              isPending={
-                deletePolicy.isPending ||
-                deleteAlias.isPending ||
-                deleteOrgPolicy.isPending ||
-                deleteOrgAlias.isPending
-              }
-              onConfirm={() => {
-                // The tenant surface names the workspace and has no user scope;
-                // the deployment-wide one defaults the workspace and keeps it.
-                const rowWorkspace = isOperator
-                  ? null
-                  : (policy.workspace_id ?? writeWorkspaceId)
-                if (rowWorkspace !== null) {
-                  const scoped = {
-                    name: policy.name,
-                    workspaceId: rowWorkspace,
-                  }
-                  if (policy.kind === "alias") deleteOrgAlias.mutate(scoped)
-                  else deleteOrgPolicy.mutate(scoped)
-                  return
-                }
-                const deployment = {
-                  name: policy.name,
-                  userId: policy.user_id,
-                }
-                if (policy.kind === "alias") deleteAlias.mutate(deployment)
-                else deletePolicy.mutate(deployment)
-              }}
-            >
-              Delete
-            </ConfirmRowAction>
+            <RowAction
+              icon={FiTrash2}
+              label="Delete"
+              onPress={() => setPendingDelete(policy)}
+            />
           </RowActionRow>
         )
       },
     })
     return base
-  }, [
-    canEdit,
-    deleteAlias,
-    deleteOrgAlias,
-    deleteOrgPolicy,
-    deletePolicy,
-    expanded,
-    isOperator,
-    writeWorkspaceId,
-  ])
+  }, [canEdit, expanded, isOperator])
+
+  // Which of the four delete surfaces a row goes to. Both name the workspace the
+  // row lives in; only the deployment-wide pair carries the user scope, which
+  // the tenant surface has no rows in.
+  const deleteWorkspaceFor = (row: RoutingRow) =>
+    row.workspace_id ?? writeWorkspaceId
+  const deleteMutationFor = (row: RoutingRow) =>
+    isOperator
+      ? row.kind === "alias"
+        ? deleteAlias
+        : deletePolicy
+      : row.kind === "alias"
+        ? deleteOrgAlias
+        : deleteOrgPolicy
+  // Resolved for the pending row alone, not as a chain over all four: a refusal
+  // stays on its mutation until the next call, so reading every one of them
+  // would report the last row's failure over this row's confirm.
+  const pendingDeleteMutation = pendingDelete
+    ? deleteMutationFor(pendingDelete)
+    : undefined
 
   return (
     <div className="flex flex-col gap-6">
       <PageIntro
         title="Routing"
         action={
-          !canEdit || isAdding || editing !== null ? undefined : (
+          canEdit ? (
             <Button
+              ref={createButtonRef}
+              // Visible while the dialog is open: the dialog is over the page,
+              // so there is nothing for hiding this to prevent.
               variant="primary"
-              onPress={() => {
-                setEditing(null)
-                setAdding(true)
-              }}
+              onPress={openCreate}
             >
-              New policy
+              Create policy
             </Button>
-          )
+          ) : undefined
         }
       >
         {/* Three readings of the same page, because what a caller may do here
@@ -1600,40 +485,47 @@ export function RoutingPage() {
             : "Named models your callers send as `model`. A policy decides which real model serves each request, what is tried if that fails, and which guardrails always run. These are the ones in force in your workspaces; your organization's admins manage them."}
       </PageIntro>
 
-      <ErrorBanner
-        error={
-          policies.error ??
-          memberPolicies.error ??
-          aliases.error ??
-          memberAliases.error ??
-          deletePolicy.error ??
-          deleteAlias.error ??
-          deleteOrgPolicy.error ??
-          deleteOrgAlias.error
-        }
+      {/* The reads only. Every delete on this page reports inside its own
+          confirm dialog, which is where the operator is looking. */}
+      <ErrorBanner error={policies.error ?? aliases.error} />
+
+      {/* Mounted while closed so the frame plays its exit with the content
+          intact, and keyed on the open counter so the draft is fresh on the way
+          in rather than cleared on the way out. See feedback.md. */}
+      <PolicyForm
+        key={createCount}
+        existing={null}
+        initialTarget={initialTarget}
+        isOpen={isAdding}
+        // The empty state's "Create your first policy" is gone by the time
+        // this closes, since creating one is what makes the page non-empty, so
+        // the frame's own restore has nothing to land on. The heading's action
+        // survives.
+        returnFocusRef={createButtonRef}
+        isDeploymentWide={isOperator}
+        workspaceId={writeWorkspaceId}
+        onClose={closeCreate}
       />
-
-      {isAdding ? (
+      {editing !== undefined ? (
         <PolicyForm
-          existing={null}
-          initialTarget={initialTarget}
-          workspaceId={writeWorkspaceId}
-          onClose={() => setAdding(false)}
-        />
-      ) : null}
-      {editing !== null ? (
-        <PolicyForm
+          // Keyed on the row: the fields seed from `existing` once, through
+          // mount-only state, so without this a second row's Edit would open
+          // with the first row's draft and save it under the second one's name.
+          key={rowKeyOf(editing)}
           existing={editing}
-          workspaceId={
-            isOperator ? null : (editing.workspace_id ?? writeWorkspaceId)
-          }
-          onClose={() => setEditing(null)}
+          isDeploymentWide={isOperator}
+          workspaceId={editing.workspace_id ?? writeWorkspaceId}
+          onClose={() => setEditing(undefined)}
         />
       ) : null}
 
-      {rows.length === 0 && !isListLoading && !isAdding ? (
+      {rows.length === 0 && !isListLoading ? (
         canEdit ? (
-          <EmptyState title="No routing policies yet">
+          <EmptyState
+            title="No routing policies yet"
+            actionLabel="Create your first policy"
+            onAction={openCreate}
+          >
             <ol className="flex list-decimal flex-col gap-1 pl-5 text-sm text-muted">
               <li>
                 Create a policy and point it at the model that should normally
@@ -1676,6 +568,57 @@ export function RoutingPage() {
           />
         </TableScrollFrame>
       )}
+
+      <ConfirmDialog
+        isOpen={pendingDelete !== undefined}
+        // Cleared on the way out: a refusal otherwise sits on the mutation and
+        // greets the next row's confirm as if that row had failed.
+        onOpenChange={(open) => {
+          if (open) return
+          setPendingDelete(undefined)
+          deletePolicy.reset()
+          deleteAlias.reset()
+          deleteOrgPolicy.reset()
+          deleteOrgAlias.reset()
+        }}
+        heading={
+          pendingDelete?.kind === "alias" ? "Delete alias" : "Delete policy"
+        }
+        body={
+          pendingDelete
+            ? `${pendingDelete.name} stops resolving. A request that still sends it as its model is refused, so update the callers that name it.`
+            : null
+        }
+        confirmLabel={
+          pendingDelete?.kind === "alias" ? "Delete alias" : "Delete policy"
+        }
+        isPending={pendingDeleteMutation?.isPending ?? false}
+        error={pendingDeleteMutation?.error}
+        onConfirm={() => {
+          if (!pendingDelete) return
+          const onSuccess = () => setPendingDelete(undefined)
+          const rowWorkspace = deleteWorkspaceFor(pendingDelete)
+          if (isOperator) {
+            const deployment = {
+              name: pendingDelete.name,
+              userId: pendingDelete.user_id,
+              workspaceId: rowWorkspace,
+            }
+            if (pendingDelete.kind === "alias")
+              deleteAlias.mutate(deployment, { onSuccess })
+            else deletePolicy.mutate(deployment, { onSuccess })
+            return
+          }
+          // Unreachable: Delete is rendered behind `canEdit`, which for a
+          // tenant admin already requires a selected workspace, and a stored row
+          // always carries its own.
+          if (rowWorkspace === null) return
+          const scoped = { name: pendingDelete.name, workspaceId: rowWorkspace }
+          if (pendingDelete.kind === "alias")
+            deleteOrgAlias.mutate(scoped, { onSuccess })
+          else deleteOrgPolicy.mutate(scoped, { onSuccess })
+        }}
+      />
     </div>
   )
 }

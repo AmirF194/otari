@@ -39,25 +39,26 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, and_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gateway.auth.models import generate_api_key, hash_key, key_prefix
+from gateway.auth.models import hash_key, key_suffix
 from gateway.core.config import GatewayConfig
-from gateway.core.usage_source import served_here
-from gateway.models.entities import APIKey, UsageLog, WorkspaceActivationState
-from gateway.models.money import as_float
-from gateway.models.tenancy import User, Workspace
-from gateway.repositories.users_repository import get_or_create_attribution_user
-from gateway.services.tenancy import authorization
-from gateway.services.tenancy.errors import (
+from gateway.exceptions.organizations_exceptions import (
     WorkspaceActivationUnavailableError,
     WorkspaceAlreadyActivatedError,
 )
+from gateway.models.api_keys import APIKey
+from gateway.models.money import as_float
+from gateway.models.tenancy import User, Workspace, WorkspaceActivationState
+from gateway.models.usage import PLAYGROUND_USAGE_ENDPOINT, SERVED_HERE_SLUG, UsageLog
+from gateway.ports.api_key_format_port import ApiKeyFormatPort
+from gateway.repositories.users_repository import get_or_create_attribution_user
+from gateway.services.tenancy import authorization
 from gateway.services.tenancy.organization_service import OrganizationService
 
 # What the guide calls the key it mints, as the Keys page shows it. One name for
@@ -141,6 +142,32 @@ def _utc_iso(value: datetime) -> str:
     return value.isoformat()
 
 
+def _integration_traffic(endpoint: Any, api_key_id: Any) -> ColumnElement[bool]:
+    """Match usage rows made from outside the product.
+
+    The guide closes when a workspace first calls this gateway *from somebody's own
+    code*; a message typed into our own Playground is the product being
+    demonstrated, not integrated, so closing on one would congratulate somebody for
+    something they have not done yet and then never offer the guide again.
+
+    Two columns, because the Playground answers to two shapes. Where this
+    deployment runs the completion itself, the row carries
+    ``PLAYGROUND_USAGE_ENDPOINT``. Where a hosted control plane forwards to its
+    data-plane gateway (``services/playground_dispatch``), the row is written from
+    the gateway's usage report and labeled like every other report, so the label
+    cannot carry the surface; the credential does, because the one the control
+    plane forwards under is minted by this deployment for exactly this purpose and
+    is marked as such.
+    """
+    return and_(
+        endpoint != PLAYGROUND_USAGE_ENDPOINT,
+        # A row with no key at all (the standalone Playground writes one, and so
+        # does any session-authorized request) matches nothing here and is left to
+        # the endpoint half above, which is the half that knows about it.
+        ~select(APIKey.id).where(APIKey.id == api_key_id, APIKey.internal_secret.is_not(None)).exists(),
+    )
+
+
 class ActivationAttemptPublic(BaseModel):
     """One gateway request in this workspace, as the guide reports it."""
 
@@ -199,16 +226,18 @@ class ActivationApiKeyPublic(BaseModel):
     key: str
     key_id: str
     key_prefix: str | None
+    key_suffix: str | None
     key_name: str | None
 
 
 class WorkspaceActivationService:
     """State and key issuance for the first-request setup guide."""
 
-    def __init__(self, db: AsyncSession, config: GatewayConfig):
+    def __init__(self, db: AsyncSession, config: GatewayConfig, key_format: ApiKeyFormatPort):
         self.db = db
         self.config = config
-        self.organizations = OrganizationService(db)
+        self.key_format = key_format
+        self.organizations = OrganizationService(db, membership_listener=None)
 
     # ------------------------------------------------------------------
     # Reads
@@ -284,16 +313,9 @@ class WorkspaceActivationService:
             # The row it adopted may have been dismissed by whoever created it.
             self._require_offerable(workspace=workspace, state=state)
 
-        plaintext = generate_api_key()
-        # Owned by the caller's own request-plane row, not the shared ``default``
-        # user that ``POST /v1/keys`` falls back to. Two reasons: the dashboard's
-        # own key form requires an owner, so a key minted from a dashboard flow
-        # should have a real one; and a key owned by an identity's attribution row
-        # is what makes the request bill through that member's scoped ceilings
-        # (`services/scoped_budget_service.py` resolves the identity back out of
-        # ``users.user_id``), where one owned by ``default`` would sit outside
-        # every per-member budget. The row normally exists already: first-boot
-        # provisioning mints the operator's, and adding a member mints theirs.
+        plaintext = self.key_format.mint()
+        # The key is owned by the caller's attribution row and not the shared ``default`` user,
+        # so its requests bill through that member's scoped ceilings.
         owner = await get_or_create_attribution_user(
             self.db,
             user_id=str(user.id),
@@ -305,14 +327,16 @@ class WorkspaceActivationService:
                 id=str(uuid.uuid4()),
                 workspace_id=workspace.id,
                 key_hash=hash_key(plaintext),
-                key_prefix=key_prefix(plaintext),
+                key_prefix=self.key_format.fingerprint(plaintext),
+                key_suffix=key_suffix(plaintext),
                 key_name=ACTIVATION_KEY_NAME,
                 user_id=owner.user_id,
             )
             self.db.add(record)
         else:
             record.key_hash = hash_key(plaintext)
-            record.key_prefix = key_prefix(plaintext)
+            record.key_prefix = self.key_format.fingerprint(plaintext)
+            record.key_suffix = key_suffix(plaintext)
             # The owner moves with the rotation. Whoever asked last is the only
             # person holding a plaintext that still authenticates, so leaving the
             # first issuer's id on the row would bill a second manager's requests
@@ -332,6 +356,7 @@ class WorkspaceActivationService:
             key=plaintext,
             key_id=record.id,
             key_prefix=record.key_prefix,
+            key_suffix=record.key_suffix,
             key_name=record.key_name,
         )
 
@@ -464,12 +489,21 @@ class WorkspaceActivationService:
         else's traffic recorded here for cost reporting, so a workspace whose only
         rows came from an import has still never called this gateway, and the guide
         would be lying to close.
+
+        Two exclusions, not one, and the second is a different kind of thing.
+        Imported usage is traffic this deployment did not serve; a Playground
+        request is traffic it served for its own UI. The guide exists to mark the
+        moment somebody's own code first reached this gateway, so a message typed
+        into the product is the demo rather than the integration, and closing on
+        one would retire the guide for a workspace that has not integrated
+        anything. See :func:`_integration_traffic`.
         """
         statement = (
             select(UsageLog)
             .where(
                 UsageLog.workspace_id == workspace_id,
-                served_here(UsageLog.source),
+                UsageLog.source == SERVED_HERE_SLUG,
+                _integration_traffic(UsageLog.endpoint, UsageLog.api_key_id),
                 UsageLog.status == "success",
             )
             # Tie-broken on the id so two rows sharing a timestamp still name one
@@ -482,14 +516,18 @@ class WorkspaceActivationService:
     async def _latest_request(self, workspace_id: uuid.UUID) -> UsageLog | None:
         """The most recent gateway request in the workspace, successful or not.
 
-        Scoped to what this deployment served, for the reason in
-        :meth:`_first_successful_request`.
+        Scoped the same two ways as :meth:`_first_successful_request`, and the
+        Playground exclusion matters here for a second reason: this row is what
+        the guide shows as "your last attempt", so a Playground message would
+        otherwise report the product talking to itself as the caller's most
+        recent try and hide the failing request they are actually debugging.
         """
         statement = (
             select(UsageLog)
             .where(
                 UsageLog.workspace_id == workspace_id,
-                served_here(UsageLog.source),
+                UsageLog.source == SERVED_HERE_SLUG,
+                _integration_traffic(UsageLog.endpoint, UsageLog.api_key_id),
                 UsageLog.status.in_(_ATTEMPT_STATUSES),
             )
             .order_by(UsageLog.timestamp.desc(), UsageLog.id.desc())

@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from gateway.core.config import GatewayConfig
+from gateway.metrics import REGISTRY
 from gateway.rate_limit import RateLimiter, RateLimitInfo
 
 
@@ -94,7 +95,7 @@ def test_rate_limiter_window_expiry() -> None:
 
 def test_rate_limiter_cleanup() -> None:
     limiter = RateLimiter(rpm=100)
-    limiter._CLEANUP_INTERVAL = 3
+    limiter._log._CLEANUP_INTERVAL = 3
 
     with patch("gateway.rate_limit.time") as mock_time:
         mock_time.monotonic.return_value = 1000.0
@@ -107,8 +108,8 @@ def test_rate_limiter_cleanup() -> None:
         mock_time.time.return_value = 1700000061.0
         limiter.check("active-user")
 
-        assert "stale-user" not in limiter._requests
-        assert "active-user" in limiter._requests
+        assert "stale-user" not in limiter._log._requests
+        assert "active-user" in limiter._log._requests
 
 
 def test_rate_limiter_uses_deque_buckets() -> None:
@@ -119,7 +120,7 @@ def test_rate_limiter_uses_deque_buckets() -> None:
         mock_time.time.return_value = 1700000000.0
         limiter.check("user-1")
 
-    assert isinstance(limiter._requests["user-1"], deque)
+    assert isinstance(limiter._log._requests["user-1"].entries, deque)
 
 
 def test_config_rejects_zero_rate_limit() -> None:
@@ -140,3 +141,17 @@ def test_config_accepts_positive_rate_limit() -> None:
 def test_config_accepts_none_rate_limit() -> None:
     config = GatewayConfig(rate_limit_rpm=None)
     assert config.rate_limit_rpm is None
+
+
+def test_check_records_metric_on_429() -> None:
+    """RateLimiter.check() records a metric before raising 429."""
+    limiter = RateLimiter(rpm=1)
+    limiter.check("metric-rl-user")
+
+    before = REGISTRY.get_sample_value("gateway_rate_limit_hits_total") or 0.0
+
+    with pytest.raises(HTTPException) as exc_info:
+        limiter.check("metric-rl-user")
+
+    assert exc_info.value.status_code == 429
+    assert (REGISTRY.get_sample_value("gateway_rate_limit_hits_total") or 0.0) - before == 1.0

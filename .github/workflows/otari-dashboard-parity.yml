@@ -22,6 +22,7 @@ on:
       # The gateway that serves the bundle and answers every request these flows
       # make, tenancy, auth, usage and the deployment bootstrap included.
       - 'src/gateway/**'
+      - 'cli/**'
       # The dashboard bundles this guide (web/src/features/docs/DocsPage.tsx), so a
       # change to it changes the built app.
       - 'docs/dashboard.md'
@@ -35,6 +36,7 @@ on:
     paths:
       - 'web/**'
       - 'src/gateway/**'
+      - 'cli/**'
       - 'docs/dashboard.md'
       - 'pyproject.toml'
       - 'uv.lock'
@@ -52,7 +54,7 @@ jobs:
       with:
         persist-credentials: false
 
-    - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
         python-version: "3.14"
 
@@ -64,7 +66,7 @@ jobs:
     # to precede setup-node, whose `cache: pnpm` shells out to pnpm for the store
     # path; `package_json_file` is needed because the pin is in web/, not at the
     # repository root.
-    - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+    - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       with:
         package_json_file: web/package.json
 

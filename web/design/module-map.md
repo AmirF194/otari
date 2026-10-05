@@ -5,6 +5,16 @@ from DESIGN.md's topics table, because it describes work rather than a rule.
 Delete it once the follow-ups at the bottom are closed; the durable half (where a
 component lives) is already in DESIGN.md's "Where things come from" table.
 
+**Superseded, in one respect: every path below that reads
+`shared/components/<topic>/` is now `design-system/<topic>/`.** The ten topic
+directories this change created were moved wholesale into a layer that may
+import nothing else under `src/`, which is what makes them extractable as a
+package; DESIGN.md's "The extraction contract" is the current rule, and the two
+directories that stayed behind (`access/`, `deprecated/`) are named there. The
+paths are left as written here rather than rewritten, because this file records
+what a past change did and a record edited to match the present stops being one.
+Read it for the reasoning, not for a location.
+
 **Status: executed.** `surface.tsx` (876 lines, 22 exports), `ui.tsx` (1,075
 lines, 20 exports) and `shared/api/hooks.ts` (3,638 lines, 172 exports) are gone,
 replaced by 10 topic directories under `shared/components/` and 17 domain modules
@@ -57,7 +67,7 @@ they are called out below so nobody mistakes them for the system's own vocabular
 
 ## Target tree
 
-```
+```text
 shared/components/
 ├── layout/       ← design/layout.md
 ├── metrics/      ← design/metrics.md
@@ -150,7 +160,6 @@ among the band components. `Tab` ships with `TabRow` and `RowActionRow` with
 | `FilterMultiComboBox` | `navigation/FilterMultiComboBox.tsx` |
 | `Badge` | `indicators/Badge.tsx` |
 | `UnavailableHere` | `access/UnavailableHere.tsx` |
-| `PageHeader` | `deprecated/PageHeader.tsx` |
 | `StatCard`, `StatStatus` | `deprecated/StatCard.tsx` |
 
 `errorMessage` and `INPUT_CLASS` take `.ts`, not `.tsx`: naming-conventions.md
@@ -220,11 +229,10 @@ directory makes it mechanical: one `noRestrictedImports` pattern for
 `@/shared/components/deprecated/**` scoped to everything outside it, or a
 `foundation.test.ts` assertion that the import count per module never rises.
 
-Four members, two of which this spec is the first to name:
+Three members, two of which this spec is the first to name:
 
 | Component | Call sites | Replacement | Why |
 | --- | --- | --- | --- |
-| `PageHeader` | 4 pages | `layout/PageIntro` | Already in DESIGN.md's table |
 | `StatCard` | 2 pages | `metrics/KpiStrip` + `KpiCell` | Already in DESIGN.md's table |
 | `RowActions` | 1 | `actions/RowActionRow` | actions.md already says "do not reach for it", and puts it on two |
 | `SettingsSection` | **0** | `layout/SettingsGroup` | Undocumented near-duplicate, and an `export const` arrow against this tree's `export function` |
@@ -244,7 +252,7 @@ nested under `MODELS`; `ORGANIZATION_BUDGETS` keyed apart from `BUDGETS`).
 One module per domain, and `hooks` dropped from the path: under `api/` every export
 is already a hook, so the segment names nothing.
 
-```
+```text
 shared/api/
   client.ts        unchanged
   queryKeys.ts     all 60 constants. MUST stay one module
@@ -348,8 +356,8 @@ and is the remaining check.
 - **Delete `deprecated/SettingsSection`.** No call site anywhere. Removing a
   component is a maintainer's call, not a side effect of moving files, so it is
   pinned at zero by a test instead.
-- **Convert the remaining deprecated call sites.** `PageHeader` on 4 pages,
-  `StatCard` on 4 uses in `OverviewPage`, `RowActions` on 1 in `PasskeysCard`. A
+- **Convert the remaining deprecated call sites.** `StatCard` on 4 uses in
+  `OverviewPage`, `RowActions` on 1 in `PasskeysCard`. A
   taxonomy change that also rewrote six pages would stop being reviewable by
   shape. One page at a time, which is what DESIGN.md already invites.
 - **Split `tabs.test.tsx`** if its header docstring is ever separable per

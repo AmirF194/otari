@@ -1,6 +1,8 @@
 import asyncio
-from collections.abc import AsyncGenerator
+import importlib.util
+from collections.abc import AsyncGenerator, Coroutine
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -8,25 +10,40 @@ from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from typing_extensions import override
 
-from gateway.api.deps import set_config
+from gateway import features
+from gateway.api.deps import build_file_service, build_idempotency_service, set_config
 from gateway.api.main import register_routers
-from gateway.container import build_container
-from gateway.core.config import API_KEY_HEADER, GATEWAY_TOKEN_HEADER, X_API_KEY_HEADER, GatewayConfig
-from gateway.core.database import create_session, init_db
+from gateway.container import Container, build_container
+from gateway.context_propagation import TraceContextPropagationMiddleware
+from gateway.core.config import API_KEY_HEADER, API_ROOT, GATEWAY_TOKEN_HEADER, X_API_KEY_HEADER, GatewayConfig
+from gateway.core.database import create_session, dispose_db, init_db
+from gateway.core.feature import Worker
 from gateway.dashboard import DASHBOARD_PACKAGE_PATH, get_dashboard_build_id, get_dashboard_dir
+from gateway.exceptions import TenancyError
+from gateway.exceptions.control_plane_exceptions import ControlPlaneError
 from gateway.inflight import InFlightMiddleware, InFlightRegistry
 from gateway.log_config import logger
-from gateway.rate_limit import RateLimiter
+from gateway.ports.api_key_format_port import ApiKeyFormatPort
+from gateway.ports.file_storage_port import FileStoragePort
+from gateway.ports.model_provider_port import ModelProviderPort
+from gateway.ports.provider_file_port import ProviderFilePort
+from gateway.ports.rate_limit_store_port import RateLimitStorePort
+from gateway.rate_limit import RateLimiter, RateLimitGrantMiddleware, RateLimitRules, UserRateLimiter
 from gateway.root_page import FAVICON_SVG, ROOT_TUTORIAL_HTML
 from gateway.services.alias_service import load_aliases_at_startup, reset_alias_cache, run_alias_refresher
 from gateway.services.bootstrap_service import bootstrap_first_api_key
-from gateway.services.budget_reservation_ledger import run_reservation_sweeper
+from gateway.services.budgets import run_reservation_sweeper
+from gateway.services.catalog_selectors import reset_selector_index
+from gateway.services.code_execution.container_sweeper import run_sandbox_container_sweeper
 from gateway.services.dashboard_session_service import revoke_sessions_on_master_key_change
-from gateway.services.file_store import build_file_store
+from gateway.services.feedback import new_feedback_rate_limiter
+from gateway.services.files import FileBackends, run_file_sweeper
+from gateway.services.inference import close_decision_client, run_idempotency_sweeper
 from gateway.services.log_writer import LogWriter, NoopLogWriter, create_log_writer
 from gateway.services.master_key_service import ensure_master_key
 from gateway.services.model_catalog_service import (
@@ -53,6 +70,7 @@ from gateway.services.pricing_init_service import (
 from gateway.services.pricing_refresh_service import (
     load_persisted_price_snapshot,
     run_price_snapshot_refresher,
+    run_price_update_poller,
 )
 from gateway.services.pricing_service import configure_default_pricing, configure_provider_types
 from gateway.services.provider_store_service import (
@@ -60,6 +78,7 @@ from gateway.services.provider_store_service import (
     reset_provider_cache,
     run_provider_refresher,
 )
+from gateway.services.rate_limits import load_rate_limit_rules_at_startup, run_rate_limit_refresher
 from gateway.services.runtime_settings_service import apply_overrides_from_db
 from gateway.services.search_backend import close_search_client
 from gateway.services.search_tool_store_service import (
@@ -67,21 +86,27 @@ from gateway.services.search_tool_store_service import (
     reset_search_tool_cache,
     run_search_tool_refresher,
 )
-from gateway.services.secret_box import validate_secret_key
-from gateway.services.tenancy.errors import TenancyError
+from gateway.services.secret_box import shares_secret_key, validate_secret_key
+from gateway.services.selector_index_service import run_selector_index_refresher
 from gateway.services.tenancy.org_provider_key_service import (
     load_org_provider_keys_at_startup,
     reset_org_provider_cache,
     run_org_provider_refresher,
 )
+from gateway.services.tenancy.organization_guardrail_runner import (
+    load_guardrail_runner_at_startup,
+    reset_guardrail_runner,
+    run_guardrail_runner_refresher,
+)
 from gateway.services.tool_settings_service import apply_overrides_from_db as apply_tool_overrides_from_db
 from gateway.version import __version__
 
-_PUBLIC_PREFIXES = ("/health",)
+# Every path here must be mounted; a contract test checks.
+_PUBLIC_PREFIXES = (f"{API_ROOT}/health",)
 # Paths authenticated by the master key in the request body (sign-in) or the
 # session cookie (sign-out) rather than the header schemes; the OpenAPI
 # security stamp below skips them. They still get the no-store cache headers.
-_COOKIE_AUTH_PREFIXES = ("/v1/auth/session",)
+_COOKIE_AUTH_PREFIXES = (f"{API_ROOT}/auth/session",)
 # Paths that carry no credential at all. The deployment bootstrap is what tells a
 # browser whether signing in is even possible here, so requiring a credential to
 # read it would be circular; the invitation and signup/verification/reset routes
@@ -90,10 +115,10 @@ _COOKIE_AUTH_PREFIXES = ("/v1/auth/session",)
 # schemes this stamps everything else with). Matched exactly rather than by
 # prefix, unlike the two tuples above: a prefix would exempt any future route
 # mounted under it too, by inheritance rather than by decision (an operator-only
-# resend or list-pending endpoint, say; `/v1/auth/session` and
-# `/v1/auth/password` both live under `/v1/auth` and do require a credential),
-# and `/v1/auth/password/reset` is already a prefix of
-# `/v1/auth/password/reset/confirm`, so the inheritance is not hypothetical.
+# resend or list-pending endpoint, say; `/api/v1/auth/session` and
+# `/api/v1/auth/password` both live under `/api/v1/auth` and do require a credential),
+# and `/api/v1/auth/password/reset` is already a prefix of
+# `/api/v1/auth/password/reset/confirm`, so the inheritance is not hypothetical.
 # Listed separately from _PUBLIC_PREFIXES because these still get
 # the no-store cache headers: each answer is specific to the caller or the
 # request's own token, and bootstrap's changes with the deployment's
@@ -103,17 +128,17 @@ _COOKIE_AUTH_PREFIXES = ("/v1/auth/session",)
 # shared token rather than by either API-key header. Stamped separately below
 # because the difference is not decoration: an API key does not open these, and
 # a published contract that says it does sends a caller to a 401.
-_GATEWAY_TOKEN_PATHS = frozenset({"/v1/web-search/search"})
+_GATEWAY_TOKEN_PATHS = frozenset({f"{API_ROOT}/web-search/search"})
 _UNAUTHENTICATED_PATHS = frozenset(
     {
-        "/v1/bootstrap",
-        "/v1/invitations/validate",
-        "/v1/invitations/accept",
-        "/v1/auth/signup",
-        "/v1/auth/verify-email",
-        "/v1/auth/resend-verification",
-        "/v1/auth/password/reset",
-        "/v1/auth/password/reset/confirm",
+        f"{API_ROOT}/bootstrap",
+        f"{API_ROOT}/invitations/validate",
+        f"{API_ROOT}/invitations/accept",
+        f"{API_ROOT}/auth/signup",
+        f"{API_ROOT}/auth/verify-email",
+        f"{API_ROOT}/auth/resend-verification",
+        f"{API_ROOT}/auth/password/reset",
+        f"{API_ROOT}/auth/password/reset/confirm",
         # The passkey sign-in ceremony, both halves. Unauthenticated for the
         # reason the sign-in endpoint is: they are how a caller who holds no
         # credential obtains a session. The signed assertion in the second call
@@ -121,17 +146,180 @@ _UNAUTHENTICATED_PATHS = frozenset(
         # Registering, listing, renaming and deleting a passkey are *not* here:
         # those are done from inside a session and are stamped like the rest of
         # the management surface.
-        "/v1/auth/webauthn/authenticate/options",
-        "/v1/auth/webauthn/authenticate",
+        f"{API_ROOT}/auth/webauthn/authenticate/options",
+        f"{API_ROOT}/auth/webauthn/authenticate",
         # The OAuth sign-in, both halves, unauthenticated for the same reason:
         # they are how a caller who holds no credential obtains a session. The
         # authorization code in the second call is the credential, and it is not
         # one of the header schemes below. Spelled with the path parameter
         # because that is how the generated document keys them.
-        "/v1/auth/oauth/{provider}/authorize",
-        "/v1/auth/oauth/{provider}/callback",
+        f"{API_ROOT}/auth/oauth/{{provider}}/authorize",
+        f"{API_ROOT}/auth/oauth/{{provider}}/callback",
     }
 )
+
+
+@dataclass(frozen=True)
+class _LifespanWorker:
+    """One periodic background task a standalone deployment runs.
+
+    ``start`` returns the task's coroutine, or None for a worker this config does
+    not run. ``reset`` clears the cache the worker keeps warm.
+    """
+
+    name: str
+    start: Callable[[GatewayConfig, Container], Coroutine[Any, Any, None] | None]
+    reset: Callable[[], None] | None = None
+
+
+def _start_reservation_sweeper(config: GatewayConfig, _container: Container) -> Coroutine[Any, Any, None] | None:
+    """Return the budget reservation sweep, or None when the interval disables it."""
+    if config.budget_reservation_sweep_interval_sec <= 0:
+        return None
+    return run_reservation_sweeper(
+        config.budget_reservation_sweep_interval_sec,
+        batch_size=config.budget_reservation_sweep_batch,
+        retention_sec=config.budget_reservation_retention_sec,
+    )
+
+
+def _start_file_sweeper(config: GatewayConfig, container: Container) -> Coroutine[Any, Any, None] | None:
+    """Return the file retention sweep, or None when files or the interval disable it.
+
+    Sweeps through the same store the request path writes to, since the bytes a
+    request wrote are the bytes this reclaims.
+    """
+    if not config.files_enabled or config.files_sweep_interval_sec <= 0:
+        return None
+    backends = FileBackends(
+        storage=container.resolve(FileStoragePort, None), provider_files=container.resolve(ProviderFilePort, None)
+    )
+    return run_file_sweeper(config.files_sweep_interval_sec, lambda uow: build_file_service(uow, backends, config))
+
+
+def _start_idempotency_sweeper(config: GatewayConfig, _container: Container) -> Coroutine[Any, Any, None]:
+    """Return the idempotency record sweep, which runs even while the header is ignored so stored records expire."""
+    return run_idempotency_sweeper(
+        config.idempotency_sweep_interval_sec, lambda uow: build_idempotency_service(uow, config)
+    )
+
+
+def _start_container_sweeper(config: GatewayConfig, _container: Container) -> Coroutine[Any, Any, None] | None:
+    """Return the sandbox container sweep, or None when no sandbox is held past its request."""
+    if not config.sandbox_configured() or config.sandbox_container_idle_ttl_sec <= 0:
+        return None
+    return run_sandbox_container_sweeper()
+
+
+# The periodic background workers a standalone deployment runs.
+# A new worker is one entry here.
+#
+# Each ``start`` resolves its refresher by name in this module when the lifespan
+# runs, so a refresher stays substitutable after import. It is handed the
+# container for the one worker that reads a port the way a request would.
+# Each ``reset`` holds the function object and binds at import, so a substitution
+# made after import does not reach it.
+_LIFESPAN_WORKERS: tuple[_LifespanWorker, ...] = (
+    _LifespanWorker("alias", lambda _config, _container: run_alias_refresher(), reset_alias_cache),
+    _LifespanWorker("policy", lambda _config, _container: run_policy_refresher(), reset_policy_cache),
+    _LifespanWorker("provider", lambda config, _container: run_provider_refresher(config), reset_provider_cache),
+    _LifespanWorker(
+        "organization provider key",
+        lambda _config, _container: run_org_provider_refresher(),
+        reset_org_provider_cache,
+    ),
+    # Not a cache of rows like its neighbours: this holds constructed vendor
+    # clients, so its tick rebuilds only what a write moved and its reset gives
+    # the threads back as well as dropping what was built.
+    _LifespanWorker(
+        "organization guardrail",
+        lambda _config, _container: run_guardrail_runner_refresher(),
+        reset_guardrail_runner,
+    ),
+    _LifespanWorker(
+        "search tool", lambda config, _container: run_search_tool_refresher(config), reset_search_tool_cache
+    ),
+    # No reset: the stored rules live on the config, which the startup load rebuilds.
+    _LifespanWorker("rate limit rule", lambda config, _container: run_rate_limit_refresher(config)),
+    _LifespanWorker("price snapshot", lambda _config, _container: run_price_snapshot_refresher()),
+    # Started whatever ``pricing_refresh`` says, because that policy is
+    # runtime-settable and each tick re-reads it.
+    _LifespanWorker("price update poll", lambda config, _container: run_price_update_poller(config)),
+    # Started whatever ``model_cache_ttl_seconds`` says, for the same reason.
+    # Gating on it would strand the gateway: the TTL is runtime-settable, and
+    # raising it from 0 flips every read onto a cache nothing then fills.
+    _LifespanWorker(
+        "model discovery", lambda config, _container: run_discovery_refresher(config), reset_discovery_cache
+    ),
+    _LifespanWorker(
+        "models.dev catalog", lambda config, _container: run_catalog_refresher(config), clear_catalog_cache
+    ),
+    # The short model spellings, rebuilt from the deployment's catalog view,
+    # with the hosted port resolved per tick as a request would resolve it.
+    _LifespanWorker(
+        "catalog selectors",
+        lambda config, container: run_selector_index_refresher(
+            config, lambda session: container.resolve(ModelProviderPort, session)
+        ),
+        reset_selector_index,
+    ),
+    # Not a cache reload: this returns leaked budget holds. Without it a user
+    # whose single request leaked would hold against their budget forever.
+    _LifespanWorker("budget reservation sweep", _start_reservation_sweeper),
+    # Same posture for uploaded files: expiry hides a file, this gives its
+    # bytes back.
+    _LifespanWorker("file retention sweep", _start_file_sweeper),
+    # The provider reclaims a held sandbox on its own timer; this drops the
+    # rows that named it once nobody can resume them.
+    _LifespanWorker("sandbox container sweep", _start_container_sweeper),
+    # Stored responses hold generated content, so they go once their retention passes.
+    _LifespanWorker("idempotency sweep", _start_idempotency_sweeper),
+)
+
+
+def _start_lifespan_workers(
+    config: GatewayConfig, container: Container
+) -> list[tuple[asyncio.Task[None], _LifespanWorker]]:
+    """Start the workers this config runs, each paired with its registry entry."""
+    return [
+        (asyncio.create_task(coroutine), worker)
+        for worker in _LIFESPAN_WORKERS
+        if (coroutine := worker.start(config, container)) is not None
+    ]
+
+
+def _operation_id(route: APIRoute) -> str:
+    """Name an operation by its first tag and handler, so moving a path renames nothing.
+
+    The id is what a generated SDK calls the method, so the tag and the handler
+    name are published contract: renaming either renames the method. A tag given
+    at mount time comes before the router's own and wins. A route with no tag is
+    named by its handler alone.
+
+    The id carries no HTTP method. A published route must declare one method,
+    because a route with several would carry one id for all of them, and neither
+    ``name`` nor ``operation_id`` can split it. Two routes that share a tag and a
+    handler collide too; the second needs a ``name`` of its own.
+    """
+    if not route.tags:
+        return route.name
+    tag = route.tags[0]
+    return f"{getattr(tag, 'value', tag)}-{route.name}"
+
+
+def _under(path: str, prefixes: tuple[str, ...]) -> bool:
+    """Whether ``path`` is one of ``prefixes`` or sits inside one.
+
+    Compared on the segment boundary, not as a byte prefix, so a sibling that
+    merely begins with the same characters does not inherit the treatment:
+    ``/api/v1/health-internal`` is not under ``/api/v1/health``. The tuples
+    below that already end in a slash are safe either way; these do not, and
+    getting it wrong here fails open, shipping an authenticated response with
+    no ``no-store`` and no ``Vary: Authorization``.
+    """
+    return any(path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes)
+
+
 # Public, unauthenticated static assets that shared caches may keep. Paths here
 # set their own Cache-Control at the route (favicon.svg), so the middleware only
 # fills one in when it is missing.
@@ -162,7 +350,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         path = request.url.path
-        if path.startswith(_PUBLIC_PREFIXES):
+        if _under(path, _PUBLIC_PREFIXES):
             return response
         # A cacheable path's policy describes its content, so it applies only to a
         # response that carries any: an error under it is a fact about right now.
@@ -180,6 +368,92 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             vary_values.add("Authorization")
             response.headers["Vary"] = ", ".join(sorted(vary_values))
         return response
+
+
+def _validate_metrics_support(config: GatewayConfig) -> None:
+    """Refuse to start when metrics are asked for but the extra is not installed.
+
+    ``prometheus-client`` is an optional extra, and without it the metric objects
+    in :mod:`gateway.metrics` fall back to no-ops. Registering ``/metrics`` on top
+    of those would answer a scrape with an empty body, which reads as a broken
+    exporter rather than a missing install, so say which it is here instead.
+    """
+    if not config.enable_metrics:
+        return
+
+    from gateway.metrics import PROMETHEUS_AVAILABLE
+
+    if not PROMETHEUS_AVAILABLE:
+        msg = (
+            "enable_metrics is set but prometheus-client is not installed. "
+            "Install it with: pip install gateway[metrics]"
+        )
+        raise ValueError(msg)
+
+
+def install_rate_limits(app: FastAPI, config: GatewayConfig) -> None:
+    """Put the per-user limit and the ``rate_limits`` rules on the app, counting in the container's store.
+
+    A standalone gateway always holds the rules, because the dashboard can add
+    one at runtime; a hybrid one, which refuses ``rate_limits``, holds them only
+    for ``rate_limit_rpm``. Resolving the store opens no connection.
+    """
+    rules_possible = not config.is_hybrid_mode
+    store: RateLimitStorePort | None = (
+        app.state.container.resolve(RateLimitStorePort, None)
+        if config.rate_limit_rpm is not None or rules_possible
+        else None
+    )
+    app.state.rate_limit_store = store
+    rpm = config.rate_limit_rpm
+    app.state.rate_limiter = UserRateLimiter(store, rpm) if store is not None and rpm is not None else None
+    app.state.rate_limit_rules = RateLimitRules(store, config) if store is not None and rules_possible else None
+
+
+def _validate_rate_limit_store(config: GatewayConfig) -> None:
+    """Refuse to start a shared rate-limit store that has nowhere to count.
+
+    Falling back to counting per process would quietly multiply the limit by
+    the number of replicas, which is the thing a shared store was asked for to
+    prevent, so a missing URL or client library stops startup instead.
+    ``rate_limits`` is refused in hybrid mode, which does not enforce it yet.
+    """
+    if config.rate_limits and config.is_hybrid_mode:
+        msg = "rate_limits is not supported in hybrid mode yet"
+        raise ValueError(msg)
+    if config.rate_limit_store != "redis":
+        return
+    if not config.rate_limit_redis_url:
+        msg = "rate_limit_store is 'redis' but rate_limit_redis_url is not set"
+        raise ValueError(msg)
+    if importlib.util.find_spec("redis") is None:
+        msg = "rate_limit_store is 'redis' but redis is not installed. Install it with: pip install gateway[redis]"
+        raise ValueError(msg)
+
+
+def _validate_provider_account_pepper(config: GatewayConfig) -> None:
+    """Refuse to start a deployment that makes provider copies without its own pepper.
+
+    The pepper keys the digest that names a provider account, so it must be set
+    and must share no value with another secret. A shared value would let a leak
+    of one secret expose the other, and tie their rotations together.
+    """
+    makes_copies = config.files_enabled and config.files_provider_upload_enabled
+    if not makes_copies or config.is_hybrid_mode or config.is_hosted_mode:
+        return
+    pepper = config.provider_account_pepper
+    if pepper is None:
+        msg = (
+            "OTARI_PROVIDER_ACCOUNT_PEPPER must be set while files_provider_upload_enabled is on; "
+            "set it to a random value of at least 32 characters, or turn provider copies off"
+        )
+        raise ValueError(msg)
+    if pepper == config.master_key:
+        msg = "OTARI_PROVIDER_ACCOUNT_PEPPER must differ from the master key"
+        raise ValueError(msg)
+    if shares_secret_key(pepper):
+        msg = "OTARI_PROVIDER_ACCOUNT_PEPPER must differ from every OTARI_SECRET_KEY key"
+        raise ValueError(msg)
 
 
 def _validate_platform_config(config: GatewayConfig) -> None:
@@ -224,7 +498,7 @@ def _warn_if_hosted_has_no_data_plane(config: GatewayConfig) -> None:
     )
 
 
-# How long shutdown waits for refreshers to acknowledge cancellation.
+# How long shutdown waits for refreshers and feature workers to acknowledge cancellation.
 #
 # Cancelling a task is a request, not a guarantee. The CancelledError is
 # delivered at whatever the task is awaiting, and a nested cancel scope there can
@@ -235,13 +509,14 @@ def _warn_if_hosted_has_no_data_plane(config: GatewayConfig) -> None:
 # unbounded ``await task`` never returns, so the lifespan never finishes and
 # uvicorn's shutdown hangs behind a background refresh. Bounding the wait and
 # moving on is the right trade: the event loop is torn down immediately after,
-# and no refresher owns state that a late tick could corrupt.
+# and no refresher owns state that a late tick could corrupt. A feature worker
+# shares the bound, so ``CoreFeature`` asks the same of it.
 _REFRESHER_STOP_TIMEOUT_SECONDS = 5.0
 
 
 def _log_abandoned_refresher(name: str) -> None:
     logger.warning(
-        "%s refresher did not stop within %.0fs; abandoning it so shutdown can finish",
+        "%s did not stop within %.0fs; abandoning it so shutdown can finish",
         name,
         _REFRESHER_STOP_TIMEOUT_SECONDS,
     )
@@ -249,7 +524,7 @@ def _log_abandoned_refresher(name: str) -> None:
 
 def _log_refresher_stop(task: asyncio.Task[None], name: str) -> None:
     if not task.cancelled() and (error := task.exception()) is not None:
-        logger.warning("%s refresher stopped with an unexpected error", name, exc_info=error)
+        logger.warning("%s stopped with an unexpected error", name, exc_info=error)
 
 
 async def _wait_for_refresher_stop(task: asyncio.Task[None], name: str) -> None:
@@ -290,9 +565,26 @@ async def _stop_refreshers(refreshers: list[tuple[asyncio.Task[None], str]]) -> 
             _log_refresher_stop(task, name)
 
 
-def _create_lifespan(config: GatewayConfig) -> Callable[[FastAPI], Any]:
+async def _run_feature_worker(name: str, worker: Worker, config: GatewayConfig) -> None:
+    """Run one feature worker, reporting a failure when it happens rather than at shutdown.
+
+    The refreshers above loop and catch their own errors; a feature worker is
+    another feature's code and may not. This is the top of the task, so the
+    error is handled here once: nothing awaits the task before shutdown, and
+    re-raising would only have the supervisor log the same death again then.
+    """
+    try:
+        await worker(config)
+    except Exception:
+        logger.exception("%s worker stopped with an unexpected error and will not run again", name)
+
+
+def _create_lifespan() -> Callable[[FastAPI], Any]:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+        # From the app, not a closure: app.state.config is what get_config hands
+        # every request, so startup reads the same object.
+        config: GatewayConfig = app.state.config
         configure_default_pricing(config.default_pricing)
         # Bound method, not a snapshot: it reads config.providers on every call, so
         # a provider added or re-typed in the dashboard is priced under the
@@ -301,15 +593,8 @@ def _create_lifespan(config: GatewayConfig) -> Callable[[FastAPI], Any]:
         # ``openai``, which names a wire protocol rather than a vendor.
         configure_provider_types(config.provider_pricing_implementation)
         log_writer: LogWriter
-        alias_refresher: asyncio.Task[None] | None = None
-        policy_refresher: asyncio.Task[None] | None = None
-        provider_refresher: asyncio.Task[None] | None = None
-        org_provider_refresher: asyncio.Task[None] | None = None
-        search_tool_refresher: asyncio.Task[None] | None = None
-        price_refresher: asyncio.Task[None] | None = None
-        discovery_refresher: asyncio.Task[None] | None = None
-        catalog_refresher: asyncio.Task[None] | None = None
-        reservation_sweeper: asyncio.Task[None] | None = None
+        workers: list[tuple[asyncio.Task[None], _LifespanWorker]] = []
+        feature_workers: list[tuple[asyncio.Task[None], str]] = []
         if config.is_hybrid_mode:
             log_writer = NoopLogWriter()
         else:
@@ -318,6 +603,10 @@ def _create_lifespan(config: GatewayConfig) -> Callable[[FastAPI], Any]:
                 # Persisted dashboard overrides win over config/env; apply them
                 # before pricing init so default-pricing behavior is consistent.
                 await apply_overrides_from_db(config, session)
+                # Checked when serving starts rather than when the app is built,
+                # so a tool that only reads the schema needs no pepper, and after
+                # the overrides, so it sees the copy setting this process serves.
+                _validate_provider_account_pepper(config)
                 await load_persisted_price_snapshot(session)
                 # Persisted tool/guardrail overrides (service URLs + web-search
                 # knobs) win over config/env too; apply them so the running worker
@@ -327,13 +616,15 @@ def _create_lifespan(config: GatewayConfig) -> Callable[[FastAPI], Any]:
                 # so a tool added through the dashboard is one the backend-URL
                 # warning and the flat-pricing warning can see.
                 await load_search_tools_at_startup(session, config)
+                # Before the first request, so a stored rule never lets a burst through at boot.
+                await load_rate_limit_rules_at_startup(config)
                 # After the overrides, not at config load: the web-search URL a
                 # searxng search tool inherits can be the dashboard-stored one
                 # applied just above, and that tool is only broken if nothing
                 # supplied it at all.
                 if missing_backend_url := config.search_tools_without_backend_url():
                     logger.warning(
-                        "No backend URL for search tool(s): %s. POST /v1/search refuses them with a 400 until "
+                        "No backend URL for search tool(s): %s. POST /api/v1/search refuses them with a 400 until "
                         "each declares an 'api_base' or a web-search URL is set (web_search_url, "
                         "OTARI_WEB_SEARCH_URL, or the dashboard's Tools page).",
                         ", ".join(sorted(missing_backend_url)),
@@ -356,7 +647,7 @@ def _create_lifespan(config: GatewayConfig) -> Callable[[FastAPI], Any]:
                 # a fresh database (no workspace or key exists yet), the same
                 # posture load_providers_at_startup takes.
                 await load_org_provider_keys_at_startup(session)
-                await bootstrap_first_api_key(config, session)
+                await bootstrap_first_api_key(config, session, app.state.container.resolve(ApiKeyFormatPort, session))
                 await initialize_pricing_from_config(config, session)
                 await warn_if_require_pricing_without_pricing(config, session)
                 await warn_if_search_tools_lack_flat_pricing(config, session)
@@ -364,65 +655,30 @@ def _create_lifespan(config: GatewayConfig) -> Callable[[FastAPI], Any]:
                 await warn_if_router_candidates_lack_pricing(config, session)
                 await load_aliases_at_startup(session)
                 await load_policies_at_startup(session)
+            # After the session above and not inside it: the runner reads through
+            # a repository, which reaches the database only through a Unit of
+            # Work of its own. It builds each stored definition into a vendor
+            # client here so the first request to need one does not wait for a
+            # vendor handshake.
+            await load_guardrail_runner_at_startup()
             log_writer = create_log_writer(config.log_writer_strategy)
-            app.state.file_store = build_file_store(config)
-            # Alias resolution is synchronous and reads a cache, so something has
-            # to reload it. A write refreshes its own worker; this is what makes
-            # every other worker and replica catch up.
-            alias_refresher = asyncio.create_task(run_alias_refresher())
-            # Routing policies are the same shape as aliases: resolution reads a
-            # process cache synchronously, so it is reloaded on a TTL to converge
-            # sibling workers and replicas after a write.
-            policy_refresher = asyncio.create_task(run_policy_refresher())
-            # Provider credentials are the same shape: resolution reads
-            # config.providers synchronously, so the overlay is reloaded on a TTL
-            # to converge sibling workers and replicas after a dashboard write.
-            provider_refresher = asyncio.create_task(run_provider_refresher(config))
-            # Organization-scoped provider keys are the same shape, keyed by
-            # (workspace_id, provider) instead of instance name; see
-            # `services/tenancy/org_provider_key_service.py`'s module docstring.
-            org_provider_refresher = asyncio.create_task(run_org_provider_refresher())
-            # Search tools are the provider overlay's twin: resolve_search_tool
-            # reads config.search_tools synchronously, so the overlay is reloaded
-            # on a TTL to converge sibling workers and replicas after a write.
-            search_tool_refresher = asyncio.create_task(run_search_tool_refresher(config))
-            # An accepted pricing snapshot is applied in-memory by the worker that
-            # served the confirm; reload it on a TTL so sibling workers and replicas
-            # converge, the same way aliases and provider credentials do.
-            price_refresher = asyncio.create_task(run_price_snapshot_refresher())
-            # Discovery is the one cache that used to be filled on the request
-            # path, which put model_discovery_timeout_seconds (10s per
-            # unreachable provider) on a dashboard page load and held that
-            # request's database session open for the whole dial. The refresher
-            # owns the dialing now and reads answer from the cache. Not awaited:
-            # priming runs on its first tick so a slow provider cannot delay boot.
-            #
-            # Started unconditionally, and each loop re-checks whether caching is
-            # on. Gating task creation on the setting here would strand the
-            # gateway in the one state that combination must never reach:
-            # model_cache_ttl_seconds and models_dev_cache_ttl_seconds are both
-            # runtime-settable from the dashboard's Settings page, and raising
-            # either from 0 flips every read onto the serve-from-cache path
-            # immediately. With no refresher running, that cache is then filled
-            # once per provider and never refreshed again for the life of the
-            # worker, which is the "cache nothing refreshes" mode these knobs
-            # deliberately do not offer.
-            discovery_refresher = asyncio.create_task(run_discovery_refresher(config))
-            # Same shape for the models.dev catalog, whose fetch is bounded at 15s.
-            catalog_refresher = asyncio.create_task(run_catalog_refresher(config))
-            # Not a cache refresher like the rest: this one returns leaked budget
-            # holds. The per-user reclaim on the reserve path only runs when that
-            # user next reserves, so a user whose single request leaked would hold
-            # against their budget with nothing ever releasing it.
-            # Standalone only, because hybrid mode reserves nothing locally.
-            if config.budget_reservation_sweep_interval_sec > 0:
-                reservation_sweeper = asyncio.create_task(
-                    run_reservation_sweeper(
-                        config.budget_reservation_sweep_interval_sec,
-                        batch_size=config.budget_reservation_sweep_batch,
-                        retention_sec=config.budget_reservation_retention_sec,
-                    )
+            container: Container = app.state.container
+            # The retention sweep below resolves this same port, so both it and
+            # the request path use whatever store this build bound.
+            app.state.file_store = container.resolve(FileStoragePort, None)
+            app.state.provider_files = container.resolve(ProviderFilePort, None)
+            workers = _start_lifespan_workers(config, container)
+            # Workers of the enabled features. Same supervisor as the registry
+            # above: created here, cancelled together in ``finally`` under one
+            # shared bound.
+            feature_workers = [
+                (
+                    asyncio.create_task(_run_feature_worker(feature.name, feature.worker, config)),
+                    f"{feature.name} worker",
                 )
+                for feature in app.state.enabled_features
+                if feature.worker is not None
+            ]
 
         # Start the writer inside the try so a failure here still runs the cleanup
         # below; the refresher tasks are already created and would otherwise leak.
@@ -433,39 +689,25 @@ def _create_lifespan(config: GatewayConfig) -> Callable[[FastAPI], Any]:
             app.state.log_writer = log_writer
             yield
         finally:
-            refreshers = [
-                (alias_refresher, "alias"),
-                (policy_refresher, "policy"),
-                (provider_refresher, "provider"),
-                (org_provider_refresher, "organization provider key"),
-                (search_tool_refresher, "search tool"),
-                (price_refresher, "price snapshot"),
-                (discovery_refresher, "model discovery"),
-                (catalog_refresher, "models.dev catalog"),
-                (reservation_sweeper, "budget reservation sweep"),
-            ]
-            await _stop_refreshers([(task, name) for task, name in refreshers if task is not None])
-            if alias_refresher is not None:
-                reset_alias_cache()
-            if policy_refresher is not None:
-                reset_policy_cache()
-            if provider_refresher is not None:
-                reset_provider_cache()
-            if org_provider_refresher is not None:
-                reset_org_provider_cache()
-            if search_tool_refresher is not None:
-                reset_search_tool_cache()
-            if discovery_refresher is not None:
-                reset_discovery_cache()
-            if catalog_refresher is not None:
-                clear_catalog_cache()
+            await _stop_refreshers([(task, f"{worker.name} refresher") for task, worker in workers] + feature_workers)
+            for _task, worker in workers:
+                if worker.reset is not None:
+                    worker.reset()
             # Only stop a writer that actually started; if start() raised there is
             # nothing to stop, but the refreshers above still needed cancelling.
             if log_writer_started:
                 await log_writer.stop()
-            # POST /v1/search dispatches on one pooled client for the process, so
-            # shutdown owns closing it. A no-op when no search was ever served.
+            # POST /api/v1/search and /api/v1/decisions each dispatch on one pooled
+            # client for the process, so shutdown owns closing them. Each is a no-op
+            # when that endpoint was never served.
             await close_search_client()
+            await close_decision_client()
+            rate_limit_store: RateLimitStorePort | None = getattr(app.state, "rate_limit_store", None)
+            if rate_limit_store is not None:
+                await rate_limit_store.aclose()
+            # After the log writer, whose final flush is the last thing to need
+            # a session. Hybrid mode never opened an engine, so this is a no-op there.
+            await dispose_db()
 
     return lifespan
 
@@ -473,10 +715,10 @@ def _create_lifespan(config: GatewayConfig) -> Callable[[FastAPI], Any]:
 async def _tenancy_error_handler(_: Request, exc: Exception) -> Response:
     """Render a tenancy domain error as the status it carries.
 
-    One handler for the whole family, so a rehomed service keeps raising domain
-    errors and no tenancy route needs a try/except (see
-    `gateway.services.tenancy.errors`). The body matches FastAPI's own
-    ``HTTPException`` shape, so a client cannot tell which layer answered.
+    One handler for the whole family, so a service keeps raising domain errors
+    and no route needs a try/except (see `gateway.exceptions`). The body matches
+    FastAPI's own ``HTTPException`` shape, so a client cannot tell which layer
+    answered.
 
     A 4xx message is written for the caller and is rendered as it is. A 5xx one
     is not: it describes the deployment rather than the request, and
@@ -497,11 +739,28 @@ async def _tenancy_error_handler(_: Request, exc: Exception) -> Response:
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
 
+async def _control_plane_error_handler(_: Request, exc: Exception) -> Response:
+    """Render a control plane failure as the answer the caller has always had.
+
+    Registered ahead of the tenancy family it belongs to, which would replace a
+    502 body with the generic internal-error detail and drop a rate limit's
+    ``Retry-After``. Both are part of this deployment's published contract with
+    a caller, so a peer's refusal reaches them whole.
+    """
+    if not isinstance(exc, ControlPlaneError):  # pragma: no cover - registered for ControlPlaneError only
+        raise exc
+    if exc.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+        logger.error("Control plane request failed: %s", exc.message)
+    retry_after = getattr(exc, "retry_after", None)
+    headers = {"Retry-After": retry_after} if retry_after else None
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message}, headers=headers)
+
+
 async def _validation_error_handler(_: Request, exc: Exception) -> Response:
     """Render a request-validation failure without echoing what was sent.
 
     Pydantic v2 puts the rejected value on every error entry, and FastAPI's
-    default handler serializes it straight back. On ``POST /v1/auth/session``
+    default handler serializes it straight back. On ``POST /api/v1/auth/session``
     that value is the credential: a password longer than the field's ceiling
     comes back in full, and a body carrying both credentials comes back with the
     master key in it. The dashboard renders the whole ``detail`` into its error
@@ -533,6 +792,8 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     _validate_platform_config(config)
     _warn_if_hosted_has_no_data_plane(config)
+    _validate_metrics_support(config)
+    _validate_rate_limit_store(config)
     # A set-but-invalid OTARI_SECRET_KEY must not silently pass startup and then
     # break provider-credential storage at request time. Fail fast here instead.
     validate_secret_key()
@@ -542,10 +803,12 @@ def create_app(config: GatewayConfig) -> FastAPI:
         title="otari",
         description="Otari, an OpenAI-compatible LLM gateway with API key management",
         version=__version__,
-        docs_url="/docs" if config.enable_docs else None,
-        redoc_url="/redoc" if config.enable_docs else None,
-        openapi_url="/openapi.json" if config.enable_docs else None,
-        lifespan=_create_lifespan(config),
+        docs_url=f"{API_ROOT}/docs" if config.enable_docs else None,
+        redoc_url=f"{API_ROOT}/redoc" if config.enable_docs else None,
+        openapi_url=f"{API_ROOT}/openapi.json" if config.enable_docs else None,
+        swagger_ui_oauth2_redirect_url=f"{API_ROOT}/docs/oauth2-redirect",
+        generate_unique_id_function=_operation_id,
+        lifespan=_create_lifespan(),
     )
 
     def custom_openapi() -> dict[str, Any]:
@@ -589,7 +852,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
         }
 
         for path, path_item in openapi_schema.get("paths", {}).items():
-            if path in _UNAUTHENTICATED_PATHS or path.startswith(_PUBLIC_PREFIXES + _COOKIE_AUTH_PREFIXES):
+            if path in _UNAUTHENTICATED_PATHS or _under(path, _PUBLIC_PREFIXES + _COOKIE_AUTH_PREFIXES):
                 continue
             requirement: list[dict[str, list[str]]] = (
                 [{"GatewayTokenAuth": []}]
@@ -619,7 +882,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
             query the provider appended.
 
             It holds no credential and decides nothing: the code in that query
-            is spent by ``POST /v1/auth/oauth/{provider}/callback``, which the
+            is spent by ``POST /api/v1/auth/oauth/{provider}/callback``, which the
             page reaches only after checking the state against the value the
             browser stored. 303 rather than 307, so a browser that followed a
             POST here would not repeat it against a page.
@@ -629,13 +892,13 @@ def create_app(config: GatewayConfig) -> FastAPI:
             landing on the dashboard's own "that did not work" panel beats a
             bare 404 from a path they never typed.
 
-            The target is built from ``public_base_url`` rather than as a
-            root-absolute path, so a gateway served under a path prefix
-            (``https://example.com/otari``) sends the browser to its own
-            dashboard rather than to the origin's root.
+            The target is built from ``effective_ui_base_url`` rather than as
+            a root-absolute path, so a deployment whose dashboard sits under a
+            path prefix (``https://example.com/otari``) sends the browser there
+            rather than to the origin's root.
             """
             return RedirectResponse(
-                url=callback_landing_target(config, provider, request.url.query),
+                url=callback_landing_target(request.app.state.config, provider, request.url.query),
                 status_code=status.HTTP_303_SEE_OTHER,
             )
 
@@ -652,7 +915,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
         )
 
     # The same bundle is the root in both modes, because the mode is not this
-    # process's decision to make in the filesystem: the page reads /v1/bootstrap
+    # process's decision to make in the filesystem: the page reads /api/v1/bootstrap
     # and renders either the management shell (standalone) or the data-plane
     # landing page (hybrid), which is what keeps "which surfaces exist here" in
     # one answer rather than two. A hybrid gateway still hosts no management API;
@@ -671,9 +934,8 @@ def create_app(config: GatewayConfig) -> FastAPI:
         # the PNG icons it points at (index.html links them from /pwa/). Only the
         # standalone dashboard is an app worth installing: a hybrid gateway's root
         # is a status page for a control plane that lives elsewhere, and an
-        # installed icon named "Otari Dashboard" would promise the wrong thing. The
-        # index still links the manifest there, which 404s and simply means no
-        # browser offers the install.
+        # installed icon named "Otari" would promise the wrong thing. The index still
+        # links the manifest there, which 404s and means no browser offers the install.
         pwa_dir = dashboard_dir / "pwa"
         if pwa_dir.is_dir() and not config.is_hybrid_mode:
             app.mount("/pwa", StaticFiles(directory=pwa_dir), name="dashboard-pwa")
@@ -716,7 +978,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
         async def root_index() -> str:
             return ROOT_TUTORIAL_HTML
 
+    # Middleware stack is registered in reverse order (last-added runs first)
     app.add_middleware(SecurityHeadersMiddleware)
+    if config.accept_incoming_trace_context:
+        app.add_middleware(TraceContextPropagationMiddleware)
 
     if config.cors_allow_origins:
         allow_credentials = "*" not in config.cors_allow_origins
@@ -739,34 +1004,43 @@ def create_app(config: GatewayConfig) -> FastAPI:
     # an entry never outlives its response (see gateway.inflight).
     app.state.inflight = InFlightRegistry()
     app.add_middleware(InFlightMiddleware, registry=app.state.inflight)
+    if not config.is_hybrid_mode:
+        app.add_middleware(RateLimitGrantMiddleware)
 
     if config.enable_metrics:
         from gateway.metrics import MetricsMiddleware
 
         app.add_middleware(MetricsMiddleware)
 
-    if config.rate_limit_rpm is not None:
-        app.state.rate_limiter = RateLimiter(config.rate_limit_rpm)
-    else:
-        app.state.rate_limiter = None
-
     if config.dashboard_login_rate_limit_per_minute is not None:
         app.state.login_rate_limiter = RateLimiter(config.dashboard_login_rate_limit_per_minute)
     else:
         app.state.login_rate_limiter = None
 
+    app.state.feedback_rate_limiter = new_feedback_rate_limiter() if config.feedback_enabled else None
+
+    if config.public_catalog_rate_limit_per_minute is not None:
+        app.state.public_catalog_rate_limiter = RateLimiter(config.public_catalog_rate_limit_per_minute)
+    else:
+        app.state.public_catalog_rate_limiter = None
+
     app.state.config = config
     app.state.gateway_mode = config.effective_mode
+    # Asked once, so the routers, the workers and the published surfaces cannot
+    # disagree when a setting changes after this point.
+    app.state.enabled_features = tuple(feature for feature in features.CORE_FEATURES if feature.enabled(config))
 
     # The composition root, built before the routers because a bootstrap may
     # contribute some of them. Per app rather than module-global, for the same
     # reason config is: two apps in one process must not share one. A bootstrap
     # that cannot be loaded raises here, so a deployment that named one and got
     # it wrong fails to start instead of quietly running the plain build.
-    app.state.container = build_container(config.bootstrap)
+    app.state.container = build_container(config.bootstrap, config=config)
+    install_rate_limits(app, config)
 
     register_routers(app, config)
     app.add_exception_handler(TenancyError, _tenancy_error_handler)
+    app.add_exception_handler(ControlPlaneError, _control_plane_error_handler)
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
 
     if config.enable_metrics:

@@ -1,9 +1,9 @@
 """The organization-scoped routing-policy read sees the caller's own workspaces and no more.
 
-``/v1/routing/policies`` is deployment-wide and operator-only, and stays that
+``/api/v1/routing/policies`` is deployment-wide and operator-only, and stays that
 way: its ``workspace_id`` parameter is a filter the client supplies, so nothing
 but the operator gate stands between a signed-in member and another
-organization's routing. ``/v1/organizations/me/routing-policies`` is the
+organization's routing. ``/api/v1/organizations/me/routing-policies`` is the
 tenant's View half of it (otari-ai#1942), shaped like the usage scope
 (otari#837), and this suite is that file's shape over the ``routing_policies``
 table: two organizations with policies in both, and every assertion names the
@@ -24,11 +24,12 @@ from fastapi import status
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from gateway.models.entities import DashboardSession, RoutingPolicy
-from gateway.models.tenancy import Organization, OrganizationMember, User, Workspace, WorkspaceMember
+from gateway.core.config import API_ROOT
+from gateway.models.routing import RoutingPolicy
+from gateway.models.tenancy import DashboardSession, Organization, OrganizationMember, User, Workspace, WorkspaceMember
 from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME, hash_session_token
 
-_SCOPED_PATH = "/v1/organizations/me/routing-policies"
+_SCOPED_PATH = f"{API_ROOT}/organizations/me/routing-policies"
 
 
 @dataclass
@@ -119,7 +120,7 @@ def world(client: TestClient, master_key_header: dict[str, str], db_session_fact
     """Two tenants with stored policies in both, and the identities that read them."""
     # One master-key call provisions the tenancy root, so the organizations built
     # below sit beside a real default rather than replacing it.
-    assert client.get("/v1/organizations/me", headers=master_key_header).status_code == status.HTTP_200_OK
+    assert client.get(f"{API_ROOT}/organizations/me", headers=master_key_header).status_code == status.HTTP_200_OK
 
     session = db_session_factory()
     try:
@@ -173,24 +174,25 @@ def world(client: TestClient, master_key_header: dict[str, str], db_session_fact
         session.close()
 
 
-def _as(client: TestClient, world: _World, who: str) -> tuple[int, object]:
+def _as(client: TestClient, world: _World, who: str, *, workspace_id: uuid.UUID | None = None) -> tuple[int, object]:
     client.cookies.set(SESSION_COOKIE_NAME, world.sessions[who])
     try:
-        response = client.get(_SCOPED_PATH)
+        params = {} if workspace_id is None else {"workspace_id": str(workspace_id)}
+        response = client.get(_SCOPED_PATH, params=params)
         body = response.json() if response.headers.get("content-type", "").startswith("application/json") else None
         return response.status_code, body
     finally:
         client.cookies.clear()
 
 
-def _stored_names(client: TestClient, world: _World, who: str) -> set[str]:
+def _stored_names(client: TestClient, world: _World, who: str, *, workspace_id: uuid.UUID | None = None) -> set[str]:
     """The stored policy names this caller is shown.
 
     Filtered to ``source == "stored"`` so a config-file policy the test
     deployment happens to define cannot pad or break an assertion: config
     policies are deployment-wide by design and outside what this suite pins.
     """
-    code, body = _as(client, world, who)
+    code, body = _as(client, world, who, workspace_id=workspace_id)
     assert code == status.HTTP_200_OK, body
     assert isinstance(body, list)
     return {row["name"] for row in body if row["source"] == "stored"}
@@ -218,9 +220,7 @@ def test_a_member_reads_only_the_workspaces_they_belong_to(client: TestClient, w
     assert listed.isdisjoint(_BETA_POLICIES)
 
 
-def test_a_member_of_no_workspace_reads_no_stored_rows_rather_than_a_refusal(
-    client: TestClient, world: _World
-) -> None:
+def test_a_member_of_no_workspace_reads_no_stored_rows_rather_than_a_refusal(client: TestClient, world: _World) -> None:
     """Nothing was refused; no stored policy is theirs to see yet."""
     code, body = _as(client, world, "alpha_newcomer")
     assert code == status.HTTP_200_OK, body
@@ -228,10 +228,55 @@ def test_a_member_of_no_workspace_reads_no_stored_rows_rather_than_a_refusal(
 
 
 def test_a_superuser_reads_their_active_organization_and_not_every_tenant(client: TestClient, world: _World) -> None:
-    """This route is scoped even for an operator; ``/v1/routing/policies`` is where they read across tenants."""
+    """This route is scoped even for an operator; ``/api/v1/routing/policies`` is where they read across tenants."""
     listed = _stored_names(client, world, "superuser")
     assert listed == set(_BETA_POLICIES)
     assert listed.isdisjoint(_ALPHA_ONE_POLICIES)
+
+
+def test_workspace_id_narrows_the_read_to_that_one_workspace(client: TestClient, world: _World) -> None:
+    """The dashboard's Routing page reads one workspace at a time (otari-ai#2087).
+
+    ``alpha_owner`` sees both of their workspaces unfiltered, so naming one is
+    the only thing that can be responsible for the other's rows going away.
+    """
+    listed = _stored_names(client, world, "alpha_owner", workspace_id=world.workspaces["alpha_one"])
+    assert listed == set(_ALPHA_ONE_POLICIES)
+    assert listed.isdisjoint(_ALPHA_TWO_POLICIES)
+
+
+def test_config_policies_survive_a_workspace_filter(client: TestClient, world: _World) -> None:
+    """They have no workspace: they are deployment-wide and resolve in every one."""
+    code, body = _as(client, world, "alpha_owner", workspace_id=world.workspaces["alpha_one"])
+    assert code == status.HTTP_200_OK, body
+    assert isinstance(body, list)
+    unfiltered = _as(client, world, "alpha_owner")[1]
+    assert isinstance(unfiltered, list)
+    assert {row["name"] for row in body if row["source"] == "config"} == {
+        row["name"] for row in unfiltered if row["source"] == "config"
+    }
+
+
+def test_another_tenants_workspace_id_lists_nothing_rather_than_reporting_itself(
+    client: TestClient, world: _World
+) -> None:
+    """A filter narrows the derived scope and never widens it.
+
+    Answered as an empty list rather than a refusal, matching the member key
+    list: a 403 or a 404 would differ between a workspace that exists elsewhere
+    and one that exists nowhere, which is an existence oracle across tenants.
+    """
+    code, body = _as(client, world, "alpha_owner", workspace_id=world.workspaces["beta_one"])
+    assert code == status.HTTP_200_OK, body
+    assert isinstance(body, list)
+    assert {row["name"] for row in body if row["source"] == "stored"} == set()
+
+
+def test_a_member_cannot_reach_a_workspace_of_their_own_organization_they_left_out(
+    client: TestClient, world: _World
+) -> None:
+    """``alpha_member`` belongs to Alpha one only, and naming Alpha two does not change that."""
+    assert _stored_names(client, world, "alpha_member", workspace_id=world.workspaces["alpha_two"]) == set()
 
 
 def test_an_active_organization_pointer_with_no_membership_behind_it_reads_nothing(
@@ -246,7 +291,7 @@ def test_the_deployment_wide_route_still_refuses_a_tenant(client: TestClient, wo
     """The control: this route exists so that gate does not have to loosen."""
     client.cookies.set(SESSION_COOKIE_NAME, world.sessions["alpha_owner"])
     try:
-        refused = client.get("/v1/routing/policies")
+        refused = client.get(f"{API_ROOT}/routing/policies")
         assert refused.status_code == status.HTTP_403_FORBIDDEN, refused.text
     finally:
         client.cookies.clear()

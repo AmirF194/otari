@@ -7,7 +7,8 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from gateway.core.config import API_KEY_HEADER, GatewayConfig
+from gateway.auth.models import API_KEY_PREFIX, MIN_API_KEY_LENGTH
+from gateway.core.config import API_KEY_HEADER, API_ROOT, GatewayConfig
 from gateway.metrics import REGISTRY
 
 from .conftest import build_test_client
@@ -57,7 +58,7 @@ def metrics_rate_limit_client(postgres_url: str) -> Generator[TestClient]:
 
 def _create_user(client: TestClient, user_id: str = "metrics-test-user") -> str:
     header = {API_KEY_HEADER: "Bearer test-master-key"}
-    resp = client.post("/v1/users", json={"user_id": user_id, "alias": "Metrics"}, headers=header)
+    resp = client.post(f"{API_ROOT}/users", json={"user_id": user_id, "alias": "Metrics"}, headers=header)
     assert resp.status_code == 200
     result: str = resp.json()["user_id"]
     return result
@@ -66,7 +67,7 @@ def _create_user(client: TestClient, user_id: str = "metrics-test-user") -> str:
 def _chat_request(client: TestClient, user_id: str) -> Any:
     header = {API_KEY_HEADER: "Bearer test-master-key"}
     return client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "openai:gpt-4o-mini",
             "messages": [{"role": "user", "content": "hi"}],
@@ -91,20 +92,20 @@ def test_metrics_endpoint_not_available_when_disabled(no_metrics_client: TestCli
 
 
 def test_request_counter_increments_on_health_check(metrics_client: TestClient) -> None:
-    labels = {"method": "GET", "endpoint": "/health", "status": "200"}
+    labels = {"method": "GET", "endpoint": "/health", "api_version": "v1", "status": "200"}
     before = _sample("gateway_requests_total", labels)
 
-    metrics_client.get("/health")
+    metrics_client.get(f"{API_ROOT}/health")
 
     after = _sample("gateway_requests_total", labels)
     assert after - before == 1.0
 
 
 def test_request_duration_recorded(metrics_client: TestClient) -> None:
-    labels = {"method": "GET", "endpoint": "/health"}
+    labels = {"method": "GET", "endpoint": "/health", "api_version": "v1"}
     before = _sample("gateway_request_duration_seconds_count", labels)
 
-    metrics_client.get("/health")
+    metrics_client.get(f"{API_ROOT}/health")
 
     after = _sample("gateway_request_duration_seconds_count", labels)
     assert after - before == 1.0
@@ -164,7 +165,7 @@ def test_cost_metric_recorded_with_pricing(metrics_client: TestClient) -> None:
     # Set up pricing
     header = {API_KEY_HEADER: "Bearer test-master-key"}
     metrics_client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "openai:gpt-4o-mini",
             "input_price_per_million": 1.0,
@@ -229,7 +230,7 @@ def test_budget_exceeded_metric(metrics_client: TestClient) -> None:
 
     # Create budget with 0 limit
     budget_resp = metrics_client.post(
-        "/v1/budgets",
+        f"{API_ROOT}/budgets",
         json={"max_budget": 0.0},
         headers=header,
     )
@@ -238,7 +239,7 @@ def test_budget_exceeded_metric(metrics_client: TestClient) -> None:
 
     # Create user with that budget
     user_resp = metrics_client.post(
-        "/v1/users",
+        f"{API_ROOT}/users",
         json={"user_id": "budget-user", "alias": "Budget", "budget_id": budget_id},
         headers=header,
     )
@@ -257,7 +258,7 @@ def test_auth_failure_metric_missing_credentials(metrics_client: TestClient) -> 
     before = _sample("gateway_auth_failures_total", labels)
 
     resp = metrics_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "openai:gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 401
@@ -266,13 +267,13 @@ def test_auth_failure_metric_missing_credentials(metrics_client: TestClient) -> 
 
 
 def test_auth_failure_metric_invalid_key(metrics_client: TestClient) -> None:
-    # Use a valid-format key (gw- prefix, 50+ chars) that doesn't exist in the DB
-    fake_key = "gw-" + "a" * 48
+    # Use a valid-format key that doesn't exist in the DB
+    fake_key = API_KEY_PREFIX + "a" * MIN_API_KEY_LENGTH
     labels = {"reason": "invalid_key"}
     before = _sample("gateway_auth_failures_total", labels)
 
     resp = metrics_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "openai:gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
         headers={API_KEY_HEADER: f"Bearer {fake_key}"},
     )
@@ -283,7 +284,7 @@ def test_auth_failure_metric_invalid_key(metrics_client: TestClient) -> None:
 
 def test_metrics_not_self_instrumented(metrics_client: TestClient) -> None:
     """The /metrics endpoint should not increment request counters for itself."""
-    labels = {"method": "GET", "endpoint": "/metrics", "status": "200"}
+    labels = {"method": "GET", "endpoint": "/metrics", "api_version": "", "status": "200"}
     before = _sample("gateway_requests_total", labels)
 
     metrics_client.get("/metrics")
@@ -294,11 +295,11 @@ def test_metrics_not_self_instrumented(metrics_client: TestClient) -> None:
 
 
 def test_request_counter_tracks_error_status(metrics_client: TestClient) -> None:
-    labels = {"method": "POST", "endpoint": "/v1/chat/completions", "status": "401"}
+    labels = {"method": "POST", "endpoint": "/chat/completions", "api_version": "v1", "status": "401"}
     before = _sample("gateway_requests_total", labels)
 
     metrics_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "openai:gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
     )
 

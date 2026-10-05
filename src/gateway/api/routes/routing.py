@@ -6,7 +6,7 @@ request, what is tried after a retryable failure, and which guardrails always ru
 in a file this process does not own); these routes manage the ``routing_policies``
 table, which means the same thing to a request but can change without a restart.
 
-Scoping matches ``/v1/aliases``: a stored policy belongs to one workspace and,
+Scoping matches ``/api/v1/aliases``: a stored policy belongs to one workspace and,
 within it, is either workspace-wide (``user_id`` omitted) or scoped to one user,
 who is then the only caller that resolves it. Omitting ``workspace_id`` means the
 deployment's default workspace, so a single-workspace deployment never names one.
@@ -29,9 +29,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gateway.api.deps import get_config, get_db, require_deployment_operator
 from gateway.api.routes._helpers import resolve_managed_workspace_id
 from gateway.core.config import GatewayConfig
+from gateway.core.surface import Surface
 from gateway.log_config import logger
-from gateway.models.entities import RoutingPolicy
-from gateway.models.routing import PolicySpec
+from gateway.models.routing import PolicySpec, RoutingPolicy
 from gateway.repositories.users_repository import get_active_user
 from gateway.services.alias_service import all_alias_names
 from gateway.services.policy_store import (
@@ -49,10 +49,12 @@ from gateway.services.routing.decide import explain_router_ordering
 from gateway.services.routing.knn import unpriced_router_candidates
 
 router = APIRouter(
-    prefix="/v1/routing/policies",
+    prefix="/routing/policies",
     tags=["routing"],
     dependencies=[Depends(require_deployment_operator)],
 )
+
+SURFACE = Surface("routing")
 
 
 class PolicyRequest(BaseModel):
@@ -306,16 +308,14 @@ async def _validate_router_pricing(
     """
     if not backend_requires_pricing(spec.router_backend):
         return
-    missing = await unpriced_router_candidates(
-        config, db, spec.router_candidates, workspace_id=workspace_id
-    )
+    missing = await unpriced_router_candidates(config, db, spec.router_candidates, workspace_id=workspace_id)
     if missing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 f"Router candidate(s) {', '.join(missing)} have no pricing. A router scores candidates by "
                 "cost, so it would decline every request and this policy would always serve "
-                f"'{spec.default_target}'. Add pricing for those models (POST /v1/pricing) first."
+                f"'{spec.default_target}'. Add pricing for those models (POST /api/v1/pricing) first."
             ),
         )
 
@@ -524,17 +524,11 @@ async def upsert_policy_in_workspace(
         # covers the user foreign key, and reporting a deleted user as a name clash
         # would send the operator after the wrong thing.
         if await _name_is_taken(db, request.name, request.user_id, workspace_id):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail=_name_taken_detail(request.name)
-            ) from None
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error"
-        ) from None
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_name_taken_detail(request.name)) from None
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error") from None
     except SQLAlchemyError:
         await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error"
-        ) from None
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error") from None
     await db.refresh(policy)
     # An operator changing where traffic goes is worth a line in the log: this is the
     # object that decides which model spends money.
@@ -610,9 +604,7 @@ async def delete_policy_in_workspace(
         await db.commit()
     except SQLAlchemyError:
         await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error"
-        ) from None
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error") from None
     await _refresh_quietly(db, name)
 
 
@@ -674,9 +666,7 @@ async def explain_policy(
         name = request.name
         resolved = resolve_effective_policy(config, name, request.user_id, workspace_id=request.workspace_id)
         if resolved is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail=f"Routing policy '{name}' not found"
-            )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Routing policy '{name}' not found")
         spec = resolved
 
     # A weighted policy's ordering is computable here: it needs no prompt, no
@@ -697,9 +687,7 @@ async def explain_policy(
             user_id=request.user_id,
             key_id=request.key_id,
             allowlist=request.allowed_models,
-            budget=BudgetState(
-                used_pct=request.budget_used_pct, remaining_usd=request.budget_remaining_usd
-            ),
+            budget=BudgetState(used_pct=request.budget_used_pct, remaining_usd=request.budget_remaining_usd),
             router_ordering=weighted_ordering,
             workspace_id=request.workspace_id,
         )
@@ -712,8 +700,7 @@ async def explain_policy(
             router_candidates=spec.router_candidates,
             candidates=[],
             dropped=[
-                DroppedResponse(selector=item.selector, reason=item.reason, detail=item.detail)
-                for item in exc.dropped
+                DroppedResponse(selector=item.selector, reason=item.reason, detail=item.detail) for item in exc.dropped
             ],
             guardrails=[],
         )
@@ -736,8 +723,7 @@ async def explain_policy(
             for attempt in plan.attempts
         ],
         dropped=[
-            DroppedResponse(selector=item.selector, reason=item.reason, detail=item.detail)
-            for item in plan.dropped
+            DroppedResponse(selector=item.selector, reason=item.reason, detail=item.detail) for item in plan.dropped
         ],
         guardrails=[guardrail.model_dump(mode="json", exclude_none=True) for guardrail in plan.guardrails],
     )

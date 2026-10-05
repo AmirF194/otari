@@ -1,8 +1,8 @@
-import { Button } from "@heroui/react"
 import { useState } from "react"
-
+import { Button } from "@/design-system/actions/Button"
+import { ErrorBanner } from "@/design-system/feedback/ErrorBanner"
+import { PublicAuthFields } from "@/features/auth/overlayPublicAuthFields"
 import { useResendVerification } from "@/shared/api/auth"
-import { ErrorBanner } from "@/shared/components/feedback/ErrorBanner"
 import { TELEMETRY_EVENTS } from "@/shared/telemetry/events"
 import { useTelemetry } from "@/shared/telemetry/overlayTelemetry"
 
@@ -69,6 +69,10 @@ export function ResendVerificationPage() {
           submit()
         }}
       >
+        <PublicAuthFields
+          page="resend-verification"
+          isBusy={resend.isPending}
+        />
         <AuthEmailField
           value={email}
           onChange={(next) => {

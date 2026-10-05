@@ -16,8 +16,7 @@
 
 import { useMemo } from "react"
 
-import { isDeploymentOperator } from "@/features/organization/roles"
-import { useOrganizationContext } from "@/shared/api/organizations"
+import { useDeploymentOperator } from "@/shared/api/organizations"
 import { useSurfaces } from "@/shared/hooks/useDeployment"
 import { useEntitlements } from "@/shared/hooks/useEntitlements"
 
@@ -37,7 +36,7 @@ export function useNavVisibility(): (item: NavItem) => boolean {
   const isRouteVisible = useRouteVisibility()
   // The caller axis, and it rides on the organization context rather than on a
   // query of its own: `GET /v1/organizations/me` carries `deployment_operator`,
-  // the same answer `/v1/admin/access` gives from the same server-side
+  // the same answer `/admin/access` gives from the same server-side
   // predicate, and the shell reads that context anyway to decide whether to
   // offer the way into the organization rail. So the answer is here when the
   // chrome is, and no row is drawn on the strength of a question still in flight
@@ -46,17 +45,14 @@ export function useNavVisibility(): (item: NavItem) => boolean {
   // read the rest of them ignore.
   //
   // It also needs no deployment gate of its own any more. The request this used
-  // to make had to be withheld from a gateway that does not host `/v1/admin`, so
+  // to make had to be withheld from a gateway that does not host `/admin`, so
   // its 404 could not become a second reading of `surfaces`; this read is not
   // that request, and each operator-only row still declares the surface it
   // needs, which `isRouteVisible` composes below.
-  const organization = useOrganizationContext()
-  // Through `roles.isDeploymentOperator` rather than reading the field, so the
-  // client keeps one spelling of the predicate for the same reason the server
-  // does: it already requires an explicit `true`, so an older gateway that omits
-  // the field reads as not an operator rather than as an answer.
-  const isOperator = isDeploymentOperator(organization.data)
-  const answerUnavailable = organization.isError
+  //
+  // Through `useDeploymentOperator`, the one answer the pages read too, so a row
+  // and the page behind it cannot disagree about a failed read (otari#876).
+  const { answer, isOperator } = useDeploymentOperator()
 
   return useMemo(() => {
     // Both values wait for an explicit yes, so neither kind of row is shown and
@@ -71,12 +67,12 @@ export function useNavVisibility(): (item: NavItem) => boolean {
         return true
       }
       return item.operatorOnly === "unlisted"
-        ? isOperator
-        : isOperator || answerUnavailable
+        ? answer === "operator"
+        : isOperator
     }
 
     return (item: NavItem) => isRouteVisible(item) && allowedByCaller(item)
-  }, [isRouteVisible, isOperator, answerUnavailable])
+  }, [isRouteVisible, answer, isOperator])
 }
 
 /**

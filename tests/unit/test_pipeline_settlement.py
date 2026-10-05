@@ -15,14 +15,19 @@ platform-fallback streaming paths. These tests pin that contract:
 """
 
 import asyncio
+import dataclasses
+import json
+import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from any_llm import LLMProvider
 from any_llm.types.completion import (
@@ -39,9 +44,15 @@ from sqlalchemy.exc import SQLAlchemyError
 
 import gateway.api.routes._pipeline as pipeline
 import gateway.streaming as streaming
+from conftest import InstallControlPlane
+from gateway.adapters.web_search_policy_adapter import RemoteWebSearchPolicy
+from gateway.api.deps import ToolPorts
 from gateway.api.routes import chat, messages, responses
 from gateway.api.routes._pipeline import (
+    DeclaredTools,
+    LoggedUsage,
     RequestContext,
+    ToolBackends,
     ToolContext,
     build_streaming_response,
     log_usage,
@@ -54,10 +65,24 @@ from gateway.api.routes._pipeline import (
 )
 from gateway.api.routes._platform import ResolvedAttempt, ResolvedRoute, SettledCost
 from gateway.core.config import GatewayConfig
-from gateway.models.mcp import McpServerConfig
+from gateway.exceptions.tools_exceptions import (
+    CodeExecutionPolicyResolutionFailure,
+    WebAccessToolNotAuthorizedError,
+    WebSearchNotEnabledError,
+    WebSearchPolicyResolutionFailure,
+    WorkspaceMcpServerNotFoundError,
+)
+from gateway.models.mcp import McpServerConfig, ResolvedMcpServer
+from gateway.models.pricing import ModelPricing, PriceSource
+from gateway.models.tools import ResolvedCodeExecutionPolicy, ResolvedWebSearchConfig, WebTool
+from gateway.models.usage import PRICING_REFERENCE_MAX_LENGTH
+from gateway.ports.code_execution_policy_port import CodeExecutionPolicyScope
+from gateway.ports.mcp_server_port import McpServerPort, McpServerScope
+from gateway.ports.web_search_policy_port import WebSearchPolicyPort, WebSearchPolicyScope
 from gateway.rate_limit import RateLimitInfo
-from gateway.services.budget_service import ReservationHandle
-from gateway.services.tenancy.errors import WorkspaceMcpServerNotFoundError
+from gateway.services.budgets import ReservationHandle
+from gateway.services.pricing_service import ResolvedPricing
+from gateway.services.tool_usage import ToolUsageTally
 
 ADAPTERS = [
     pytest.param(chat._ADAPTER, id="chat"),
@@ -72,8 +97,7 @@ def _tool_ctx(**overrides: Any) -> ToolContext:
         "mcp_server_configs": None,
         "use_sandbox": False,
         "sandbox_tool_entry": None,
-        "sandbox_url": None,
-        "sandbox_auth_token": None,
+        "code_execution_port": None,
         "use_web_search": False,
         "web_search_tool_entry": None,
         "web_search_url": None,
@@ -94,6 +118,59 @@ def _tool_ctx(**overrides: Any) -> ToolContext:
 _ORGANIZATION_ID = uuid.UUID("99999999-9999-9999-9999-999999999999")
 
 
+_ResolveMany = Callable[[McpServerScope, list[uuid.UUID]], Awaitable[list[McpServerConfig]]]
+
+
+async def _resolves_to_nothing(scope: McpServerScope, server_ids: list[uuid.UUID]) -> list[McpServerConfig]:
+    """Resolve to no servers, for a case that is not about stored servers."""
+    return []
+
+
+class _Servers(McpServerPort):
+    """A port whose plural resolve does what a case needs.
+
+    The singular resolve answers that it reaches nothing, which is a real answer
+    rather than a refusal to have one.
+    """
+
+    def __init__(self, resolve_many: _ResolveMany) -> None:
+        self._resolve_many = resolve_many
+
+    async def resolve_many(self, scope: McpServerScope, server_ids: list[uuid.UUID]) -> list[McpServerConfig]:
+        return await self._resolve_many(scope, server_ids)
+
+    async def resolve_one(self, scope: McpServerScope, server_id: uuid.UUID) -> ResolvedMcpServer | None:
+        return None
+
+
+class _Policy(WebSearchPolicyPort):
+    """A port that answers every resolve with ``policy``, and records each scope it was asked about."""
+
+    def __init__(self, policy: ResolvedWebSearchConfig | None = None) -> None:
+        self._policy = policy
+        self.asked: list[WebSearchPolicyScope] = []
+
+    async def resolve(
+        self, scope: WebSearchPolicyScope, requested_tools: Sequence[WebTool]
+    ) -> ResolvedWebSearchConfig | None:
+        self.asked.append(scope)
+        return self._policy
+
+
+def _answer_web_access(install: InstallControlPlane, answer: Any) -> list[dict[str, Any]]:
+    """Answer every control plane call with ``answer``, and record each request."""
+    requests: list[dict[str, Any]] = []
+
+    async def post(
+        *, url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        requests.append({"url": url, "headers": headers, "body": body})
+        return httpx.Response(200, json=answer)
+
+    install(post)
+    return requests
+
+
 def _ctx(
     config: GatewayConfig,
     *,
@@ -103,14 +180,17 @@ def _ctx(
     rate_limit_info: RateLimitInfo | None = None,
     workspace_id: uuid.UUID | None = None,
     organization_id: uuid.UUID | None = _ORGANIZATION_ID,
+    hybrid_mode: bool = False,
+    user_token: str | None = None,
 ) -> RequestContext:
     return RequestContext(
         config=config,
         db=db,
+        uow=None,
         log_writer=log_writer,
-        hybrid_mode=False,
+        hybrid_mode=hybrid_mode,
         route=None,
-        user_token=None,
+        user_token=user_token,
         api_key_id="key-1",
         user_id="user-1",
         rate_limit_info=rate_limit_info,
@@ -135,8 +215,8 @@ def test_all_settlement_callbacks_wired_for_every_format_and_path(
 ) -> None:
     """Every streaming response, regardless of format and of single-attempt vs
     platform-fallback path, must wire on_complete / on_error / on_no_usage /
-    on_incomplete. Both paths build through ``build_streaming_response``, so
-    asserting here covers them uniformly.
+    on_incomplete / on_first_chunk. Both paths build through
+    ``build_streaming_response``, so asserting here covers them uniformly.
     """
     captured: dict[str, Any] = {}
 
@@ -167,17 +247,17 @@ def test_all_settlement_callbacks_wired_for_every_format_and_path(
         rate_limit_info=None,
         reservation=None,
         platform_correlation_id="corr-1" if hybrid_path else None,
-        platform_request_id="req-1" if hybrid_path else None,
+        request_id="req-1" if hybrid_path else None,
     )
 
-    for callback_name in ("on_complete", "on_error", "on_no_usage", "on_incomplete"):
+    for callback_name in ("on_complete", "on_error", "on_no_usage", "on_incomplete", "on_first_chunk"):
         assert callable(captured.get(callback_name)), f"{callback_name} not wired"
     assert captured["fmt"] is adapter.stream_format
     if hybrid_path:
-        assert response.headers["X-Correlation-ID"] == "corr-1"
-        assert response.headers["X-Otari-Request-ID"] == "req-1"
+        assert response.headers["Otari-Attempt-ID"] == "corr-1"
+        assert response.headers["Otari-Request-ID"] == "req-1"
     else:
-        assert "X-Correlation-ID" not in response.headers
+        assert "Otari-Attempt-ID" not in response.headers
 
 
 @pytest.mark.parametrize("adapter", ADAPTERS)
@@ -334,11 +414,71 @@ async def test_streaming_fallback_wires_forwarded_tools_into_final_timeout(
             config=config,
             remaining_user_tools=[{"name": "slack_send", "input_schema": {}}],
         ),
+        started_at=time.monotonic(),
     )
 
     assert response is marker
     assert captured["first_chunk_timeout_seconds"] == 3.0
     assert captured["final_attempt_extra_seconds"] == 34.0
+
+
+@pytest.mark.asyncio
+async def test_streaming_fallback_forwards_started_at_to_build_streaming_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``started_at`` must reach ``build_streaming_response`` through the
+    fallback wrapper, not just be accepted and dropped.
+
+    ``_ttft_ms`` needs a real ``started_at`` to report anything but ``None``,
+    and the hybrid streaming routes only have a value to offer once this
+    plumbing exists; a call site test alone cannot prove the value actually
+    arrives at the callback that reports it upstream.
+    """
+    config = GatewayConfig()
+    route = ResolvedRoute(
+        request_id="request-1",
+        fallback_enabled=False,
+        attempts=[
+            ResolvedAttempt(
+                attempt_id="attempt-1",
+                position=1,
+                provider="openai",
+                model="gpt-test",
+                api_key="test-key",
+                managed=True,
+            )
+        ],
+    )
+
+    async def fake_iterate_streaming_attempts(**kwargs: Any) -> tuple[Any, AsyncIterator[Any]]:
+        async def stream() -> AsyncIterator[Any]:
+            yield object()
+
+        return route.attempts[0], stream()
+
+    captured: dict[str, Any] = {}
+    marker = Response()
+
+    def fake_build_streaming_response(**kwargs: Any) -> Response:
+        captured.update(kwargs)
+        return marker
+
+    monkeypatch.setattr(pipeline, "iterate_streaming_attempts", fake_iterate_streaming_attempts)
+    monkeypatch.setattr(pipeline, "build_streaming_response", fake_build_streaming_response)
+
+    response = await pipeline.run_streaming_with_fallback(
+        adapter=chat._ADAPTER,
+        route=route,
+        base_request_fields={},
+        config=config,
+        background_tasks=BackgroundTasks(),
+        rate_limit_info=None,
+        tool_ctx=_tool_ctx(config=config),
+        started_at=123.456,
+    )
+
+    assert response is marker
+    assert captured["started_at"] == 123.456
 
 
 # ---------------------------------------------------------------------------
@@ -349,19 +489,23 @@ async def test_streaming_fallback_wires_forwarded_tools_into_final_timeout(
 class _Settlement:
     """Records which settlement primitives the callbacks invoked."""
 
-    def __init__(self) -> None:
+    def __init__(self, pricing_source: PriceSource | None = "deployment") -> None:
+        self.pricing_source = pricing_source
         self.reconciled: list[float] = []
         self.settled_tokens: list[int] = []
         self.refunded = 0
         self.logged: list[dict[str, Any]] = []
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        async def fake_log_usage(**kwargs: Any) -> float | None:
+        async def fake_record_usage(**kwargs: Any) -> LoggedUsage:
             self.logged.append(kwargs)
             usage = kwargs.get("usage_override")
             if kwargs.get("cost_override") is not None:
-                return float(kwargs["cost_override"])
-            return 0.25 if usage else None
+                return LoggedUsage(Decimal(kwargs["cost_override"]), None)
+            return LoggedUsage(Decimal("0.25"), self.pricing_source) if usage else LoggedUsage(None, None)
+
+        async def fake_log_usage(**kwargs: Any) -> Decimal | None:
+            return (await fake_record_usage(**kwargs)).cost
 
         async def fake_reconcile(db: Any, handle: Any, actual_cost: float, *, actual_tokens: int = 0) -> None:
             self.reconciled.append(actual_cost)
@@ -371,6 +515,7 @@ class _Settlement:
             self.refunded += 1
 
         monkeypatch.setattr(pipeline, "log_usage", fake_log_usage)
+        monkeypatch.setattr(pipeline, "record_usage", fake_record_usage)
         monkeypatch.setattr(pipeline, "reconcile_reservation", fake_reconcile)
         monkeypatch.setattr(pipeline, "refund_reservation", fake_refund)
 
@@ -395,6 +540,9 @@ def _build(
     config: GatewayConfig,
     *,
     workspace_id: uuid.UUID | None = None,
+    started_at: float | None = None,
+    tool_tally: ToolUsageTally | None = None,
+    request_id: str | None = None,
 ) -> Any:
     return build_streaming_response(
         adapter=chat._ADAPTER,
@@ -409,6 +557,9 @@ def _build(
         rate_limit_info=None,
         reservation=_reservation(),
         workspace_id=workspace_id,
+        started_at=started_at,
+        tool_tally=tool_tally,
+        request_id=request_id,
     )
 
 
@@ -431,6 +582,48 @@ async def test_stream_with_usage_reconciles_actual_cost(monkeypatch: pytest.Monk
     # rather than at the estimate the request was admitted on.
     assert settlement.settled_tokens == [15]
     assert settlement.refunded == 0
+
+
+def _usage_payload(frames: list[str]) -> dict[str, Any]:
+    """The ``usage`` object of the one streamed chat frame that carries it."""
+    payloads = [json.loads(frame.removeprefix("data: ")) for frame in frames if frame.startswith("data: {")]
+    usages = [payload["usage"] for payload in payloads if payload.get("usage")]
+    assert len(usages) == 1
+    return cast(dict[str, Any], usages[0])
+
+
+@pytest.mark.asyncio
+async def test_standalone_stream_carries_priced_cost_on_terminal_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    settlement = _Settlement()
+    settlement.install(monkeypatch)
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield _chunk()
+        yield _chunk(CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15))
+
+    frames = await _drain(_build(stream(), GatewayConfig()))
+
+    usage = _usage_payload(frames)
+    assert usage["cost_usd"] == "0.250000"
+    assert usage["pricing_source"] == "deployment"
+    # Settlement runs before the terminal suffix, so the done marker still ends the stream.
+    assert frames[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_standalone_stream_omits_cost_when_the_model_is_unpriced(monkeypatch: pytest.MonkeyPatch) -> None:
+    settlement = _Settlement(pricing_source=None)
+    settlement.install(monkeypatch)
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield _chunk(CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15))
+
+    frames = await _drain(_build(stream(), GatewayConfig()))
+
+    usage = _usage_payload(frames)
+    assert "cost_usd" not in usage
+    assert "pricing_source" not in usage
+    assert settlement.reconciled == [0.25]
 
 
 @pytest.mark.asyncio
@@ -495,6 +688,104 @@ async def test_client_disconnect_refunds(monkeypatch: pytest.MonkeyPatch) -> Non
     assert settlement.reconciled == []
 
 
+@pytest.mark.asyncio
+async def test_client_disconnect_with_tool_work_records_ttft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_on_incomplete only reaches log_usage when there is tool work to bill
+    for (a non-empty tool_tally). That is also the one settlement path this
+    PR's own coverage missed: it should still record ttft_ms from the same
+    on_first_chunk mark every other path uses.
+    """
+    settlement = _Settlement()
+    settlement.install(monkeypatch)
+
+    tally = ToolUsageTally()
+    tally.record_result("search", "ok")
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield _chunk()
+        yield _chunk()
+
+    response = _build(
+        stream(),
+        GatewayConfig(),
+        started_at=time.monotonic(),
+        tool_tally=tally,
+    )
+    iterator = response.body_iterator
+    await iterator.__anext__()
+    # Closing the generator mid-stream simulates a client disconnect.
+    await iterator.aclose()
+
+    assert len(settlement.logged) == 1
+    logged = settlement.logged[0]
+    assert logged["ttft_ms"] is not None
+    assert logged["ttft_ms"] >= 0
+    assert logged["ttft_ms"] <= logged["latency_ms"]
+
+
+_PARTIAL_USAGE = CompletionUsage(prompt_tokens=120, completion_tokens=0, total_tokens=120)
+
+
+@pytest.mark.asyncio
+async def test_stream_error_after_reported_usage_bills_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stream that dies after the provider reported tokens still owes for them.
+
+    Refunding would record a request the provider charged for as free, and the
+    caller, who never received a cost, could not recover it by request id.
+    """
+    settlement = _Settlement()
+    settlement.install(monkeypatch)
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield _chunk(_PARTIAL_USAGE)
+        raise RuntimeError("upstream broke")
+
+    await _drain(_build(stream(), GatewayConfig(), request_id="req-1"))
+
+    assert settlement.refunded == 0
+    assert settlement.reconciled == [Decimal("0.25")]
+    assert settlement.settled_tokens == [120]
+    (logged,) = settlement.logged
+    assert logged["usage_override"].prompt_tokens == 120
+    assert logged["error"] == "upstream broke"
+    assert logged["request_id"] == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_after_reported_usage_bills_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    settlement = _Settlement()
+    settlement.install(monkeypatch)
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield _chunk(_PARTIAL_USAGE)
+        yield _chunk()
+
+    response = _build(stream(), GatewayConfig(), request_id="req-1")
+    iterator = response.body_iterator
+    await iterator.__anext__()
+    await iterator.aclose()
+
+    assert settlement.refunded == 0
+    assert settlement.reconciled == [Decimal("0.25")]
+    (logged,) = settlement.logged
+    assert logged["usage_override"].prompt_tokens == 120
+    assert logged["request_id"] == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_completed_stream_row_carries_the_request_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    settlement = _Settlement()
+    settlement.install(monkeypatch)
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield _chunk(_PARTIAL_USAGE)
+
+    await _drain(_build(stream(), GatewayConfig(), request_id="req-1"))
+
+    (logged,) = settlement.logged
+    assert logged["request_id"] == "req-1"
+
+
 class _FakeLogWriter:
     def __init__(self) -> None:
         self.put_rows: list[Any] = []
@@ -534,6 +825,27 @@ async def test_log_usage_skips_the_workspace_lookup_when_given_one(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_log_usage_stores_the_request_id_as_the_group_of_an_unrouted_row() -> None:
+    """An unrouted row has no attribution, and is findable by ``Otari-Request-ID`` all the same."""
+    writer = _FakeLogWriter()
+
+    await log_usage(
+        db=cast(Any, object()),
+        log_writer=cast(Any, writer),
+        api_key_id=None,
+        model="gpt-4",
+        provider="openai",
+        endpoint="/v1/chat/completions",
+        workspace_id=uuid.uuid4(),
+        request_id="req-1",
+    )
+
+    (row,) = writer.put_rows
+    assert row.request_group_id == "req-1"
+    assert row.policy_name is None
+
+
+@pytest.mark.asyncio
 async def test_log_usage_still_resolves_the_workspace_when_not_given_one(monkeypatch: pytest.MonkeyPatch) -> None:
     """The fallback stays intact for the callers that have no context to draw
     ``workspace_id`` from (a rejection logged before one exists, the vision
@@ -560,6 +872,297 @@ async def test_log_usage_still_resolves_the_workspace_when_not_given_one(monkeyp
 
     assert lookups == 1
     assert log_writer.put_rows[0].workspace_id == resolved
+
+
+def _stub_pricing(monkeypatch: pytest.MonkeyPatch, resolved: ResolvedPricing | None) -> None:
+    async def workspace_for_key_id(db: Any, api_key_id: str | None) -> uuid.UUID:
+        return uuid.uuid4()
+
+    async def organization_for_workspace_id(db: Any, workspace_id: uuid.UUID | None) -> None:
+        return None
+
+    async def resolve_model_pricing(*args: Any, **kwargs: Any) -> ResolvedPricing | None:
+        return resolved
+
+    monkeypatch.setattr(pipeline, "workspace_for_key_id", workspace_for_key_id)
+    monkeypatch.setattr(pipeline, "organization_for_workspace_id", organization_for_workspace_id)
+    monkeypatch.setattr(pipeline, "resolve_model_pricing", resolve_model_pricing)
+    monkeypatch.setattr(pipeline, "_unpriced_warned_at", {})
+
+
+async def _settle(model: str) -> Any:
+    writer = _FakeLogWriter()
+    await log_usage(
+        db=cast(Any, object()),
+        log_writer=cast(Any, writer),
+        api_key_id=None,
+        model=model,
+        provider="gemini",
+        endpoint="/v1/chat/completions",
+        usage_override=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+    return writer.put_rows[0]
+
+
+@pytest.fixture
+def gateway_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """``caplog`` attached to the gateway logger, which does not propagate to root."""
+    gateway_logger = logging.getLogger("gateway")
+    gateway_logger.addHandler(caplog.handler)
+    caplog.set_level(logging.WARNING, logger="gateway")
+    try:
+        yield caplog
+    finally:
+        gateway_logger.removeHandler(caplog.handler)
+
+
+def _unpriced_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "No pricing configured" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_unpriced_settlement_warns_once_per_model(
+    monkeypatch: pytest.MonkeyPatch, gateway_caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unpriced model is logged once per interval, not once per request (#1625)."""
+    _stub_pricing(monkeypatch, None)
+
+    row = await _settle("gemini-3.7-flash")
+    await _settle("gemini-3.7-flash")
+    await _settle("gemini-3.8-flash")
+
+    assert row.cost is None
+    warnings = _unpriced_warnings(gateway_caplog)
+    assert len(warnings) == 2
+    assert "'gemini:gemini-3.7-flash'" in warnings[0]
+    assert "'gemini:gemini-3.8-flash'" in warnings[1]
+
+
+@pytest.mark.asyncio
+async def test_unpriced_settlement_warns_again_after_the_interval(
+    monkeypatch: pytest.MonkeyPatch, gateway_caplog: pytest.LogCaptureFixture
+) -> None:
+    _stub_pricing(monkeypatch, None)
+
+    await _settle("gemini-3.7-flash")
+    await _settle("gemini-3.7-flash")
+    assert len(_unpriced_warnings(gateway_caplog)) == 1
+
+    # Backdate the last warning past the interval rather than patching the clock,
+    # which the event loop reads too.
+    pipeline._unpriced_warned_at["gemini:gemini-3.7-flash"] -= pipeline.UNPRICED_WARNING_INTERVAL_S
+    await _settle("gemini-3.7-flash")
+
+    assert len(_unpriced_warnings(gateway_caplog)) == 2
+
+
+def test_unpriced_warning_map_at_capacity_drops_expired_entries_first(
+    monkeypatch: pytest.MonkeyPatch, gateway_caplog: pytest.LogCaptureFixture
+) -> None:
+    """A full map keeps live suppressions, so a recently warned model stays quiet."""
+    now = time.monotonic()
+    cap = pipeline._UNPRICED_WARNING_MAX_MODELS
+    warned = {f"p:expired-{i}": now - pipeline.UNPRICED_WARNING_INTERVAL_S - 1 for i in range(cap - 1)}
+    warned["p:recent"] = now
+    monkeypatch.setattr(pipeline, "_unpriced_warned_at", warned)
+
+    pipeline._warn_unpriced_model("p:new")
+    pipeline._warn_unpriced_model("p:recent")
+
+    assert set(pipeline._unpriced_warned_at) == {"p:recent", "p:new"}
+    warnings = _unpriced_warnings(gateway_caplog)
+    assert len(warnings) == 1
+    assert "'p:new'" in warnings[0]
+
+
+def test_unpriced_warning_map_at_capacity_evicts_only_the_oldest(
+    monkeypatch: pytest.MonkeyPatch, gateway_caplog: pytest.LogCaptureFixture
+) -> None:
+    now = time.monotonic()
+    cap = pipeline._UNPRICED_WARNING_MAX_MODELS
+    warned = {f"p:live-{i}": now - i for i in range(cap)}
+    monkeypatch.setattr(pipeline, "_unpriced_warned_at", warned)
+    oldest = f"p:live-{cap - 1}"
+
+    pipeline._warn_unpriced_model("p:new")
+    pipeline._warn_unpriced_model("p:live-0")
+
+    assert len(pipeline._unpriced_warned_at) == cap
+    assert oldest not in pipeline._unpriced_warned_at
+    assert "p:new" in pipeline._unpriced_warned_at
+    assert len(_unpriced_warnings(gateway_caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_priced_settlement_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch, gateway_caplog: pytest.LogCaptureFixture
+) -> None:
+    pricing = ModelPricing(
+        model_key="gemini:gemini-2.5-flash", input_price_per_million=1.0, output_price_per_million=2.0
+    )
+    _stub_pricing(monkeypatch, ResolvedPricing(pricing, "deployment"))
+
+    row = await _settle("gemini-2.5-flash")
+
+    assert row.cost is not None
+    assert _unpriced_warnings(gateway_caplog) == []
+
+
+def _deployment_rate() -> ResolvedPricing:
+    pricing = ModelPricing(
+        model_key="gemini:gemini-2.5-flash", input_price_per_million=1.0, output_price_per_million=2.0
+    )
+    return ResolvedPricing(pricing, "deployment", "gemini:gemini-2.5-flash", datetime(2026, 9, 1, tzinfo=UTC))
+
+
+@pytest.mark.asyncio
+async def test_priced_settlement_records_its_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row names the rate that priced it, so it can say why it costs what it does (#782)."""
+    _stub_pricing(monkeypatch, _deployment_rate())
+
+    row = await _settle("gemini-2.5-flash")
+
+    assert row.cost is not None
+    assert row.pricing_source == "deployment"
+    assert row.pricing_reference == "gemini:gemini-2.5-flash"
+    assert row.pricing_effective_at == datetime(2026, 9, 1, tzinfo=UTC)
+    assert row.pricing_version is None
+    assert row.calculated_at == row.timestamp
+
+
+@pytest.mark.asyncio
+async def test_unpriced_settlement_records_no_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_pricing(monkeypatch, None)
+
+    row = await _settle("gemini-3.7-flash")
+
+    assert row.cost is None
+    assert (row.pricing_source, row.pricing_reference, row.pricing_effective_at, row.calculated_at) == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_override_settlement_names_no_rate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fixed amount billed in place of the rate is not that rate's work."""
+    _stub_pricing(monkeypatch, _deployment_rate())
+    writer = _FakeLogWriter()
+
+    await log_usage(
+        db=cast(Any, object()),
+        log_writer=cast(Any, writer),
+        api_key_id=None,
+        model="gemini-2.5-flash",
+        provider="gemini",
+        endpoint="/v1/chat/completions",
+        usage_override=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        cost_override=Decimal("0.5"),
+    )
+
+    row = writer.put_rows[0]
+    assert row.cost == Decimal("0.5")
+    assert (row.pricing_source, row.pricing_reference, row.pricing_effective_at) == (None, None, None)
+    assert row.calculated_at == row.timestamp
+
+
+@pytest.mark.asyncio
+async def test_oversized_pricing_reference_is_recorded_as_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A model key past the column's length must not fail the row's insert."""
+    rate = _deployment_rate()
+    _stub_pricing(monkeypatch, rate._replace(reference="k" * (PRICING_REFERENCE_MAX_LENGTH + 1)))
+
+    row = await _settle("gemini-2.5-flash")
+
+    assert row.cost is not None
+    assert row.pricing_source == "deployment"
+    assert row.pricing_reference is None
+
+
+@pytest.mark.asyncio
+async def test_log_usage_writes_provider_latency_ms_onto_the_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one call site that actually populates the column (otari#337): a
+    unit test on ``provider_latency_ms_of`` alone never exercises this line."""
+    monkeypatch.setattr(pipeline, "organization_for_workspace_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(pipeline, "resolve_model_pricing", AsyncMock(return_value=None))
+    workspace_id = uuid.uuid4()
+    log_writer = _FakeLogWriter()
+
+    await log_usage(
+        db=cast(Any, object()),
+        log_writer=cast(Any, log_writer),
+        api_key_id=None,
+        model="llama-3.1-8b-instant",
+        provider="groq",
+        endpoint="/v1/chat/completions",
+        workspace_id=workspace_id,
+        usage_override=CompletionUsage.model_construct(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15, total_time=0.25
+        ),
+    )
+
+    assert log_writer.put_rows[0].provider_latency_ms == 250
+
+
+@pytest.mark.asyncio
+async def test_log_usage_provider_latency_lookup_uses_provider_type_not_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A named instance (``groq-prod``) does not appear in the latency table;
+    only its resolved implementation (``groq``) does. Without ``provider_type``
+    the lookup misses and the column stays NULL even though the field is
+    present, which is the bug coderabbitai flagged on PR #1117."""
+    monkeypatch.setattr(pipeline, "organization_for_workspace_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(pipeline, "resolve_model_pricing", AsyncMock(return_value=None))
+    log_writer = _FakeLogWriter()
+
+    await log_usage(
+        db=cast(Any, object()),
+        log_writer=cast(Any, log_writer),
+        api_key_id=None,
+        model="llama-3.1-8b-instant",
+        provider="groq-prod",
+        provider_type="groq",
+        endpoint="/v1/chat/completions",
+        workspace_id=uuid.uuid4(),
+        usage_override=CompletionUsage.model_construct(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15, total_time=0.25
+        ),
+    )
+
+    row = log_writer.put_rows[0]
+    assert row.provider_latency_ms == 250
+    # The instance name still keys the row, per the coderabbit note: latency
+    # resolution must not change what usage/pricing keys on.
+    assert row.provider == "groq-prod"
+
+
+@pytest.mark.asyncio
+async def test_log_usage_provider_latency_lookup_falls_back_to_provider_without_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller with no resolved provider_type (none exists yet) keeps the
+    prior behavior: latency capture is a no-op rather than wrong."""
+    monkeypatch.setattr(pipeline, "organization_for_workspace_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(pipeline, "resolve_model_pricing", AsyncMock(return_value=None))
+    log_writer = _FakeLogWriter()
+
+    await log_usage(
+        db=cast(Any, object()),
+        log_writer=cast(Any, log_writer),
+        api_key_id=None,
+        model="llama-3.1-8b-instant",
+        provider="groq-prod",
+        endpoint="/v1/chat/completions",
+        workspace_id=uuid.uuid4(),
+        usage_override=CompletionUsage.model_construct(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15, total_time=0.25
+        ),
+    )
+
+    assert log_writer.put_rows[0].provider_latency_ms is None
 
 
 @pytest.mark.asyncio
@@ -602,7 +1205,11 @@ async def test_standalone_non_stream_forwards_the_contexts_workspace_id(monkeypa
 # ---------------------------------------------------------------------------
 
 
-def _build_platform(stream: AsyncIterator[ChatCompletionChunk]) -> Any:
+def _build_platform(
+    stream: AsyncIterator[ChatCompletionChunk],
+    *,
+    started_at: float | None = None,
+) -> Any:
     return build_streaming_response(
         adapter=chat._ADAPTER,
         stream=stream,
@@ -616,7 +1223,8 @@ def _build_platform(stream: AsyncIterator[ChatCompletionChunk]) -> Any:
         rate_limit_info=None,
         reservation=None,
         platform_correlation_id="corr-1",
-        platform_request_id="req-1",
+        request_id="req-1",
+        started_at=started_at,
     )
 
 
@@ -656,8 +1264,87 @@ async def test_platform_stream_without_usage_reports_final_success(
         "outcome": "success",
         "usage": None,
         "session_label": None,
+        "ttft_ms": None,
         "is_final_attempt": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_platform_stream_reports_ttft_on_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """platform_active's on_complete branch skipped log_usage entirely, so
+    ttft_ms never reached _report_platform_usage's payload."""
+    reports: list[dict[str, Any]] = []
+
+    async def completed_report() -> SettledCost | None:
+        return None
+
+    def fake_report(**kwargs: Any) -> Any:
+        reports.append(kwargs)
+        return completed_report()
+
+    monkeypatch.setattr(pipeline, "_report_platform_usage", fake_report)
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        # A content chunk ahead of the usage-carrying one marks first_chunk_at
+        # before settlement: the terminal (cost-carrier) chunk itself is
+        # buffered and only marked once flushed after on_complete runs.
+        yield _chunk()
+        yield _chunk(CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2))
+
+    await _drain(_build_platform(stream(), started_at=time.monotonic()))
+
+    assert len(reports) == 1
+    assert reports[0]["ttft_ms"] is not None
+    assert reports[0]["ttft_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_platform_stream_reports_ttft_on_no_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    reports: list[dict[str, Any]] = []
+
+    async def completed_report() -> SettledCost | None:
+        return None
+
+    def fake_report(**kwargs: Any) -> Any:
+        reports.append(kwargs)
+        return completed_report()
+
+    monkeypatch.setattr(pipeline, "_report_platform_usage", fake_report)
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield _chunk()
+
+    await _drain(_build_platform(stream(), started_at=time.monotonic()))
+
+    assert len(reports) == 1
+    assert reports[0]["ttft_ms"] is not None
+    assert reports[0]["ttft_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_platform_stream_reports_ttft_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pipeline, "_USAGE_REPORT_TASKS", set(), raising=False)
+    reports: list[dict[str, Any]] = []
+
+    async def fake_report(**kwargs: Any) -> SettledCost | None:
+        reports.append(kwargs)
+        return None
+
+    monkeypatch.setattr(pipeline, "_report_platform_usage", fake_report)
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield _chunk()
+        raise RuntimeError("upstream broke")
+
+    await _drain(_build_platform(stream(), started_at=time.monotonic()))
+    for _ in range(20):
+        if reports:
+            break
+        await asyncio.sleep(0)
+
+    assert len(reports) == 1
+    assert reports[0]["ttft_ms"] is not None
+    assert reports[0]["ttft_ms"] >= 0
 
 
 @pytest.mark.asyncio
@@ -1139,13 +1826,22 @@ def _chunk_id(part: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+class _NoCodeExecutionPolicy:
+    """A workspace with no code execution policy, which narrows nothing."""
+
+    async def resolve(self, scope: CodeExecutionPolicyScope) -> ResolvedCodeExecutionPolicy | None:
+        return None
+
+
+_BACKEND_FIELDS = frozenset(field.name for field in dataclasses.fields(ToolBackends))
+_PORT_FIELDS = frozenset(field.name for field in dataclasses.fields(ToolPorts))
+_DECLARED_FIELDS = frozenset(field.name for field in dataclasses.fields(DeclaredTools))
+
+
 async def _call_prepare_gateway_tools(ctx: RequestContext, **overrides: Any) -> ToolContext:
     from fastapi import Response
 
-    kwargs: dict[str, Any] = {
-        "adapter": chat._ADAPTER,
-        "ctx": ctx,
-        "response": Response(),
+    declared: dict[str, Any] = {
         "guardrails": None,
         "guardrail_text": "",
         "tools": None,
@@ -1153,6 +1849,23 @@ async def _call_prepare_gateway_tools(ctx: RequestContext, **overrides: Any) -> 
         "mcp_server_ids": None,
         "max_tool_iterations": None,
         "tools_header": None,
+    }
+    declared.update({name: overrides.pop(name) for name in list(overrides) if name in _DECLARED_FIELDS})
+    ports: dict[str, Any] = {
+        "code_execution": None,
+        "code_execution_policy": _NoCodeExecutionPolicy(),
+        "mcp_server": _Servers(_resolves_to_nothing),
+        "web_search_policy": _Policy(),
+    }
+    ports.update({name: overrides.pop(name) for name in list(overrides) if name in _PORT_FIELDS})
+    backends: dict[str, Any] = {"ports": ToolPorts(**ports)}
+    backends.update({name: overrides.pop(name) for name in list(overrides) if name in _BACKEND_FIELDS})
+    kwargs: dict[str, Any] = {
+        "adapter": chat._ADAPTER,
+        "ctx": ctx,
+        "response": Response(),
+        "declared": DeclaredTools(**declared),
+        "backends": ToolBackends(**backends),
     }
     kwargs.update(overrides)
     # Stubbed rather than fed a session: every case here is about a *different*
@@ -1201,6 +1914,377 @@ async def test_tool_misconfiguration_400_releases_reservation(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_fetch_only_admission_needs_no_search_backend() -> None:
+    db = AsyncMock()
+    ctx = _ctx(
+        GatewayConfig(require_pricing=False, web_fetch_enabled=True),
+        db=cast(Any, db),
+        workspace_id=uuid.uuid4(),
+    )
+
+    tool_ctx = await _call_prepare_gateway_tools(ctx, tools=[{"type": "otari_web_fetch"}])
+
+    assert tool_ctx.use_web_fetch is True
+    assert tool_ctx.use_web_search is False
+    assert tool_ctx.remaining_user_tools is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_fetch_releases_reservation_before_workspace_policy_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settlement = _Settlement()
+    settlement.install(monkeypatch)
+    policy = _Policy()
+    ctx = _ctx(
+        GatewayConfig(require_pricing=False),
+        db=cast(Any, AsyncMock()),
+        reservation=_reservation(),
+        workspace_id=uuid.uuid4(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_prepare_gateway_tools(ctx, tools=[{"type": "otari_web_fetch"}], web_search_policy=policy)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == pipeline.WEB_FETCH_NOT_ENABLED_DETAIL
+    assert settlement.refunded == 1
+    assert policy.asked == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tools",
+    [
+        [{"type": "otari_web_fetch", "headers": {}}],
+        [{"type": "otari_web_fetch"}, {"type": "otari_web_fetch"}],
+        [
+            {"type": "otari_web_fetch"},
+            {"type": "function", "function": {"name": "web_fetch", "parameters": {}}},
+        ],
+        [
+            {"type": "otari_web_fetch"},
+            {"name": "web_fetch", "input_schema": {"type": "object"}},
+        ],
+        [{"type": "otari_web_search", "unknown": True}],
+        [{"type": "otari_web_search"}, {"type": "otari_web_search"}],
+        [
+            {"type": "otari_web_search"},
+            {"type": "function", "function": {"name": "web_search", "parameters": {}}},
+        ],
+    ],
+)
+async def test_invalid_managed_web_declarations_release_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+    tools: list[dict[str, Any]],
+) -> None:
+    settlement = _Settlement()
+    settlement.install(monkeypatch)
+    ctx = _ctx(
+        GatewayConfig(require_pricing=False, web_fetch_enabled=True),
+        db=cast(Any, AsyncMock()),
+        reservation=_reservation(),
+        workspace_id=uuid.uuid4(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_prepare_gateway_tools(ctx, tools=tools)
+
+    assert exc_info.value.status_code == 400
+    assert settlement.refunded == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tools",
+    [
+        [{"type": "otari_web_search"}, {"type": "web_search_20250305"}],
+        [{"type": "web_search"}, {"type": "web_search_20250305"}],
+    ],
+)
+async def test_intercepted_search_declarations_must_be_unique(
+    tools: list[dict[str, Any]],
+) -> None:
+    ctx = _ctx(
+        GatewayConfig(
+            require_pricing=False,
+            web_search_url="https://search.example",
+            web_search_intercept=True,
+        ),
+        db=cast(Any, AsyncMock()),
+        workspace_id=uuid.uuid4(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_prepare_gateway_tools(ctx, tools=tools)
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_invalid_web_declaration_is_rejected_before_policy_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization_resolve = AsyncMock(return_value=[])
+    mcp_resolve = AsyncMock(return_value=[])
+    monkeypatch.setattr(pipeline, "_resolve_organization_guardrails", organization_resolve)
+    monkeypatch.setattr(pipeline, "_resolve_mcp_server_ids", mcp_resolve)
+    ctx = _ctx(
+        GatewayConfig(require_pricing=False, web_fetch_enabled=True),
+        db=cast(Any, AsyncMock()),
+        workspace_id=uuid.uuid4(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_prepare_gateway_tools(
+            ctx,
+            tools=[{"type": "otari_web_fetch", "headers": {}}],
+            mcp_server_ids=[uuid.uuid4()],
+        )
+
+    assert exc_info.value.status_code == 400
+    organization_resolve.assert_not_awaited()
+    mcp_resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_combined_standalone_request_domains_narrow_fetch_without_workspace_row() -> None:
+    ctx = _ctx(
+        GatewayConfig(
+            require_pricing=False,
+            web_fetch_enabled=True,
+            web_search_url="https://search.example",
+        ),
+        db=cast(Any, AsyncMock()),
+        workspace_id=uuid.uuid4(),
+    )
+
+    tool_ctx = await _call_prepare_gateway_tools(
+        ctx,
+        tools=[
+            {
+                "type": "otari_web_search",
+                "allowed_domains": ["docs.example.com"],
+                "blocked_domains": ["private.docs.example.com"],
+            },
+            {"type": "otari_web_fetch"},
+        ],
+    )
+
+    assert [rule.value for rule in tool_ctx.web_fetch_policy.allowed] == ["docs.example.com"]
+    assert [rule.value for rule in tool_ctx.web_fetch_policy.blocked] == ["private.docs.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_a_disjoint_allow_list_gets_one_refusal_whether_or_not_fetch_is_declared() -> None:
+    workspace = ResolvedWebSearchConfig(
+        enabled=True,
+        max_results=None,
+        purpose_hint=None,
+        allowed_domains=("example.com",),
+        blocked_domains=None,
+        provider_options=None,
+        authorized_tools=None,
+    )
+    ctx = _ctx(
+        GatewayConfig(require_pricing=False, web_fetch_enabled=True, web_search_url="https://search.example"),
+        db=cast(Any, AsyncMock()),
+        workspace_id=uuid.uuid4(),
+    )
+    search = {"type": "otari_web_search", "allowed_domains": ["elsewhere.example"]}
+
+    refusals = []
+    for tools in ([dict(search)], [dict(search), {"type": "otari_web_fetch"}]):
+        with pytest.raises(HTTPException) as exc_info:
+            await _call_prepare_gateway_tools(ctx, tools=tools, web_search_policy=_Policy(workspace))
+        refusals.append((exc_info.value.status_code, exc_info.value.detail))
+
+    assert refusals[0] == refusals[1]
+    assert refusals[0][0] == 403
+
+
+@pytest.mark.asyncio
+async def test_combined_standalone_policy_narrows_fetch_domains() -> None:
+    workspace = ResolvedWebSearchConfig(
+        enabled=True,
+        max_results=None,
+        purpose_hint=None,
+        allowed_domains=("example.com",),
+        blocked_domains=("blocked.example.com",),
+        provider_options=None,
+        authorized_tools=None,
+    )
+    ctx = _ctx(
+        GatewayConfig(
+            require_pricing=False,
+            web_fetch_enabled=True,
+            web_search_url="https://search.example",
+        ),
+        db=cast(Any, AsyncMock()),
+        workspace_id=uuid.uuid4(),
+    )
+
+    tool_ctx = await _call_prepare_gateway_tools(
+        ctx,
+        tools=[
+            {"type": "otari_web_search", "allowed_domains": ["docs.example.com"]},
+            {"type": "otari_web_fetch"},
+        ],
+        web_search_policy=_Policy(workspace),
+    )
+
+    assert [rule.value for rule in tool_ctx.web_fetch_policy.allowed] == ["docs.example.com"]
+    assert [rule.value for rule in tool_ctx.web_fetch_policy.blocked] == ["blocked.example.com"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_hybrid_legacy_policy_preserves_search(
+    control_plane_transport: InstallControlPlane, enabled: bool
+) -> None:
+    requests = _answer_web_access(control_plane_transport, {"enabled": enabled, "allowed_domains": ["example.com"]})
+    ctx = _ctx(
+        GatewayConfig(
+            mode="hybrid",
+            require_pricing=False,
+            web_search_url="https://search.example",
+            platform={"base_url": "https://platform.example"},
+        ),
+        hybrid_mode=True,
+        user_token="tk_user",
+    )
+
+    if enabled:
+        tool_ctx = await _call_prepare_gateway_tools(
+            ctx, tools=[{"type": "otari_web_search"}], web_search_policy=RemoteWebSearchPolicy(ctx.config)
+        )
+        assert tool_ctx.use_web_search is True
+        assert tool_ctx.use_web_fetch is False
+        assert tool_ctx.web_search_tool_entry is not None
+        assert tool_ctx.web_search_tool_entry["allowed_domains"] == ["example.com"]
+    else:
+        with pytest.raises(HTTPException) as exc_info:
+            await _call_prepare_gateway_tools(
+                ctx, tools=[{"type": "otari_web_search"}], web_search_policy=RemoteWebSearchPolicy(ctx.config)
+            )
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail == WebSearchNotEnabledError().message
+    assert len(requests) == 1
+    assert requests[0]["url"].endswith("/gateway/web-search/resolve")
+    assert requests[0]["headers"]["X-User-Token"] == "tk_user"
+    assert requests[0]["body"] == {"requested_tools": ["web_search"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("combined", [False, True])
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"enabled": True},
+        {"enabled": True, "authorized_tools": []},
+        {"enabled": True, "authorized_tools": ["web_search"]},
+    ],
+)
+async def test_hybrid_fetch_requires_explicit_authorization(
+    control_plane_transport: InstallControlPlane, response: dict[str, Any], combined: bool
+) -> None:
+    requests = _answer_web_access(control_plane_transport, response)
+    ctx = _ctx(
+        GatewayConfig(
+            mode="hybrid",
+            require_pricing=False,
+            web_fetch_enabled=True,
+            platform={"base_url": "https://platform.example"},
+        ),
+        hybrid_mode=True,
+        user_token="tk_user",
+    )
+
+    tools = [{"type": "otari_web_fetch"}]
+    requested_tools = ["web_fetch"]
+    if combined:
+        ctx.config.web_search_url = "https://search.example"
+        tools.insert(0, {"type": "otari_web_search"})
+        requested_tools.insert(0, "web_search")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_prepare_gateway_tools(ctx, tools=tools, web_search_policy=RemoteWebSearchPolicy(ctx.config))
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == WebAccessToolNotAuthorizedError().message
+    assert [request["body"] for request in requests] == [{"requested_tools": requested_tools}]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_fetch_only_needs_no_search_backend(control_plane_transport: InstallControlPlane) -> None:
+    requests = _answer_web_access(
+        control_plane_transport,
+        {
+            "enabled": True,
+            "authorized_tools": ["web_fetch"],
+            "allowed_domains": ["example.com"],
+        },
+    )
+    ctx = _ctx(
+        GatewayConfig(
+            mode="hybrid",
+            require_pricing=False,
+            web_fetch_enabled=True,
+            platform={"base_url": "https://platform.example"},
+        ),
+        hybrid_mode=True,
+        user_token="tk_user",
+    )
+
+    tool_ctx = await _call_prepare_gateway_tools(
+        ctx, tools=[{"type": "otari_web_fetch"}], web_search_policy=RemoteWebSearchPolicy(ctx.config)
+    )
+
+    assert tool_ctx.use_web_fetch is True
+    assert tool_ctx.use_web_search is False
+    assert [rule.value for rule in tool_ctx.web_fetch_policy.allowed] == ["example.com"]
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"enabled": True, "authorized_tools": None},
+        {"enabled": True, "authorized_tools": "web_fetch"},
+        {"enabled": True, "authorized_tools": [1]},
+        {"enabled": "true", "authorized_tools": ["web_fetch"]},
+        {"enabled": True, "authorized_tools": ["web_fetch"], "allowed_domains": "example.com"},
+        {"enabled": True, "authorized_tools": ["web_fetch"], "blocked_domains": [1]},
+    ],
+)
+@pytest.mark.parametrize("tool_type", ["otari_web_search", "otari_web_fetch"])
+async def test_hybrid_web_tools_fail_closed_on_malformed_policy(
+    control_plane_transport: InstallControlPlane,
+    response: dict[str, Any],
+    tool_type: str,
+) -> None:
+    _answer_web_access(control_plane_transport, response)
+    ctx = _ctx(
+        GatewayConfig(
+            mode="hybrid",
+            require_pricing=False,
+            web_fetch_enabled=True,
+            platform={"base_url": "https://platform.example"},
+        ),
+        hybrid_mode=True,
+        user_token="tk_user",
+    )
+
+    ctx.config.web_search_url = "https://search.example"
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_prepare_gateway_tools(
+            ctx, tools=[{"type": tool_type}], web_search_policy=RemoteWebSearchPolicy(ctx.config)
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == WebSearchPolicyResolutionFailure.ANSWER_UNREADABLE.message
+
+
+@pytest.mark.asyncio
 async def test_a_request_without_a_workspace_is_refused_before_any_tool_resolves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1212,17 +2296,13 @@ async def test_a_request_without_a_workspace_is_refused_before_any_tool_resolves
     server invariant rather than something the caller sent wrong. What the case
     is really about is that the request is refused rather than served with its
     tool configuration silently dropped, and that the hold does not survive it.
-    `_resolve_mcp_server_ids` keeps its own guard on the same condition; it is
-    simply no longer the first to run.
     """
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
     ctx = _ctx(GatewayConfig(), db=cast(Any, object()), reservation=_reservation())
     with pytest.raises(HTTPException) as exc_info:
-        await _call_prepare_gateway_tools(
-            ctx, mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")]
-        )
+        await _call_prepare_gateway_tools(ctx, mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")])
 
     assert exc_info.value.status_code == 500
     assert settlement.refunded == 1
@@ -1234,15 +2314,20 @@ async def test_unknown_mcp_server_id_releases_reservation(monkeypatch: pytest.Mo
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
-    async def missing(*args: Any, **kwargs: Any) -> list[Any]:
+    async def missing(scope: McpServerScope, server_ids: list[uuid.UUID]) -> list[McpServerConfig]:
         raise WorkspaceMcpServerNotFoundError("11111111-1111-1111-1111-111111111111")
 
-    monkeypatch.setattr(pipeline, "resolve_workspace_mcp_servers", missing)
-
-    ctx = _ctx(GatewayConfig(), db=cast(Any, object()), reservation=_reservation(), workspace_id=uuid.uuid4())
+    ctx = _ctx(
+        GatewayConfig(),
+        db=cast(Any, object()),
+        reservation=_reservation(),
+        workspace_id=uuid.uuid4(),
+    )
     with pytest.raises(HTTPException) as exc_info:
         await _call_prepare_gateway_tools(
-            ctx, mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")]
+            ctx,
+            mcp_server=_Servers(missing),
+            mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
 
     assert exc_info.value.status_code == 404
@@ -1277,15 +2362,19 @@ async def test_duplicate_mcp_server_name_against_a_stored_server_releases_reserv
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
-    async def stored(*args: Any, **kwargs: Any) -> list[McpServerConfig]:
+    async def stored(scope: McpServerScope, server_ids: list[uuid.UUID]) -> list[McpServerConfig]:
         return [McpServerConfig(name="tools", url="https://93.184.216.35/mcp")]
 
-    monkeypatch.setattr(pipeline, "resolve_workspace_mcp_servers", stored)
-
-    ctx = _ctx(GatewayConfig(), db=cast(Any, object()), reservation=_reservation(), workspace_id=uuid.uuid4())
+    ctx = _ctx(
+        GatewayConfig(),
+        db=cast(Any, object()),
+        reservation=_reservation(),
+        workspace_id=uuid.uuid4(),
+    )
     with pytest.raises(HTTPException) as exc_info:
         await _call_prepare_gateway_tools(
             ctx,
+            mcp_server=_Servers(stored),
             mcp_servers=[McpServerConfig(name="tools", url="https://93.184.216.34/mcp")],
             mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
@@ -1362,29 +2451,31 @@ async def test_an_inline_duplicate_is_refused_before_the_url_safety_check(
 async def test_stored_mcp_servers_sharing_a_name_are_an_operator_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two *stored* servers sharing a name is broken workspace config, not a bad request.
+    """Two *stored* servers sharing a name is broken workspace configuration, not a bad request.
 
-    Unreachable in standalone (`uq_workspace_mcp_servers_workspace_name`, plus
-    `resolve_workspace_mcp_servers` de-duplicates the ids), so the resolve is
-    stubbed to produce what hybrid can: `_resolve_platform_mcp_servers` returns
-    the platform's payload verbatim, and that uniqueness is the platform's
-    promise rather than a local invariant (otari#792 review).
+    A unique index and de-duplicated ids rule it out where the rows are held, so
+    the port is stubbed to answer the way a peer can: verbatim, with uniqueness
+    its promise rather than a local invariant.
     """
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
-    async def stored(*args: Any, **kwargs: Any) -> list[McpServerConfig]:
+    async def stored(scope: McpServerScope, server_ids: list[uuid.UUID]) -> list[McpServerConfig]:
         return [
             McpServerConfig(name="tools", url="https://93.184.216.34/mcp"),
             McpServerConfig(name="tools", url="https://93.184.216.35/mcp"),
         ]
 
-    monkeypatch.setattr(pipeline, "resolve_workspace_mcp_servers", stored)
-
-    ctx = _ctx(GatewayConfig(), db=cast(Any, object()), reservation=_reservation(), workspace_id=uuid.uuid4())
+    ctx = _ctx(
+        GatewayConfig(),
+        db=cast(Any, object()),
+        reservation=_reservation(),
+        workspace_id=uuid.uuid4(),
+    )
     with pytest.raises(HTTPException) as exc_info:
         await _call_prepare_gateway_tools(
             ctx,
+            mcp_server=_Servers(stored),
             mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
 
@@ -1407,16 +2498,21 @@ async def test_a_database_failure_releases_the_reservation(monkeypatch: pytest.M
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
-    async def failing(*args: Any, **kwargs: Any) -> list[Any]:
+    async def failing(scope: McpServerScope, server_ids: list[uuid.UUID]) -> list[McpServerConfig]:
         raise SQLAlchemyError("connection reset")
 
-    monkeypatch.setattr(pipeline, "resolve_workspace_mcp_servers", failing)
-
     db = AsyncMock()
-    ctx = _ctx(GatewayConfig(), db=cast(Any, db), reservation=_reservation(), workspace_id=uuid.uuid4())
+    ctx = _ctx(
+        GatewayConfig(),
+        db=cast(Any, db),
+        reservation=_reservation(),
+        workspace_id=uuid.uuid4(),
+    )
     with pytest.raises(SQLAlchemyError):
         await _call_prepare_gateway_tools(
-            ctx, mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")]
+            ctx,
+            mcp_server=_Servers(failing),
+            mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
 
     assert settlement.refunded == 1
@@ -1429,21 +2525,27 @@ async def test_a_release_that_also_fails_reraises_the_original(monkeypatch: pyte
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
-    async def failing(*args: Any, **kwargs: Any) -> list[Any]:
+    async def failing(scope: McpServerScope, server_ids: list[uuid.UUID]) -> list[McpServerConfig]:
         raise SQLAlchemyError("connection reset")
 
     async def failing_release(*args: Any, **kwargs: Any) -> None:
         raise SQLAlchemyError("still down")
 
-    monkeypatch.setattr(pipeline, "resolve_workspace_mcp_servers", failing)
     monkeypatch.setattr(pipeline, "release_reservation", failing_release)
 
     db = AsyncMock()
     db.rollback.side_effect = SQLAlchemyError("still down")
-    ctx = _ctx(GatewayConfig(), db=cast(Any, db), reservation=_reservation(), workspace_id=uuid.uuid4())
+    ctx = _ctx(
+        GatewayConfig(),
+        db=cast(Any, db),
+        reservation=_reservation(),
+        workspace_id=uuid.uuid4(),
+    )
     with pytest.raises(SQLAlchemyError, match="connection reset"):
         await _call_prepare_gateway_tools(
-            ctx, mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")]
+            ctx,
+            mcp_server=_Servers(failing),
+            mcp_server_ids=[cast(Any, "11111111-1111-1111-1111-111111111111")],
         )
 
 
@@ -1600,14 +2702,36 @@ async def test_standalone_non_stream_success_logs_once_and_reconciles(monkeypatc
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
-    result, _ = await _run_standalone(
-        monkeypatch, result=_completion(usage=_usage()), reservation=_reservation()
-    )
+    result, _ = await _run_standalone(monkeypatch, result=_completion(usage=_usage()), reservation=_reservation())
 
     assert result.usage is not None
     assert len(settlement.logged) == 1
     assert settlement.reconciled == [0.25]
     assert settlement.refunded == 0
+
+
+@pytest.mark.asyncio
+async def test_standalone_non_stream_carries_priced_cost_inline(monkeypatch: pytest.MonkeyPatch) -> None:
+    settlement = _Settlement()
+    settlement.install(monkeypatch)
+
+    result, _ = await _run_standalone(monkeypatch, result=_completion(usage=_usage()), reservation=_reservation())
+
+    assert result.usage.cost_usd == "0.250000"
+    assert result.usage.pricing_source == "deployment"
+
+
+@pytest.mark.asyncio
+async def test_standalone_non_stream_omits_cost_when_the_model_is_unpriced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cost with no model rate behind it (tool charges alone) is not presented as the request's price."""
+    settlement = _Settlement(pricing_source=None)
+    settlement.install(monkeypatch)
+
+    result, _ = await _run_standalone(monkeypatch, result=_completion(usage=_usage()), reservation=_reservation())
+
+    assert getattr(result.usage, "cost_usd", None) is None
+    assert getattr(result.usage, "pricing_source", None) is None
+    assert settlement.reconciled == [0.25]
 
 
 @pytest.mark.asyncio
@@ -1812,3 +2936,17 @@ async def test_standalone_stream_has_no_first_chunk_deadline(monkeypatch: pytest
 
     assert chunks, "the slow first chunk was dropped: a first-chunk deadline is being applied"
     assert settlement.reconciled == [0.25]
+
+
+@pytest.mark.parametrize(
+    ("reason", "status_code"),
+    [
+        (CodeExecutionPolicyResolutionFailure.ANSWER_UNREADABLE, 502),
+        (CodeExecutionPolicyResolutionFailure.NO_CALLER_CREDENTIAL, 500),
+        (CodeExecutionPolicyResolutionFailure.NO_WORKSPACE, 500),
+    ],
+)
+def test_a_code_execution_policy_failure_renders_its_status(
+    reason: CodeExecutionPolicyResolutionFailure, status_code: int
+) -> None:
+    assert pipeline._code_execution_policy_failure_status(reason) == status_code

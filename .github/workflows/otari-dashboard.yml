@@ -20,6 +20,8 @@ on:
       # otari-dashboard-parity.yml (Playwright, the flows the served bundle
       # walks). A path filter applies to a whole workflow, which is why those are
       # separate files rather than jobs here.
+      # The lint and type-check steps run make targets.
+      - 'Makefile'
       - '.github/workflows/otari-dashboard.yml'
   pull_request:
     branches: [ main ]
@@ -40,6 +42,8 @@ on:
       # otari-dashboard-parity.yml (Playwright, the flows the served bundle
       # walks). A path filter applies to a whole workflow, which is why those are
       # separate files rather than jobs here.
+      # The lint and type-check steps run make targets.
+      - 'Makefile'
       - '.github/workflows/otari-dashboard.yml'
   workflow_dispatch:
 
@@ -62,7 +66,7 @@ jobs:
     # to precede setup-node, whose `cache: pnpm` shells out to pnpm for the store
     # path; `package_json_file` is needed because the pin is in web/, not at the
     # repository root.
-    - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+    - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       with:
         package_json_file: web/package.json
 
@@ -77,14 +81,18 @@ jobs:
 
     # Biome (web/biome.jsonc): formatting, the recommended rule set, and the layer
     # boundary (a feature may not import the composition root; shared/ may not import
-    # either; nothing may import an overlay's tree). `pnpm run lint` is `biome check`,
-    # which reports rather than rewrites, so a formatting drift fails here instead of
-    # landing as noise in the next person's diff. `pnpm run lint:fix` is the writing one.
-    - name: Lint and format check
-      run: pnpm run lint
+    # either; nothing may import an overlay's tree). `make lint-web` applies the fixes
+    # Biome can make, so the diff check after it fails on input nobody linted locally.
+    - name: Lint and format
+      working-directory: .
+      run: make lint-web
+
+    - name: Check lint left no changes
+      run: git diff --exit-code .
 
     - name: Type-check
-      run: pnpm run typecheck
+      working-directory: .
+      run: make typecheck-web
 
     - name: Test
       run: pnpm test
@@ -137,14 +145,14 @@ jobs:
       with:
         persist-credentials: false
 
-    - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
         python-version: "3.14"
 
     - name: Install Python deps
       run: uv sync --dev --frozen
 
-    - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+    - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       with:
         package_json_file: web/package.json
 

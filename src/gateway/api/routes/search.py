@@ -16,10 +16,10 @@ the multi-query array, and the filters with no field below (recency, context
 size, published-date) are ignored rather than rejected. Both are called out in
 ``docs/api-reference.md`` so a migrating caller can check for them.
 
-Both the body-selected (``POST /v1/search``) and path-selected
-(``POST /v1/search/{search_tool_name}``) forms log ``endpoint="/v1/search"``,
-so one Activity filter covers every search regardless of how the tool was
-named.
+Both the body-selected (``POST /api/v1/search``) and path-selected
+(``POST /api/v1/search/{search_tool_name}``) forms log ``endpoint="/v1/search"``,
+a frozen label rather than a path, so one Activity filter covers every search
+regardless of how the tool was named.
 
 A request the gateway itself turns away (an unknown or ambiguous tool name, a
 workspace that has web search switched off, a tool the caller's key may not use)
@@ -55,7 +55,6 @@ from gateway.api.routes._passthrough import (
     resolve_passthrough_user_id,
 )
 from gateway.api.routes._pipeline import (
-    WEB_SEARCH_NOT_ENABLED_DETAIL,
     _elapsed_ms,
     failure_status_code,
     log_gateway_rejection,
@@ -63,15 +62,16 @@ from gateway.api.routes._pipeline import (
 )
 from gateway.core.config import GatewayConfig
 from gateway.core.metered_pricing import quantize_cost
+from gateway.exceptions.tools_exceptions import WebSearchNotEnabledError, WebSearchPolicyResolutionFailure
 from gateway.inflight import track_request
 from gateway.log_config import logger
-from gateway.models.entities import APIKey, UsageLog
+from gateway.models.api_keys import APIKey
+from gateway.models.usage import UsageLog
 from gateway.rate_limit import check_rate_limit
-from gateway.services.budget_service import reconcile_reservation, refund_reservation, reserve_budget
+from gateway.services.budgets import BudgetScopeRequest, reconcile_reservation, refund_reservation, reserve_budget
 from gateway.services.log_writer import LogWriter
 from gateway.services.model_access import is_model_allowed, model_not_allowed_detail, resolve_request_allowlist
 from gateway.services.pricing_service import find_model_pricing, flat_request_cost
-from gateway.services.scoped_budget_service import BudgetScopeRequest
 from gateway.services.search_backend import (
     MAX_RESULTS_CAP,
     SearchHit,
@@ -81,10 +81,13 @@ from gateway.services.search_backend import (
     resolve_search_tool,
     run_search,
 )
-from gateway.services.tenancy.workspace_web_search_service import resolve_workspace_web_search_config
+from gateway.services.tenancy.workspace_web_search_service import (
+    InvalidStoredWebSearchDomainError,
+    resolve_workspace_web_search_config,
+)
 from gateway.services.workspace_scope import organization_for_key_id, workspace_for_key_id
 
-router = APIRouter(prefix="/v1", tags=["search"])
+router = APIRouter(tags=["search"])
 
 SEARCH_ENDPOINT = "/v1/search"
 
@@ -110,7 +113,7 @@ class SearchRequest(BaseModel):
         default=None,
         description=(
             "Configured search tool to run against. Optional when exactly one tool is "
-            "configured, and ignored on POST /v1/search/{search_tool_name}."
+            "configured, and ignored on POST /api/v1/search/{search_tool_name}."
         ),
     )
     max_results: int | None = Field(
@@ -198,7 +201,7 @@ async def create_search_for_tool(
 ) -> SearchResponse:
     """Run a search against the search tool named in the path.
 
-    Identical to ``POST /v1/search`` except that the path names the tool, which
+    Identical to ``POST /api/v1/search`` except that the path names the tool, which
     is the form LiteLLM clients use. Any ``search_tool_name`` in the body is
     ignored.
 
@@ -248,7 +251,7 @@ async def _dispatch_search(
     budget_exempt = api_key is not None and api_key.exclude_from_budget
 
     user_id = resolve_passthrough_user_id(auth_result, request.user, reject_mismatch=config.reject_user_mismatch)
-    rate_limit_info = check_rate_limit(raw_request, user_id)
+    rate_limit_info = await check_rate_limit(raw_request, user_id)
 
     async def log_rejection(detail: str, *, row_model: str, row_provider: str | None, status_code: int) -> None:
         """Record a search the gateway itself refused.
@@ -302,15 +305,26 @@ async def _dispatch_search(
     # workspace, which is a policy that fails open. Only the veto applies; the
     # row's other fields shape the in-loop backend's own request and have no
     # counterpart in this endpoint's provider adapters.
-    workspace_search = await resolve_workspace_web_search_config(db, usage_workspace_id)
-    if workspace_search is not None and not workspace_search.enabled:
+    try:
+        workspace_search = await resolve_workspace_web_search_config(db, usage_workspace_id)
+    except InvalidStoredWebSearchDomainError as exc:
+        invalid = WebSearchPolicyResolutionFailure.STORED_POLICY_INVALID
         await log_rejection(
-            WEB_SEARCH_NOT_ENABLED_DETAIL,
+            invalid.message,
+            row_model=tool.name,
+            row_provider=tool.provider,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=invalid.message) from exc
+    if workspace_search is not None and not workspace_search.enabled:
+        refusal = WebSearchNotEnabledError()
+        await log_rejection(
+            refusal.message,
             row_model=tool.name,
             row_provider=tool.provider,
             status_code=status.HTTP_403_FORBIDDEN,
         )
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=WEB_SEARCH_NOT_ENABLED_DETAIL)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=refusal.message)
 
     pricing_key = f"{tool.provider}:{tool.name}"
 

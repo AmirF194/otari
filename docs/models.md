@@ -2,7 +2,7 @@
 
 Otari routes provider calls through
 [any-llm](https://github.com/mozilla-ai/any-llm). Provider support changes with
-that dependency, so the running gateway's `GET /v1/models` response is more
+that dependency, so the running gateway's `GET /api/v1/models` response is more
 reliable than a copied provider table.
 
 ## Model format
@@ -18,14 +18,24 @@ ollama:llama3
 The prefix selects a provider or named provider instance. Everything after the
 first colon is sent as the provider's model ID.
 
-`provider/model` is also accepted on completion routes for compatibility with
-otari.ai. Prefer the colon form in standalone configuration, pricing, aliases,
-and routing policies.
+A request may also name the model the way the catalog does. `vendor/model`
+(`deepseek/deepseek-v4.1-flash`) is the model's catalog id, and Otari picks the
+provider: the vendor's own where it serves the model, otherwise the cheapest
+offering the caller can reach, including one on the organization's own
+provider key. `provider:vendor/model` (`nebius:deepseek/deepseek-v4.1-flash`)
+pins the provider and lets Otari pick the model id that provider spells it
+under. See [Catalog spellings](#catalog-spellings) for the rules.
+
+The legacy `provider/model` spelling is still honored where it names an
+offering the deployment serves (`openai/gpt-4o` while an `openai` instance
+serves `gpt-4o`); read as a catalog id otherwise. Prefer the colon form in
+standalone configuration, pricing, aliases, and routing policies.
 
 ## Configuring a provider
 
-A provider can come from `config.yml`, its native credential environment
-variable, or the standalone Providers page:
+Declare a provider under `providers` in `config.yml`, or add it on the
+standalone Providers page. Either way it serves requests and its models are
+discovered. Supply the key from the environment with a `${VAR}` reference:
 
 ```yaml
 providers:
@@ -33,9 +43,10 @@ providers:
     api_key: ${OPENAI_API_KEY}
 ```
 
-A native variable such as `OPENAI_API_KEY` can be enough to dispatch a direct
-request. Add the provider to `providers` when you also want model discovery or
-explicit client settings.
+A provider that is not declared is still called when its native variable (such
+as `OPENAI_API_KEY`) is set, but its models are not listed. That fallback is
+deprecated: the gateway logs a warning naming the provider, and a future
+release will refuse the request.
 
 Provider support is endpoint-specific. A provider that supports chat may not
 support Responses, images, audio, rerank, or batches. Unsupported combinations
@@ -61,7 +72,7 @@ name. `provider_type: openai-compatible` and `openai_compatible` are accepted
 aliases for the OpenAI implementation.
 
 The optional `models` list supplies discovery for a backend that has no
-`/v1/models` endpoint. It does not restrict direct dispatch.
+model-listing endpoint. It does not restrict direct dispatch.
 
 Named instances are local configuration and do not apply in hybrid mode, where
 the control plane resolves each attempt.
@@ -83,7 +94,7 @@ because their provider exists in any-llm.
 
 ## Model discovery
 
-`GET /v1/models` combines discoverable provider models, configured prices,
+`GET /api/v1/models` combines discoverable provider models, configured prices,
 aliases, and routing-policy names. Discovery is cached and bounded; an
 unreachable provider does not block the catalog indefinitely.
 
@@ -91,7 +102,7 @@ Set `model_discovery: false` to publish a curated catalog made from aliases and
 explicitly priced models. For a backend with no listing API, use the instance's
 `models` list.
 
-Hosted mode keeps `GET /v1/models` for control-plane discovery. Hybrid mode
+Hosted mode keeps `GET /api/v1/models` for control-plane discovery. Hybrid mode
 does not serve the local catalog.
 
 ### Who is shown which models
@@ -104,6 +115,14 @@ is deployment-wide, plus the models their own organization's provider keys
 reach, narrowed by any workspace model restriction. A deployment whose providers
 all come from `config.yml` therefore shows every tenant the same catalog it
 always did.
+
+The models an organization's own key reaches are the ones offered on it, which
+is what the Providers page records when it pulls a key's catalog. Each carries a
+Serving switch, and a model switched off leaves the catalog and is refused at
+dispatch, because both read one allow-list. A key nobody has refreshed offers no
+rows at all, and that is not the same as offering none: it means the key is
+unnarrowed and reaches whatever its provider serves. Offering none, which is
+every model switched off, serves nothing.
 
 Aliases and stored routing policies are workspace-scoped rows, and the catalog
 reads them for a workspace rather than filtering them by target, so a name alone
@@ -153,7 +172,7 @@ point to another alias.
 
 ### Runtime aliases
 
-Standalone operators can manage aliases from Routing or `/v1/aliases` without
+Standalone operators can manage aliases from Routing or `/api/v1/aliases` without
 restarting. A stored alias belongs to a workspace and can optionally be narrowed
 to one user. Resolution prefers the most specific applicable alias.
 
@@ -175,10 +194,115 @@ Policies appear as model names, but dynamic policies have no single price.
 Price their concrete candidates. Unlike aliases, policies do not hide candidate
 models from the catalog.
 
+## The catalog, grouped by model
+
+`GET /api/v1/catalog/models` reads the same merged catalog as `GET /api/v1/models` and
+folds it by model, so `nebius:zai-org/GLM-5.3` and
+`fireworks:accounts/fireworks/models/glm-5p3` are two offerings of one entry.
+`?at_context=<tokens>` on the list takes each model's minimum from the pricing
+tier a request of that size would settle at, so tiered offerings compare at
+the size that matters rather than at their base rate.
+`GET /api/v1/catalog/models/{id}` lists every offering of one model the caller may
+use, cheapest first, with each provider's context and output limits and the
+price the caller's organization would be charged, labeled by which price list
+it came from: the organization's own override, the deployment's stored rate, or
+the genai-prices default. Both routes accept the same credentials as
+`GET /api/v1/models`, and a model the caller may not use answers 404.
+
+Grouping keys on the models.dev display name where the dataset knows the
+model, and on the provider's id with its path prefixes, org segment and version
+pins removed where it does not; a vendor's name written in front of its own
+model (`NVIDIA Nemotron 3 Ultra`, `openai-gpt-oss-120b`) is dropped from both. A
+model's id is its vendor and its name, `z-ai/glm-5.3`, or the bare name where
+nobody could say the vendor. The vendor is the org of models.dev's
+`canonical_model_id` where the dataset has one, else the org segment of the
+provider's id, else the model family (`claude`, `nemotron`). A dated build, a size or tier, and a mode a
+reseller exposes as its own id stay separate models. models.dev's description,
+capabilities and modalities are served to every catalog reader here, where
+`GET /api/v1/models/metadata` stays operator-only.
+
+Each offering also carries the provider's own list price from models.dev,
+where it has one, and for a signed-in caller the organization's last thirty
+days on that offering: requests, cache hit rate, and the effective price per
+million tokens after cache reads and tiers.
+
+### Browsing the grouped catalog
+
+The Models page requests one page at a time from `GET /api/v1/catalog/models`.
+Filters and sorting apply to the caller's full authorized catalog before `skip`
+and `limit` select a page. `count` is the number of matching models before paging;
+`limit` defaults to 100 and is capped at 1,000.
+
+Repeat `provider` or `vendor` to match any selected value. An empty `vendor`
+selects models whose vendor is unknown. Repeat `input_modality`,
+`output_modality`, or `capability` to require every selected value. The endpoint
+also accepts `search`, `min_context`, `max_input`, `pricing`, `source`, and
+`released_within_days`. Release windows end today in UTC and exclude unknown
+and future dates. A price ceiling excludes models with no known input rate.
+
+`sort` accepts `name`, `released`, `input`, `output`, `context`, or `providers`,
+with `direction=asc` or `desc`. Unknown values sort last in either direction;
+names and catalog ids break ties so pages have a stable order.
+
+Request `include_facets=true` to receive the provider and vendor choices from
+the complete authorized catalog, whatever the filters match, so a filter that
+matches nothing can still be undone. `facets.total_count` counts authorized
+models before filtering. `facets` is null unless requested, and never names a
+model or provider the caller cannot access.
+
+### Catalog spellings
+
+A provider's own id can be long, so the gateway also accepts the two spellings
+the catalog shows. Each is relabeled like an alias, so a response's `model` is
+what was sent, and pricing, budgets and usage key on the offering reached.
+
+- The model's catalog id (`z-ai/glm-5.3`, `deepseek/deepseek-v4.1-flash`)
+  resolves to the model's cheapest priced offering, at the caller's rates.
+  Where the id's vendor is also a provider (`openai/gpt-4o`), that provider's
+  own offerings win while it serves the model, because the caller who names
+  OpenAI's model while OpenAI is configured means OpenAI's price; where it
+  serves nothing, the model is reached through whoever resells it.
+- `instance:<catalog id>` (`nebius:deepseek/deepseek-v4.1-flash`) pins the
+  instance and resolves to the model's cheapest offering there, never
+  elsewhere. This is the spelling the catalog shows as an offering's
+  `short_selector`.
+
+A selector that already names an offering is never rewritten, so a provider's
+own id keeps working verbatim.
+
+The index behind this is rebuilt every minute and on
+`POST /api/v1/catalog/selectors/refresh`, an operator call. It holds the
+deployment's catalog view, priced from the deployment's list and the defaults,
+and one view per organization for the models it offers on its own provider
+keys, priced at that organization's rates. An organization's view answers only
+its own callers: a model one tenant reaches through its key is never where
+another tenant's selector lands, and a model nobody offers to the caller
+resolves as the deployment's view says. A model's `selector` in the catalog is
+null where the caller has no such spelling for it. A key whose allow-list names
+some instances only should send one of those instances, a pinned spelling or
+an alias, since a bare catalog id resolves before the allow-list is consulted.
+
+The dashboard's Models page is this catalog: one card per model, with a rail
+of filters beside it, and a page per model with its facts and every offering
+compared in a table. "Use this model" opens a drawer beside the table with
+the request to copy, sent to the gateway's pick or to a provider pinned by
+its selector. It is read-only; an organization's own rate is set on Providers,
+which an offering on one of that organization's keys links to. An offering the
+deployment supplies the credential for says so instead, because its rate is the
+deployment price list's rather than a tenant's. A metered rate that differs from the provider's
+list price is marked with the list price.
+
+With `public_catalog: true` (see [Configuration](configuration.md)), the same
+two routes and the same page are served to a visitor with no session, at the
+deployment's rates and for the models the deployment itself serves: the
+configured providers, and on a managed platform its hosted models. A visitor's
+"Use this model" opens account creation instead of the drawer (sign-in where
+signup is closed), and the dashboard reopens that model on their first sign-in.
+
 ## Listing available models
 
 ```bash
-curl http://localhost:8000/v1/models \
+curl http://localhost:8000/api/v1/models \
   -H "Authorization: Bearer $OTARI_API_KEY"
 ```
 

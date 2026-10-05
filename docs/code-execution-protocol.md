@@ -40,19 +40,25 @@ policy. `tests/unit/test_code_execution_contract.py` fails when they disagree.
 |---|---|---|
 | Client | Otari | Leases a session, submits tool calls, releases the session |
 | Backend | `otari-sandbox-container` or another implementation | Executes untrusted, model-generated code and returns results |
-| Control plane | The platform, in hybrid mode | Authorizes the caller, enforces per-workspace policy, injects tenancy, meters usage |
+| Control plane | The platform, in hybrid mode | Authorizes the workspace, returns its policy, issues a grant, meters usage |
+| Front door | A service in front of the backend, or the backend itself, in hybrid mode | Checks the grant, enforces its claims, injects tenancy |
 
-The backend does not authorize callers, enforce quota, or meter usage. In
-standalone mode there is no control plane at all: Otari addresses a backend it
-was configured with. In hybrid mode the platform interposes a proxy that
-authenticates the caller and enforces policy before forwarding; the contract
-below is unchanged either way, which is what lets the same backend serve both.
+The backend does not authorize callers, enforce quota, or meter usage. Otari applies the workspace's policy itself, and a front door checking a grant's claims is an extra layer. In hybrid mode the control plane's answer carries no image, so a hybrid data plane runs the deployment's own image. In standalone mode there is no control plane at all: Otari addresses a backend it was configured with.
+
+In hybrid mode the control plane authorizes the workspace and gives Otari a short-lived grant, and Otari presents it to a front door that admits the operation and forwards it to the backend. Code, files and results never pass through the control plane. The contract below is unchanged either way, which is what lets the same backend serve both. [#1603](https://github.com/mozilla-ai/otari/issues/1603) records the decision.
+
+> **Where this stands.** The grant and the front door are not built yet, and [#1688](https://github.com/mozilla-ai/otari/issues/1688) holds their design. Until they are, Otari sends a backend no credential in either mode, as "Authentication and tenancy" below says.
 
 ## Operations
 
 Six operations, of which the first three are the whole execution path. A
 backend MUST implement those three; the file operations are OPTIONAL and are
-used only by clients that move files in or out of a session.
+used only by clients that move files in or out of a session. Otari is such a
+client when a request runs with files enabled: it seeds uploads with `PutFile`
+before the first call, and after each call fetches with `GetFile` what the
+result block's file references name together with whatever `ListFiles` shows
+appeared or changed, since not every backend fills the block's list in (see
+`docs/files.md`, "Files and code execution").
 
 | Operation | Purpose | Request | Response |
 |---|---|---|---|
@@ -141,6 +147,34 @@ Releases the session and destroys its state. A backend SHOULD reclaim sessions
 that are never released (an abandoned client, a crashed one), which is why the
 lifetime bounds on the handle exist. Releasing a session that does not exist is
 not an error worth distinguishing: it is already in the desired state.
+
+### Sessions held across requests
+
+Otari may hold a session past the request that created it, so a later request
+can resume the same workspace (see [Built-in tools](tools.md#reusing-a-sandbox-across-requests)).
+It does so only for a request that asked, by sending `container: "auto"` or an
+id; a request that asks for nothing gets `DestroySession` at the end of it, as
+every request did before this existed.
+For such a session it sends `idle_timeout_seconds` on `CreateSession`, equal to
+how long it will hold the session, and the `SessionHandle` is what decides
+whether it is held. A handle reporting an `idle_timeout_seconds` is the backend
+saying an idle reclaim will come, so Otari skips `DestroySession` and lets that
+reclaim end the session. A handle reporting none means no reclaim is coming, so
+Otari destroys the session at the end of the request exactly as it always has
+and reports no container to the caller. A backend that does not want to hold
+sessions therefore needs to do nothing at all, and one that wants a shorter
+lease than the hint asked for clamps it and reports what it kept.
+
+On resume, Otari confirms the session still exists with `ListFiles` before
+running anything, and treats a 404 as the session being gone. A backend that
+does not implement `ListFiles` answers 404 there too, so its sessions cannot be
+resumed; Otari then tells the caller its container is gone, which for that
+backend is the truth of every resume.
+
+One request at a time runs in a held session. A second request naming a
+container the first is still using is refused with a 409 rather than admitted,
+because two sharing one workspace would interleave their code and each collect
+the other's files.
 
 ### ListFiles, GetFile, and PutFile
 
@@ -287,9 +321,10 @@ be exposed to an untrusted one.
 
 Authentication is therefore a property of the deployment, not of the contract. A
 client MAY be configured to present a bearer credential on every operation, and
-a backend (or a proxy in front of one) MAY require it. In Otari's hybrid mode
-this is how the platform's authenticated proxy admits the request and derives
-tenancy from the caller's workspace, so the backend behind it never has to.
+a backend (or a front door in front of one) MAY require it. Otari presents none
+today, in either mode, so a backend it reaches must not depend on one.
+
+In hybrid mode that credential will be the grant the control plane issued for the request. The front door checks it, enforces its claims, and derives tenancy from the workspace it names, so the backend behind it never has to. A grant names one workspace, the tools it may use, and a deadline. Otari receives grants and never mints them, and it never logs a grant, stores one, or hands one to a client. The control plane issues a grant only to a workspace whose policy allows code execution. [#1603](https://github.com/mozilla-ai/otari/issues/1603) records the decision.
 
 Tenancy, when a backend is multi-tenant, is injected by whichever component
 authenticates the caller. A backend that expects tenancy MUST fail closed when
@@ -324,7 +359,13 @@ Status codes:
 | Malformed request, or unknown tool kind | `400` or `422` |
 | Path outside the session workspace | `403` |
 | File larger than the backend's cap | `413` |
-| At capacity, session not leased | `503` |
+| Session creation or execution temporarily unavailable | `503` |
+
+A backend may include `Retry-After` delay-seconds with a `503`. Otari preserves
+that status and a delay-seconds hint of one to six ASCII digits for its caller.
+Other hint values are omitted. It does not retry session creation or code
+execution automatically. Connection failures remain
+`502`; clients should not blindly replay an execution whose outcome is unknown.
 
 A bearer credential, where the deployment uses one, is sent as
 `Authorization: Bearer <token>`.
@@ -362,8 +403,41 @@ with the reference one rather than merely similar to it.
 
 | Setting | Env var | Meaning |
 |---|---|---|
-| `sandbox_url` | `OTARI_SANDBOX_URL` | Base URL of the backend. Unset, `otari_code_execution` requests are rejected. |
+| `sandbox_provider` | `OTARI_SANDBOX_PROVIDER` | What runs the code: `protocol` (the default) speaks this contract to `sandbox_url`; `e2b` drives [E2B](https://e2b.dev)'s hosted sandboxes from the gateway process and needs no backend of your own. |
+| `sandbox_url` | `OTARI_SANDBOX_URL` | Base URL of the backend, for the `protocol` provider. Unset, `otari_code_execution` requests are rejected. |
 | `sandbox_purpose_hint` | `OTARI_SANDBOX_PURPOSE_HINT` | Default purpose hint for the tool, when a request supplies none. |
+| `code_execution_executor` | `OTARI_CODE_EXECUTION_EXECUTOR` | Who runs a provider-native code-execution declaration: `auto` (default), `otari` or `provider`. See [Built-in tools](tools.md#code-execution-executor). |
+
+### Running code without a backend of your own
+
+This contract is how Otari reaches a backend an operator runs, and it stays the
+way to plug in one Otari knows nothing about, in any language. A deployment
+that cannot run such a backend, a PaaS with no privileged containers for
+instance, has a second option: set `sandbox_provider` to a hosted provider and
+Otari drives it in its own process, over that provider's SDK rather than over
+this contract. `e2b` ships in the core (`uv sync --extra e2b`, then
+`E2B_API_KEY`). Everything above the seam is the same either way, including the
+per-workspace policy, the usage tally, and seeding and collecting files, so the
+choice is about what you run, not about what a request can do. The seam itself
+is `CodeExecutionPort` (see [ARCHITECTURE.md](../ARCHITECTURE.md)); a provider
+Otari does not ship is an adapter, and `scripts/check_code_execution_conformance.py`
+certifies a backend rather than an adapter.
+
+One setting does not carry over: `sandbox_session_image` (and the
+`sandbox_allowed_session_images` that curates it) names a container image,
+which is this contract's vocabulary. A hosted provider names workspaces its own
+way, so the `e2b` adapter ignores a pinned image and logs that it did. Pick the
+sandbox a run gets in the provider's own account instead.
+
+The isolation a run gets is the provider's too, and it is worth knowing what
+you traded for not running a container. What the reference backend confines,
+notably a sandbox's outbound network, a hosted provider decides for itself:
+E2B's sandboxes reach the internet by default, so code the model writes can
+send an attached file anywhere it likes. That is the same posture as a
+reference container an operator deliberately gave egress, but it is the
+default here rather than a choice, and the controls over it live in the
+provider's account rather than in Otari's settings. A deployment handling data
+that must not leave should confine it there before choosing this provider.
 
 See [Configuration](configuration.md) for the full settings reference and
 [Built-in tools](tools.md) for the user-facing view of the tool.

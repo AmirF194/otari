@@ -1,6 +1,6 @@
 """The caller's own API keys, for a tenant who does not operate the deployment.
 
-``/v1/keys`` is deployment-wide and operator-only (otari-ai#1880), which left a
+``/api/v1/keys`` is deployment-wide and operator-only (otari-ai#1880), which left a
 hosted organization member with no way to mint a key at all: they could not use
 the product without an operator handing them one out of band
 (mozilla-ai/otari-ai#1941). The answer is not a looser gate on that router,
@@ -14,7 +14,7 @@ established for usage reads (otari#837), applied to a write surface:
   guide already keys on), and every load below carries that owner predicate.
   There is no ``user_id`` parameter, so there is nothing for an escalation to
   travel on, and somebody else's key answers the 404 a nonexistent one does. An
-  owner an operator has revoked through ``DELETE /v1/users`` stays revoked: this
+  owner an operator has revoked through ``DELETE /api/v1/users`` stays revoked: this
   surface refuses rather than reviving the row, which is what would restore the
   spend that route deactivated.
 * **The workspace must be one the caller may see.** A named ``workspace_id``
@@ -44,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col
 
 from gateway.api.deps import (
+    ApiKeyFormatPortDep,
     CurrentIdentity,
     GrowthSignalPortDep,
     get_config,
@@ -52,27 +53,29 @@ from gateway.api.deps import (
 )
 from gateway.api.routes.keys import (
     _KEY_EXCEEDS_USER_DETAIL,
+    NOT_INTERNAL,
     CreateKeyResponse,
     KeyInfo,
     _load_key_in_organization,
 )
-from gateway.auth.models import generate_api_key, hash_key, key_prefix
+from gateway.auth.models import hash_key, key_suffix
 from gateway.core.config import GatewayConfig
-from gateway.models.entities import APIKey, User
+from gateway.exceptions.organizations_exceptions import WorkspaceNotFoundError
+from gateway.models.api_keys import APIKey
 from gateway.models.tenancy import User as TenancyUser
 from gateway.models.tenancy import Workspace
+from gateway.models.users import User
 from gateway.ports.growth_signal_port import GrowthActivationEvent
 from gateway.repositories.users_repository import get_or_create_attribution_user
 from gateway.services.model_access import is_allowlist_subset, validate_allowed_models
 from gateway.services.tenancy import OrganizationService
 from gateway.services.tenancy.authorization import resolve_workspace_in_organization
-from gateway.services.tenancy.errors import WorkspaceNotFoundError
 from gateway.services.workspace_scope import organization_default_workspace_id
 
 router = APIRouter(
-    prefix="/v1/organizations/me/keys",
+    prefix="/organizations/me/keys",
     tags=["organization-keys"],
-    # Authentication only, like the rest of the ``/v1/organizations/me`` surface.
+    # Authentication only, like the rest of the ``/api/v1/organizations/me`` surface.
     # What the caller may touch is decided per request by the owner predicate and
     # the workspace resolver below, which is why the deployment operator gate
     # does not belong here.
@@ -143,11 +146,11 @@ async def _caller_context(db: AsyncSession, identity: TenancyUser) -> tuple[uuid
     The organization is the caller's own ``active_organization_id``, resolved
     through ``get_active_organization_for_user`` so a pointer with no live
     membership behind it refuses rather than resolving; moving between
-    organizations is ``POST /v1/organizations/me/switch``. The owner id is the
+    organizations is ``POST /api/v1/organizations/me/switch``. The owner id is the
     identity's UUID rendered as a string, the attribution convention
     ``get_or_create_attribution_user`` documents.
     """
-    organization = await OrganizationService(db).get_active_organization_for_user(identity)
+    organization = await OrganizationService(db, membership_listener=None).get_active_organization_for_user(identity)
     return organization.id, str(identity.id)
 
 
@@ -159,15 +162,16 @@ async def create_own_key(
     db: Annotated[AsyncSession, Depends(get_db)],
     config: Annotated[GatewayConfig, Depends(get_config)],
     growth: GrowthSignalPortDep,
+    key_format: ApiKeyFormatPortDep,
 ) -> CreateKeyResponse:
     """Create an API key owned by the caller, in a workspace they may see.
 
-    The member-scoped counterpart of ``POST /v1/keys``: the owner is always the
+    The member-scoped counterpart of ``POST /api/v1/keys``: the owner is always the
     caller's own attribution user, the key is always budget-enforced, and the
     workspace must be visible to the caller (a member of it, or an organization
-    owner/admin/superuser, who see every workspace). The secret is returned once.
+    owner/admin, who see every workspace). The secret is returned once.
     """
-    organizations = OrganizationService(db)
+    organizations = OrganizationService(db, membership_listener=None)
     organization = await organizations.get_active_organization_for_user(identity)
 
     if request.workspace_id is not None:
@@ -214,14 +218,12 @@ async def create_own_key(
     # ``get_or_create_attribution_user`` revives a soft-deleted row. That is what
     # the membership paths calling it want (re-adding a member must find their
     # existing owner, not mint a second one) and the wrong answer here.
-    # ``DELETE /v1/users`` is the operator's revocation of a spend identity: it
+    # ``DELETE /api/v1/users`` is the operator's revocation of a spend identity: it
     # soft-deletes the row and deactivates every key it holds, and the data plane
     # then refuses a request whose owner is deleted. Reviving it is therefore
     # restoring spend, which is not a member's to do for themselves, so this
-    # refuses where ``POST /v1/keys`` refuses the same owner.
-    revoked = (
-        await db.execute(select(User.deleted_at).where(User.user_id == str(identity.id)))
-    ).scalar_one_or_none()
+    # refuses where ``POST /api/v1/keys`` refuses the same owner.
+    revoked = (await db.execute(select(User.deleted_at).where(User.user_id == str(identity.id)))).scalar_one_or_none()
     if revoked is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -246,12 +248,13 @@ async def create_own_key(
         await db.execute(select(APIKey.id).where(APIKey.user_id == owner.user_id).limit(1))
     ).scalar_one_or_none() is None
 
-    api_key = generate_api_key()
+    api_key = key_format.mint()
     db_key = APIKey(
         id=str(uuid.uuid4()),
         workspace_id=workspace_id,
         key_hash=hash_key(api_key),
-        key_prefix=key_prefix(api_key),
+        key_prefix=key_format.fingerprint(api_key),
+        key_suffix=key_suffix(api_key),
         key_name=request.key_name,
         user_id=owner.user_id,
         expires_at=request.expires_at,
@@ -314,6 +317,7 @@ async def list_own_keys(
         .where(
             col(Workspace.organization_id) == organization_id,
             col(APIKey.user_id) == owner_user_id,
+            NOT_INTERNAL,
         )
     )
     if workspace_id is not None:
@@ -386,6 +390,7 @@ async def rotate_own_key(
     key_id: str,
     identity: CurrentIdentity,
     db: Annotated[AsyncSession, Depends(get_db)],
+    key_format: ApiKeyFormatPortDep,
 ) -> CreateKeyResponse:
     """Rotate the secret of one of the caller's own API keys, in place.
 
@@ -396,9 +401,10 @@ async def rotate_own_key(
     organization_id, owner_user_id = await _caller_context(db, identity)
     key = await _load_key_in_organization(db, key_id, organization_id, owner_user_id=owner_user_id)
 
-    new_api_key = generate_api_key()
+    new_api_key = key_format.mint()
     key.key_hash = hash_key(new_api_key)
-    key.key_prefix = key_prefix(new_api_key)
+    key.key_prefix = key_format.fingerprint(new_api_key)
+    key.key_suffix = key_suffix(new_api_key)
     key.last_used_at = None
 
     try:

@@ -56,30 +56,30 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.core.config import GatewayConfig
-from gateway.models.tenancy import User
-from gateway.repositories.tenancy import UserRepository
-from gateway.services.dashboard_session_service import revoke_user_dashboard_sessions
-from gateway.services.mail import Mailer
-from gateway.services.password_service import (
-    MAX_PASSWORD_BYTES,
-    MIN_PASSWORD_LENGTH,
-    hash_password_async,
-    verify_absent_password_async,
-    verify_password_async,
-)
-from gateway.services.tenancy.email_address import validated_email
-from gateway.services.tenancy.errors import (
+from gateway.exceptions.identity_exceptions import (
     CurrentPasswordIncorrectError,
     EmailAlreadyInUseError,
     EmailNotVerifiedError,
     InvalidCredentialsError,
     PasswordNotSetError,
-    PasswordPolicyError,
     ResetTokenInvalidError,
     SignInAddressRequiredError,
     UnmodifiedPasswordError,
     VerificationTokenInvalidError,
 )
+from gateway.models.tenancy import User
+from gateway.repositories.tenancy import UserRepository
+from gateway.services.dashboard_session_service import revoke_user_dashboard_sessions
+from gateway.services.mail import Mailer
+from gateway.services.password_service import (
+    hash_password_async,
+    verify_absent_password_async,
+    verify_password_async,
+)
+from gateway.services.tenancy.email_address import validated_email
+from gateway.services.tenancy.membership_listener import MembershipListener
+from gateway.services.tenancy.organization_service import OrganizationService
+from gateway.services.tenancy.password_policy import validate_new_password
 from gateway.services.tenancy.password_reset_email import render_password_reset_email
 from gateway.services.tenancy.provisioning_service import load_bootstrap_identity
 from gateway.services.tenancy.tokens import generate_token, hash_token
@@ -199,7 +199,7 @@ async def set_password(
     change elsewhere (the operator recovers the account before the link is
     opened, say) would still work, letting whoever holds it undo the change.
     """
-    _validate_password(new_password)
+    validate_new_password(new_password)
     vouches_for_the_address = email is not None or identity.hashed_password is None
     if email is not None:
         identity.email = await _claimable_email(db, identity, email)
@@ -236,6 +236,24 @@ async def set_password(
     await db.refresh(identity)
 
 
+async def update_full_name(db: AsyncSession, identity: User, *, full_name: str | None) -> User:
+    """Set the name an identity goes by, or clear it, and commit.
+
+    Whitespace is collapsed to single spaces and a value that holds nothing else
+    becomes NULL, which is the same state an identity starts in: a roster entry
+    added by address has no name until somebody supplies one, and going back to
+    that has to be reachable from the surface that supplies it. Every reader
+    already falls back to the address, so clearing is a choice rather than a
+    broken row.
+    """
+    normalized = " ".join(full_name.split()) if full_name else ""
+    identity.full_name = normalized or None
+    db.add(identity)
+    await db.commit()
+    await db.refresh(identity)
+    return identity
+
+
 async def create_user_for_signup(
     db: AsyncSession,
     config: GatewayConfig,
@@ -243,36 +261,34 @@ async def create_user_for_signup(
     background_tasks: BackgroundTasks,
     email: str,
     password: str,
+    membership_listener: MembershipListener,
     full_name: str | None = None,
     terms_accepted: bool = False,
 ) -> User | None:
-    """Claim an identity ``organization_service`` already put on the roster, or do nothing.
+    """Claim an identity ``organization_service`` already put on the roster, register a new
+    one where the deployment allows it, or do nothing.
 
-    This edition's signup only ever completes an identity an admin already
-    added or invited by address (password-less, per that service's own
-    docstrings): it never creates one from nothing. Enumeration-safe the same
-    way ``resend_verification_email`` and ``request_password_reset`` are: an
-    address nobody has touched, one that already has a password, and one whose
-    identity has been deactivated all return with nothing written and nothing
-    mailed, and only a genuinely pending identity is claimed. Deactivation is
-    checked here for the reason ``verify_email`` and ``reset_password`` already
-    check it: it has to close every road in, and without this an identity
-    deactivated before it ever signed up could still have a password set and a
-    live verification token minted on it, waiting to become usable the moment
-    an operator reactivated it. An earlier version of this call answered the
-    three cases with distinguishable 404/409/200 statuses, which let an
-    unauthenticated caller enumerate an organization's roster and signup
-    progress, exactly what the sibling functions were already written to
-    avoid; this closes that gap. ``password`` is still validated and reported
-    on its own shape (too short, too long) before the lookup, since a policy
-    violation says nothing about whether the address exists and checking it
-    first means a bad password answers the same way whether or not the
-    address is real.
+    Which of the three depends on ``open_signup`` (otari-ai#2100). Off, the
+    default and the single-tenant posture, this only ever completes an identity
+    an admin already added or invited by address (password-less, per
+    ``organization_service``'s own docstrings) and creates nothing from nothing,
+    because on a deployment with one tenant anybody who can reach the dashboard
+    could otherwise join it. On, an address nobody has added is registered
+    instead, with an organization and workspace of its own
+    (``OrganizationService.provision_signup_tenancy``), which is how a control
+    plane serving many tenants takes its first member of each.
 
-    Returns the identity that was claimed, or ``None`` on every enumeration-safe
-    path, so a caller can tell the two apart without the response doing so. That
-    is what lets the route notify ``GrowthSignalPort`` of a genuine signup and
-    stay silent otherwise.
+    A refusal writes nothing and mails nothing, so it does not reveal which addresses hold an account.
+    An address that has a password, an address that is already verified, and a deactivated identity are refused.
+    An unknown address is registered where ``open_signup`` is on, and refused otherwise.
+    A verified address is refused because a password set on it would sign in with no proof of the mailbox.
+    A deactivated identity is refused so that no password or verification token waits on it for a reactivation.
+    ``password`` is validated before the lookup, so a policy violation answers the same for every address.
+
+    Returns the identity that was claimed or registered, or ``None`` on every
+    enumeration-safe path, so a caller can tell the two apart without the
+    response doing so. That is what lets the route notify ``GrowthSignalPort`` of
+    a genuine signup and stay silent otherwise.
 
     Refuses before writing anything if this deployment cannot mail the
     verification link: a signup that could never be verified would strand the
@@ -288,11 +304,13 @@ async def create_user_for_signup(
     """
     mailer = Mailer(config)
     mailer.require_ready()
-    _validate_password(password)
+    validate_new_password(password)
 
     address = validated_email(email)
     identity = await UserRepository(db).get_by_email(address)
-    if identity is None or identity.hashed_password is not None or not identity.is_active:
+    if identity is not None and (
+        identity.hashed_password is not None or identity.email_verified_at is not None or not identity.is_active
+    ):
         # Pays the same bcrypt cost the claim path pays hashing a fresh
         # password, so the two cases are closer in wall-clock time than a bare
         # early return would be. Not a full equalization (the claim path also
@@ -301,18 +319,61 @@ async def create_user_for_signup(
         # address with no stored hash.
         await verify_absent_password_async(password)
         return None
+    if identity is None:
+        if not config.open_signup:
+            # The same bcrypt cost as the branch above, for the same reason: an
+            # address this deployment will not register has to answer in about
+            # the time one it would register takes.
+            await verify_absent_password_async(password)
+            return None
+        # Staged into this call's transaction rather than committed on its own,
+        # so the password and verification token below land with it: an account
+        # committed here and nowhere else would be live, password-less and
+        # unverifiable.
+        try:
+            identity = await OrganizationService(db, membership_listener=membership_listener).provision_signup_tenancy(
+                email=address,
+                full_name=full_name,
+            )
+        except IntegrityError as exc:
+            # Two registrations of the same address at once. The unique index on
+            # email decides, and the loser answers like every other
+            # enumeration-safe path rather than reporting a 500 or admitting
+            # that the address is now taken.
+            #
+            # Matched on that index rather than on "an IntegrityError happened",
+            # the same discrimination ``update_password`` already makes with
+            # this helper: the other constraints this unit of work can violate
+            # (the organization slug, a membership) are not a taken address, and
+            # swallowing one as though it were would answer a failed
+            # registration with the sentence that says it succeeded.
+            await db.rollback()
+            if not _is_email_conflict(exc):
+                raise
+            return None
 
-    identity.full_name = identity.full_name or full_name
-    identity.hashed_password = await hash_password_async(password)
-    if terms_accepted:
-        identity.terms_accepted_at = datetime.now(UTC)
     token = generate_token()
-    identity.email_verification_token_hash = hash_token(token)
-    identity.email_verification_token_expires_at = datetime.now(UTC) + timedelta(
-        hours=config.email_verification_expiry_hours
+    values: dict[str, str | datetime | None] = {
+        "full_name": identity.full_name or full_name,
+        "email_verification_token_hash": hash_token(token),
+        "email_verification_token_expires_at": datetime.now(UTC)
+        + timedelta(hours=config.email_verification_expiry_hours),
+    }
+    if terms_accepted:
+        values["terms_accepted_at"] = datetime.now(UTC)
+    # NOTE: A provider sign-in or another first password can commit after the check above.
+    # The condition in this write decides.
+    claimed = await UserRepository(db).claim_first_password(
+        identity.id,
+        hashed_password=await hash_password_async(password),
+        require_unverified=True,
+        values=values,
     )
-    db.add(identity)
+    if not claimed:
+        await db.rollback()
+        return None
     await db.commit()
+    await db.refresh(identity)
 
     background_tasks.add_task(
         mailer.send,
@@ -484,7 +545,7 @@ async def reset_password(db: AsyncSession, *, token: str, new_password: str) -> 
         raise ResetTokenInvalidError
     if identity.password_reset_token_expires_at < datetime.now(UTC):
         raise ResetTokenInvalidError
-    _validate_password(new_password)
+    validate_new_password(new_password)
 
     identity.hashed_password = await hash_password_async(new_password)
     identity.password_reset_token_hash = None
@@ -525,15 +586,22 @@ async def operator_has_password(db: AsyncSession) -> bool:
     return operator is not None and operator.hashed_password is not None
 
 
-def _validate_password(password: str) -> None:
-    """Refuse a password bcrypt would reject or that is too short to be one."""
-    if len(password) < MIN_PASSWORD_LENGTH:
-        raise PasswordPolicyError(f"A password must be at least {MIN_PASSWORD_LENGTH} characters")
-    if len(password.encode()) > MAX_PASSWORD_BYTES:
-        raise PasswordPolicyError(
-            f"A password must be at most {MAX_PASSWORD_BYTES} bytes; "
-            "accented and non-Latin characters count for more than one each"
-        )
+async def password_sign_in_possible(db: AsyncSession) -> bool:
+    """Whether the email and password form could sign anybody in right now.
+
+    The companion to ``operator_has_password``, and deliberately the broad
+    question that one refuses to answer: any active identity holding a password,
+    not the operator's alone. The two are asked by the bootstrap for different
+    purposes, which is why both exist. ``operator_has_password`` decides whether
+    the *master key* is still a dashboard login, a question only the operator's
+    row can settle. This decides whether the *password* form is worth showing,
+    and every row can settle that, because ``authenticate`` has never cared
+    which identity it is verifying (otari-ai#2100).
+
+    False on a fresh deployment, where the form would be a box with no possible
+    answer, and the master-key branch of the sign-in screen is the only one.
+    """
+    return await UserRepository(db).any_active_with_password()
 
 
 def _is_email_conflict(exc: IntegrityError) -> bool:
@@ -578,10 +646,12 @@ __all__ = [
     "authenticate",
     "create_user_for_signup",
     "operator_has_password",
+    "password_sign_in_possible",
     "request_password_reset",
     "resend_verification_email",
     "reset_password",
     "set_password",
+    "update_full_name",
     "update_password",
     "verify_email",
 ]

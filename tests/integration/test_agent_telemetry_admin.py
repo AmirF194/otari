@@ -8,9 +8,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from conftest import seed_workspace_id
-from gateway.models.entities import AgentTelemetry, APIKey, User
+from gateway.core.config import API_ROOT
+from gateway.models.api_keys import APIKey
+from gateway.models.usage import AgentTelemetry
+from gateway.models.users import User
 
-DELETE_PATH = "/v1/agent-telemetry"
+DELETE_PATH = f"{API_ROOT}/agent-telemetry"
 
 _TS = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
 
@@ -135,9 +138,7 @@ def test_purge_by_filter_user_id_name_and_date_range(
     assert _get(db_session, "bob-1") is not None
 
 
-def test_purge_by_filter_api_key_id(
-    client: TestClient, master_key_header: dict[str, str], db_session: Session
-) -> None:
+def test_purge_by_filter_api_key_id(client: TestClient, master_key_header: dict[str, str], db_session: Session) -> None:
     _make_row(db_session, row_id="key-a-row", user_id="alice", api_key_id="key-a")
     _make_row(db_session, row_id="key-b-row", user_id="alice", api_key_id="key-b")
     db_session.commit()
@@ -161,15 +162,11 @@ def test_purge_matching_zero_rows_is_not_an_error(client: TestClient, master_key
     assert resp.json() == {"deleted": 0}
 
 
-def test_purge_requires_exactly_one_of_ids_or_by_filter(
-    client: TestClient, master_key_header: dict[str, str]
-) -> None:
+def test_purge_requires_exactly_one_of_ids_or_by_filter(client: TestClient, master_key_header: dict[str, str]) -> None:
     neither = client.request("DELETE", DELETE_PATH, json={}, headers=master_key_header)
     assert neither.status_code == 422
 
-    both = client.request(
-        "DELETE", DELETE_PATH, json={"ids": ["x"], "by_filter": True}, headers=master_key_header
-    )
+    both = client.request("DELETE", DELETE_PATH, json={"ids": ["x"], "by_filter": True}, headers=master_key_header)
     assert both.status_code == 422
 
 
@@ -185,7 +182,7 @@ def test_delete_user_removes_only_that_users_agent_telemetry_rows(
     _make_row(db_session, row_id="bob-row", user_id="bob")
     db_session.commit()
 
-    resp = client.delete("/v1/users/alice", headers=master_key_header)
+    resp = client.delete(f"{API_ROOT}/users/alice", headers=master_key_header)
     assert resp.status_code == 204
 
     db_session.expire_all()
@@ -213,7 +210,7 @@ def test_purge_by_filter_removes_metric_rows_alongside_behavioral_ones(
     assert _get(db_session, "alice-metric") is None
     assert _get(db_session, "bob-behavioral") is not None
 
-    count = client.get("/v1/agent-telemetry/count", params={"user_id": "alice"}, headers=master_key_header)
+    count = client.get(f"{API_ROOT}/agent-telemetry/count", params={"user_id": "alice"}, headers=master_key_header)
     assert count.status_code == 200
     assert count.json()["total"] == 0
 
@@ -226,7 +223,7 @@ def test_delete_user_removes_that_users_metric_rows_too(
     _make_metric_row(db_session, row_id="bob-metric", user_id="bob")
     db_session.commit()
 
-    resp = client.delete("/v1/users/alice", headers=master_key_header)
+    resp = client.delete(f"{API_ROOT}/users/alice", headers=master_key_header)
     assert resp.status_code == 204
 
     db_session.expire_all()

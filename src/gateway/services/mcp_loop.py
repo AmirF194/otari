@@ -35,9 +35,10 @@ from gateway.services._tool_loop import (
     run_tool_loop,
     run_tool_loop_stream,
 )
+from gateway.services.tools import MAX_USES_EXCEEDED_ERROR, ToolUseBudget, is_capped_call
 
 if TYPE_CHECKING:
-    from any_llm.types.completion import ChatCompletion, ChatCompletionChunk
+    from any_llm.types.completion import ChatCompletion, ChatCompletionChunk, CompletionUsage
 
 MAX_TOOL_ITERATIONS_CAP = 25
 DEFAULT_MAX_TOOL_ITERATIONS = 10
@@ -177,7 +178,12 @@ def _execute_split(tool_calls: list[dict[str, Any]], pool: ToolBackend) -> tuple
     return mcp_calls, has_foreign
 
 
-async def _execute_mcp_calls(pool: ToolBackend, mcp_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _execute_mcp_calls(
+    pool: ToolBackend,
+    mcp_calls: list[dict[str, Any]],
+    *,
+    budget: ToolUseBudget | None = None,
+) -> list[dict[str, Any]]:
     """Run each MCP tool call and return the resulting tool-role messages.
 
     Tool failures (network errors, server errors, schema mismatches, MCP-specific
@@ -187,6 +193,10 @@ async def _execute_mcp_calls(pool: ToolBackend, mcp_calls: list[dict[str, Any]])
     inherit from ``BaseException`` and never reach the ``Exception`` clause.
     That's the standard idiom for "treat tool failures as recoverable, let
     cancellation propagate".
+
+    A search past ``budget`` is refused the same way, as a tool error rather than a
+    native result block: this format has no vocabulary for a server-side tool call,
+    so the plain string is all a caller can be told.
     """
     out: list[dict[str, Any]] = []
     for tc in mcp_calls:
@@ -195,17 +205,37 @@ async def _execute_mcp_calls(pool: ToolBackend, mcp_calls: list[dict[str, Any]])
             args = json.loads(tc["function"]["arguments"] or "{}")
         except json.JSONDecodeError:
             args = {}
+        capped = is_capped_call(budget, pool, name)
+        if capped and budget is not None and budget.exhausted():
+            out.append({"role": "tool", "tool_call_id": tc["id"] or "", "content": MAX_USES_EXCEEDED_ERROR})
+            continue
         try:
             text = await pool.call_tool(name, args)
+        except MaxToolIterationsExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 — see docstring
             logger.warning("MCP tool %s execution failed: %s", name, exc)
             text = f"[tool error] {exc}"
+        else:
+            if capped and budget is not None:
+                budget.record(text)
         out.append({"role": "tool", "tool_call_id": tc["id"] or "", "content": text})
     return out
 
 
+def _add_usage(acc: dict[str, int], usage: CompletionUsage | None) -> None:
+    """Add one round's usage to the loop's running totals."""
+    if usage is None:
+        return
+    acc["prompt"] += usage.prompt_tokens or 0
+    acc["completion"] += usage.completion_tokens or 0
+    details = usage.prompt_tokens_details
+    if details is not None:
+        acc["cache_read"] += details.cached_tokens or 0
+
+
 def _fold_usage(
-    completion: ChatCompletion,
+    completion: ChatCompletion | ChatCompletionChunk,
     prompt_total: int,
     completion_total: int,
     cache_read_total: int = 0,
@@ -235,6 +265,10 @@ class _ChatStreamState:
         self.slots: dict[int, dict[str, Any]] = {}
         self.finish_reason: str | None = None
         self.pending_terminal: ChatCompletionChunk | None = None
+        # The ``include_usage`` chunks (usage set, no choices) that OpenAI, and
+        # any-llm's Anthropic adapter, send after the finish chunk. Held back with
+        # it, so the rounds the loop hides are billed on the one the client sees.
+        self.usage_chunks: list[ChatCompletionChunk] = []
         self.mcp_calls: list[dict[str, Any]] = []
         # Upstream tool_call index -> the index the client sees. Gateway-owned calls
         # are dropped from the stream, so the surviving foreign calls have to be
@@ -243,6 +277,15 @@ class _ChatStreamState:
         # official OpenAI client raise IndexError.
         self.visible_tool_index: dict[int, int] = {}
         self.next_visible_tool_index = 0
+
+    def deferred_terminal(self) -> list[ChatCompletionChunk]:
+        """The round's held-back chunks, in stream order."""
+        head = [self.pending_terminal] if self.pending_terminal is not None else []
+        return [*head, *self.usage_chunks]
+
+    def usage_carrier(self) -> ChatCompletionChunk | None:
+        """The chunk carrying this round's usage report: the last one that has usage."""
+        return next((c for c in reversed(self.deferred_terminal()) if c.usage is not None), None)
 
 
 class _ChatToolLoopStrategy:
@@ -253,6 +296,11 @@ class _ChatToolLoopStrategy:
     """
 
     transcript_key = "messages"
+
+    def __init__(self, *, budget: ToolUseBudget | None = None) -> None:
+        # Absent unless the caller capped the searches, which keeps the shared
+        # instance in ``_strategy_for`` free of per-request state.
+        self._budget = budget
 
     def coerce_transcript(self, value: Any) -> list[Any]:
         return list(value or [])
@@ -270,12 +318,7 @@ class _ChatToolLoopStrategy:
         return {"prompt": 0, "completion": 0, "cache_read": 0}
 
     def accumulate_usage(self, acc: dict[str, int], result: ChatCompletion) -> None:
-        if result.usage:
-            acc["prompt"] += result.usage.prompt_tokens or 0
-            acc["completion"] += result.usage.completion_tokens or 0
-            details = result.usage.prompt_tokens_details
-            if details is not None:
-                acc["cache_read"] += details.cached_tokens or 0
+        _add_usage(acc, result.usage)
 
     def fold_usage(self, result: ChatCompletion, acc: dict[str, int]) -> None:
         _fold_usage(result, acc["prompt"], acc["completion"], acc["cache_read"])
@@ -303,12 +346,10 @@ class _ChatToolLoopStrategy:
     def exit_after_split(self, result: ChatCompletion) -> bool:
         return False
 
-    async def execute_owned(
-        self, pool: ToolBackend, owned: list[Any], acc: Any = None
-    ) -> list[dict[str, Any]]:
+    async def execute_owned(self, pool: ToolBackend, owned: list[Any], acc: Any = None) -> list[dict[str, Any]]:
         # ``acc`` is accepted for interface parity and unused: this format has no
         # native vocabulary for a server-side tool call to report on a mixed batch.
-        return await _execute_mcp_calls(pool, owned)
+        return await _execute_mcp_calls(pool, owned, budget=self._budget)
 
     def filter_owned(self, result: ChatCompletion, owned: list[Any], pool: ToolBackend) -> None:
         # Mixed batch: the MCP-owned subset was executed internally so its
@@ -339,7 +380,7 @@ class _ChatToolLoopStrategy:
         acc: Any = None,
     ) -> None:
         transcript.append({"role": "assistant", "tool_calls": owned})
-        transcript.extend(await _execute_mcp_calls(pool, owned))
+        transcript.extend(await _execute_mcp_calls(pool, owned, budget=self._budget))
 
     # ---- streaming hooks ----
 
@@ -350,19 +391,21 @@ class _ChatToolLoopStrategy:
     def new_stream_state(self) -> _ChatStreamState:
         return _ChatStreamState()
 
-    def new_stream_accumulator(self) -> None:
-        # Chat streaming does not fold cumulative usage into the terminal
-        # chunk (parity with the pre-engine behavior); streaming usage
-        # accounting happens downstream in `streaming_generator`.
-        return None
+    def new_stream_accumulator(self) -> dict[str, int]:
+        # Usage of the rounds the loop hid, folded into the final round's report
+        # by ``terminal_events``: the client sees one usage chunk for the loop.
+        return self.new_usage_accumulator()
 
     def observe(
         self,
         state: _ChatStreamState,
         event: ChatCompletionChunk,
         pool: ToolBackend,
-        acc: None,
+        acc: dict[str, int],
     ) -> tuple[StreamAction, ChatCompletionChunk]:
+        if not event.choices and event.usage is not None:
+            state.usage_chunks.append(event)
+            return StreamAction.DEFER, event
         chunk_is_terminal = False
         hide = False
         visible = event
@@ -457,21 +500,27 @@ class _ChatToolLoopStrategy:
         return has_foreign or not state.mcp_calls
 
     async def finalize_exit(
-        self, state: _ChatStreamState, pool: ToolBackend, acc: None
+        self, state: _ChatStreamState, pool: ToolBackend, acc: dict[str, int]
     ) -> AsyncIterator[ChatCompletionChunk]:
         del acc
         if state.mcp_calls:
-            await _execute_mcp_calls(pool, state.mcp_calls)
+            await _execute_mcp_calls(pool, state.mcp_calls, budget=self._budget)
         return
         yield  # pragma: no cover - makes this a no-event async iterator
 
-    def terminal_events(self, state: _ChatStreamState, acc: None) -> list[ChatCompletionChunk]:
-        return [state.pending_terminal] if state.pending_terminal is not None else []
+    def terminal_events(self, state: _ChatStreamState, acc: dict[str, int]) -> list[ChatCompletionChunk]:
+        carrier = state.usage_carrier()
+        if carrier is not None:
+            totals = dict(acc)
+            _add_usage(totals, carrier.usage)
+            _fold_usage(carrier, totals["prompt"], totals["completion"], totals["cache_read"])
+        return state.deferred_terminal()
 
-    def accumulate_stream_usage(self, acc: None, state: _ChatStreamState) -> None:
-        return None
+    def accumulate_stream_usage(self, acc: dict[str, int], state: _ChatStreamState) -> None:
+        carrier = state.usage_carrier()
+        _add_usage(acc, carrier.usage if carrier is not None else None)
 
-    def synthetic_events(self, state: _ChatStreamState, acc: None) -> list[Any]:
+    def synthetic_events(self, state: _ChatStreamState, acc: dict[str, int]) -> list[Any]:
         # This format has no native vocabulary for a server-side tool call, so the
         # gateway's calls stay invisible on the wire. Documented in docs/tools.md.
         return []
@@ -481,13 +530,13 @@ class _ChatToolLoopStrategy:
         transcript: list[Any],
         state: _ChatStreamState,
         pool: ToolBackend,
-        acc: None,
+        acc: dict[str, int],
     ) -> AsyncIterator[ChatCompletionChunk]:
         del acc
         # All-MCP: the terminal chunk was silently dropped so the client
         # doesn't think this iteration's response was the final answer.
         transcript.append({"role": "assistant", "tool_calls": state.mcp_calls})
-        transcript.extend(await _execute_mcp_calls(pool, state.mcp_calls))
+        transcript.extend(await _execute_mcp_calls(pool, state.mcp_calls, budget=self._budget))
         return
         yield  # pragma: no cover - makes this a no-event async iterator
 
@@ -495,11 +544,23 @@ class _ChatToolLoopStrategy:
 _CHAT_STRATEGY = _ChatToolLoopStrategy()
 
 
+def _strategy_for(budget: ToolUseBudget | None) -> _ChatToolLoopStrategy:
+    """The shared strategy, or a per-request one when the caller capped searches.
+
+    Only a capped request has anything per-request to hold, so every other request
+    keeps reusing the single module-level instance.
+    """
+    if budget is None:
+        return _CHAT_STRATEGY
+    return _ChatToolLoopStrategy(budget=budget)
+
+
 async def mcp_tool_loop_stream(
     *,
     completion_kwargs: dict[str, Any],
     pool: ToolBackend,
     max_iterations: int,
+    use_budget: ToolUseBudget | None = None,
 ) -> AsyncGenerator[ChatCompletionChunk, None]:
     """Yield chunks across multiple `acompletion(stream=True)` calls, with MCP execution between rounds.
 
@@ -521,7 +582,7 @@ async def mcp_tool_loop_stream(
     # instead of waiting for event-loop async-generator finalization.
     async with aclosing(
         run_tool_loop_stream(
-            strategy=_CHAT_STRATEGY,
+            strategy=_strategy_for(use_budget),
             completion_kwargs=completion_kwargs,
             pool=pool,
             max_iterations=max_iterations,
@@ -537,6 +598,7 @@ async def mcp_tool_loop(
     pool: ToolBackend,
     max_iterations: int,
     on_first_response: Callable[[], None] | None = None,
+    use_budget: ToolUseBudget | None = None,
 ) -> ChatCompletion:
     """Non-streaming variant. Accumulates usage across iterations into the returned completion.
 
@@ -545,7 +607,7 @@ async def mcp_tool_loop(
     loop in :mod:`gateway.api.routes.chat` is the consumer.
     """
     return await run_tool_loop(
-        strategy=_CHAT_STRATEGY,
+        strategy=_strategy_for(use_budget),
         completion_kwargs=completion_kwargs,
         pool=pool,
         max_iterations=max_iterations,

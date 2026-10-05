@@ -1,18 +1,27 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { render, screen } from "@testing-library/react"
+import { render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import type { ReactElement } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type {
   ConfigField,
+  DeploymentBootstrap,
   GatewaySettings,
   MailSettings,
   ReencryptProviderCredentialsResult,
   StoredProvider,
 } from "@/client"
 import { AuthProvider } from "@/features/auth/AuthContext"
-import { fieldMatches, SettingsPage } from "@/features/settings/SettingsPage"
+import {
+  fieldMatches,
+  rateLimitRulesMatch,
+  rulesCardAfter,
+  SettingsPage,
+} from "@/features/settings/SettingsPage"
+import { API_ROOT } from "@/shared/api/client"
+import { DeploymentProvider } from "@/shared/hooks/useDeployment"
+import { bootstrap } from "@/tests/fixtures"
 import { pickOption } from "@/tests/select"
 
 describe("fieldMatches", () => {
@@ -41,6 +50,39 @@ describe("fieldMatches", () => {
 
   it("does not match unrelated text", () => {
     expect(fieldMatches(field, "database")).toBe(false)
+  })
+})
+
+describe("rulesCardAfter", () => {
+  const all = [
+    { name: "Server & database" },
+    { name: "Rate limiting & CORS" },
+    { name: "Observability" },
+  ]
+
+  it("follows the rate limiting group", () => {
+    expect(rulesCardAfter(all, all)).toBe(1)
+  })
+
+  it("keeps its place when a filter hides that group", () => {
+    const shown = [{ name: "Server & database" }, { name: "Observability" }]
+    expect(rulesCardAfter(shown, all)).toBe(0)
+    expect(rulesCardAfter([{ name: "Observability" }], all)).toBe(-1)
+  })
+
+  it("goes last when the settings name no rate limiting group", () => {
+    const other = [{ name: "Server & database" }, { name: "Observability" }]
+    expect(rulesCardAfter(other, other)).toBe(1)
+  })
+})
+
+describe("rateLimitRulesMatch", () => {
+  it("is found by what it limits and by its name", () => {
+    expect(rateLimitRulesMatch("")).toBe(true)
+    expect(rateLimitRulesMatch("rate")).toBe(true)
+    expect(rateLimitRulesMatch("tokens per minute")).toBe(true)
+    expect(rateLimitRulesMatch("rate_limits")).toBe(true)
+    expect(rateLimitRulesMatch("database")).toBe(false)
   })
 })
 
@@ -176,13 +218,18 @@ function storedProvider(
   }
 }
 
-function renderWithClient(ui: ReactElement) {
+function renderWithClient(
+  ui: ReactElement,
+  deployment: Partial<DeploymentBootstrap> = {},
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   return render(
     <QueryClientProvider client={client}>
-      <AuthProvider>{ui}</AuthProvider>
+      <DeploymentProvider value={bootstrap(deployment)}>
+        <AuthProvider>{ui}</AuthProvider>
+      </DeploymentProvider>
     </QueryClientProvider>,
   )
 }
@@ -202,6 +249,7 @@ function mockApi(
   stored: StoredProvider[] = [],
   reencryptResult: ReencryptProviderCredentialsResult = {
     reencrypted: 1,
+    skipped: 0,
     unreadable: 0,
   },
 ) {
@@ -213,7 +261,7 @@ function mockApi(
       const url = String(input)
       const method = (init?.method ?? "GET").toUpperCase()
       if (
-        url.includes("/v1/provider-credentials/reencrypt") &&
+        url.includes(`${API_ROOT}/provider-credentials/reencrypt`) &&
         method === "POST"
       ) {
         storedList = storedList.map((provider) => ({
@@ -222,18 +270,18 @@ function mockApi(
         }))
         return jsonResponse(reencryptResult)
       }
-      if (url.includes("/v1/provider-credentials")) {
+      if (url.includes(`${API_ROOT}/provider-credentials`)) {
         return jsonResponse(storedList)
       }
       // Ahead of the /v1/settings branch below, which would otherwise answer
       // the mail card's request with the whole settings payload.
-      if (url.includes("/v1/settings/mail")) {
+      if (url.includes(`${API_ROOT}/settings/mail`)) {
         return jsonResponse(MAIL_SETTINGS)
       }
-      if (url.includes("/v1/settings/master-key/rotate")) {
+      if (url.includes(`${API_ROOT}/settings/master-key/rotate`)) {
         return jsonResponse({ master_key: "otari-mk-new" })
       }
-      if (url.includes("/v1/settings")) {
+      if (url.includes(`${API_ROOT}/settings`)) {
         if (method === "PATCH") {
           const body = JSON.parse(String(init?.body)) as Record<string, unknown>
           current = {
@@ -252,6 +300,41 @@ function mockApi(
     })
 }
 
+// The same settings after a second operator raised the cache TTL and named a
+// describe model, with this operator's own switch flip alongside them.
+const MOVED_SETTINGS: GatewaySettings = {
+  ...SETTINGS,
+  model_discovery: false,
+  config: SETTINGS.config.map((field) => {
+    if (field.key === "model_cache_ttl_seconds") return { ...field, value: 900 }
+    if (field.key === "model_discovery") return { ...field, value: false }
+    if (field.key === "vision_describe_model") {
+      return { ...field, value: "ollama/qwen2-vl" }
+    }
+    return field
+  }),
+}
+
+// Serves `before` until a PATCH lands and `after` from then on: a second
+// operator's change reaches this page on the response to its own save, which
+// writes the whole settings payload back into the cache.
+function mockApiMovingTo(before: GatewaySettings, after: GatewaySettings) {
+  let current = before
+  return vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url.includes(`${API_ROOT}/settings/mail`)) {
+        return jsonResponse(MAIL_SETTINGS)
+      }
+      if (url.includes(`${API_ROOT}/settings`)) {
+        if ((init?.method ?? "GET").toUpperCase() === "PATCH") current = after
+        return jsonResponse(current)
+      }
+      return jsonResponse([])
+    })
+}
+
 describe("SettingsPage", () => {
   beforeEach(() => {
     window.localStorage.setItem("otari.dashboard.hasSession", "1")
@@ -259,6 +342,24 @@ describe("SettingsPage", () => {
   afterEach(() => {
     vi.restoreAllMocks()
     window.localStorage.clear()
+  })
+
+  it("offers the rate limit rules on a standalone gateway", async () => {
+    mockApi()
+
+    renderWithClient(<SettingsPage />)
+
+    await screen.findByText(/Version 1.2.3/)
+    expect(screen.getByText("Rate limit rules")).toBeInTheDocument()
+  })
+
+  it("does not offer the rate limit rules on a hosted control plane", async () => {
+    mockApi()
+
+    renderWithClient(<SettingsPage />, { deployment_type: "hosted" })
+
+    await screen.findByText(/Version 1.2.3/)
+    expect(screen.queryByText("Rate limit rules")).not.toBeInTheDocument()
   })
 
   it("reflects the current settings on its switches", async () => {
@@ -295,7 +396,7 @@ describe("SettingsPage", () => {
       ([, init]) => (init?.method ?? "") === "PATCH",
     )
     expect(call).toBeDefined()
-    expect(String(call?.[0])).toContain("/v1/settings")
+    expect(String(call?.[0])).toContain(`${API_ROOT}/settings`)
     expect(JSON.parse(String(call?.[1]?.body))).toEqual({
       model_discovery: false,
     })
@@ -319,10 +420,18 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument()
     await user.click(screen.getByRole("button", { name: "Regenerate key" }))
 
-    const revealedKey = await screen.findByDisplayValue("otari-mk-new")
-    expect(revealedKey).toHaveAttribute("autocomplete", "off")
-    expect(revealedKey).toHaveAttribute("data-1p-ignore")
-    expect(revealedKey).toHaveAttribute("data-lpignore", "true")
+    // Concealed until it is asked for, so the replacement key is not on screen
+    // for anyone who happens to be looking at it (otari-ai#2111).
+    const keyField = await screen.findByLabelText("New master key")
+    expect(keyField).not.toHaveValue("otari-mk-new")
+    expect(keyField).toHaveAttribute("autocomplete", "off")
+    expect(keyField).toHaveAttribute("data-1p-ignore")
+    expect(keyField).toHaveAttribute("data-lpignore", "true")
+
+    await user.click(
+      screen.getByRole("button", { name: "Show New master key" }),
+    )
+    expect(await screen.findByDisplayValue("otari-mk-new")).toBeInTheDocument()
     expect(
       screen.getByRole("alertdialog", { name: "Master key regenerated" }),
     ).toBeInTheDocument()
@@ -373,7 +482,7 @@ describe("SettingsPage", () => {
 
     const call = fetchMock.mock.calls.find(
       ([url, init]) =>
-        String(url).endsWith("/v1/provider-credentials/reencrypt") &&
+        String(url).endsWith(`${API_ROOT}/provider-credentials/reencrypt`) &&
         (init?.method ?? "") === "POST",
     )
     expect(call).toBeDefined()
@@ -572,6 +681,109 @@ describe("SettingsPage", () => {
     await user.clear(input)
     await user.type(input, "5")
     expect(save).not.toBeDisabled()
+  })
+
+  it("shows a whitespace-only save as the unset value it stored", async () => {
+    // Whitespace clears the field, so the box goes back to its placeholder and
+    // Save disarms rather than offering to send the same null again.
+    const withValue = {
+      ...SETTINGS,
+      config: SETTINGS.config.map((field) =>
+        field.key === "vision_describe_model"
+          ? { ...field, value: "ollama/qwen2-vl" }
+          : field,
+      ),
+    }
+    const fetchMock = mockApi(withValue)
+    const user = userEvent.setup()
+
+    renderWithClient(<SettingsPage />)
+    await screen.findByText(/Version 1.2.3/)
+
+    const input = screen.getByRole("textbox", { name: "vision_describe_model" })
+    await user.clear(input)
+    await user.type(input, "   ")
+    await user.click(
+      screen.getByRole("button", { name: "Save vision_describe_model" }),
+    )
+
+    const call = fetchMock.mock.calls.find(
+      ([, init]) => (init?.method ?? "") === "PATCH",
+    )
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({
+      vision_describe_model: null,
+    })
+
+    await waitFor(() => {
+      expect(input).toHaveValue("")
+    })
+    expect(
+      screen.getByRole("button", { name: "Save vision_describe_model" }),
+    ).toBeDisabled()
+  })
+
+  it("keeps an unsaved numeric edit when another operator's value arrives", async () => {
+    mockApiMovingTo(SETTINGS, MOVED_SETTINGS)
+    const user = userEvent.setup()
+
+    renderWithClient(<SettingsPage />)
+    await screen.findByText(/Version 1.2.3/)
+
+    const input = screen.getByRole("spinbutton", {
+      name: "model_cache_ttl_seconds",
+    })
+    await user.clear(input)
+    await user.type(input, "60")
+
+    // Any save on the page writes the whole payload back, so the other
+    // operator's 900 reaches a field this one is still typing in.
+    await user.click(screen.getByRole("switch", { name: "model_discovery" }))
+    await waitFor(() => {
+      expect(
+        screen.getByRole("switch", { name: "model_discovery" }),
+      ).toHaveAttribute("aria-checked", "false")
+    })
+
+    expect(input).toHaveValue(60)
+  })
+
+  it("keeps an unsaved text edit when another operator's value arrives", async () => {
+    mockApiMovingTo(SETTINGS, MOVED_SETTINGS)
+    const user = userEvent.setup()
+
+    renderWithClient(<SettingsPage />)
+    await screen.findByText(/Version 1.2.3/)
+
+    const input = screen.getByRole("textbox", { name: "vision_describe_model" })
+    await user.type(input, "ollama/llama-vision")
+
+    await user.click(screen.getByRole("switch", { name: "model_discovery" }))
+    await waitFor(() => {
+      expect(
+        screen.getByRole("switch", { name: "model_discovery" }),
+      ).toHaveAttribute("aria-checked", "false")
+    })
+
+    expect(input).toHaveValue("ollama/llama-vision")
+  })
+
+  it("follows the server on a field with no unsaved edit", async () => {
+    mockApiMovingTo(SETTINGS, MOVED_SETTINGS)
+    const user = userEvent.setup()
+
+    renderWithClient(<SettingsPage />)
+    await screen.findByText(/Version 1.2.3/)
+
+    await user.click(screen.getByRole("switch", { name: "model_discovery" }))
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("spinbutton", { name: "model_cache_ttl_seconds" }),
+      ).toHaveValue(900)
+    })
+    expect(
+      screen.getByRole("textbox", { name: "vision_describe_model" }),
+    ).toHaveValue("ollama/qwen2-vl")
   })
 
   it("shows an empty state when nothing matches the search", async () => {

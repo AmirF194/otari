@@ -9,9 +9,9 @@ import click
 import uvicorn
 from uvicorn.config import logger
 
-from gateway.core.config import load_config
+from gateway.core.config import API_ROOT, load_config
 from gateway.log_config import setup_logger
-from gateway.main import create_app
+from gateway.services.url_safety import redact_url_secrets
 
 _LOG_LEVEL_NAMES: dict[str, int] = {
     "DEBUG": logging.DEBUG,
@@ -33,8 +33,7 @@ def _parse_log_level(ctx: click.Context, param: click.Parameter, value: str | No
         return int(normalized)
     choices = ", ".join(_LOG_LEVEL_NAMES)
     raise click.BadParameter(
-        f"{value!r} is not a valid log level. Choose one of {choices} (case-insensitive) "
-        "or a numeric level such as 20."
+        f"{value!r} is not a valid log level. Choose one of {choices} (case-insensitive) or a numeric level such as 20."
     )
 
 
@@ -87,6 +86,8 @@ def serve(
     log_level: int,
 ) -> None:
     """Start the Otari server."""
+    from gateway.main import create_app
+
     if workers > 1:
         raise click.ClickException(
             "Otari does not support running more than one worker process yet. "
@@ -147,6 +148,7 @@ def serve(
             app,
             host=gateway_config.host,
             port=gateway_config.port,
+            forwarded_allow_ips=gateway_config.forwarded_allow_ips,
         )
     except KeyboardInterrupt:
         logger.info("\nShutting down Otari...")
@@ -165,7 +167,7 @@ def init_db(config: str | None, database_url: str | None) -> None:
     if database_url:
         gateway_config.database_url = database_url
 
-    click.echo(f"Initializing database: {gateway_config.database_url}")
+    click.echo(f"Initializing database: {redact_url_secrets(gateway_config.database_url)}")
 
     db_init(gateway_config)
 
@@ -192,7 +194,7 @@ def migrate(config: str | None, database_url: str | None, revision: str) -> None
         click.echo("alembic command not found in PATH", err=True)
         sys.exit(1)
 
-    click.echo(f"Running migrations on: {gateway_config.database_url}")
+    click.echo(f"Running migrations on: {redact_url_secrets(gateway_config.database_url)}")
     click.echo(f"Target revision: {revision}")
 
     env = os.environ.copy()
@@ -224,6 +226,18 @@ def gen_secret_key() -> None:
     from gateway.services.secret_box import generate_secret_key
 
     click.echo(generate_secret_key())
+
+
+@cli.command(name="gen-provider-account-pepper")
+def gen_provider_account_pepper() -> None:
+    """Print a fresh OTARI_PROVIDER_ACCOUNT_PEPPER for naming the provider accounts that hold file copies.
+
+    A deployment that makes provider copies will not start without one. Losing
+    it costs nothing but a fresh copy of each file the next time it is used.
+    """
+    import secrets
+
+    click.echo(secrets.token_urlsafe(32))
 
 
 @cli.group()
@@ -283,7 +297,7 @@ def routing_explain(
     """
     from gateway.models.routing import PolicySpec
     from gateway.services.routing import BudgetState, NoEligibleCandidatesError, compile_policy
-    from gateway.services.routing.backends import backend_is_weighted
+    from gateway.services.routing.backends import backend_is_priority, backend_is_weighted
     from gateway.services.routing.decide import explain_router_ordering
 
     cfg = load_config(config)
@@ -291,7 +305,7 @@ def routing_explain(
         click.echo(
             "No routing policies are configured in config.yml. Add a `routing.policies` block there, or, if "
             "your policies were created through the dashboard or the API, note that this command reads config "
-            "only: it has no database. Use `POST /v1/routing/policies/explain` against a running gateway to "
+            f"only: it has no database. Use `POST {API_ROOT}/routing/policies/explain` against a running gateway to "
             "compile a stored policy."
         )
         raise SystemExit(1)
@@ -301,8 +315,10 @@ def routing_explain(
     if policy_name is None:
         click.echo("Configured policies:")
         for name, listed in cfg.routing.policies.items():
-            shape = f"router:{listed.router_backend}" if listed.router_backend else (
-                "dynamic" if listed.is_dynamic else "static"
+            shape = (
+                f"router:{listed.router_backend}"
+                if listed.router_backend
+                else ("dynamic" if listed.is_dynamic else "static")
             )
             candidates = len(listed.router_candidates) or 1
             click.echo(f"  {name}  ({shape}, {candidates + len(listed.on_failure)} candidate(s))")
@@ -341,12 +357,8 @@ def routing_explain(
     click.echo(f"{policy_name}: {len(plan.attempts)} candidate(s), selected by {plan.selection_reason}")
     for attempt in plan.attempts:
         canonical = f"{attempt.instance}:{attempt.model}"
-        label = (
-            f"weighted {shares[canonical]:.0f}%" if canonical in shares else attempt.selection_reason
-        )
-        click.echo(
-            f"  {attempt.position}. {canonical}    [{label}]  dispatches as {attempt.dispatch_model}"
-        )
+        label = f"weighted {shares[canonical]:.0f}%" if canonical in shares else attempt.selection_reason
+        click.echo(f"  {attempt.position}. {canonical}    [{label}]  dispatches as {attempt.dispatch_model}")
     for dropped in plan.dropped:
         click.echo(f"  x  {dropped.selector}    dropped: {dropped.detail}")
     # Keyed on the backend rather than on the shares: a weighted policy whose whole
@@ -362,6 +374,11 @@ def routing_explain(
             "whatever the failure chain leaves. Every candidate in the split is listed as dropped, with "
             "the reason it went."
         )
+    elif backend_is_priority(spec.router_backend):
+        click.echo(
+            "  priority: each request goes to the first candidate above that has room under its per: model "
+            "rate limits, then on_failure. A candidate that fails before responding falls to the next one."
+        )
     elif spec.router_backend is not None:
         # The plan above is the *decline* path, because a router needs a live
         # request (a prompt to embed, stored examples to compare it against) and
@@ -375,19 +392,30 @@ def routing_explain(
     if plan.guardrails:
         click.echo("  guardrails (always enforced):")
         for guardrail in plan.guardrails:
-            click.echo(
-                f"    {guardrail.profile}  mode={guardrail.mode}  on_unavailable={guardrail.on_unavailable}"
-            )
+            click.echo(f"    {guardrail.profile}  mode={guardrail.mode}  on_unavailable={guardrail.on_unavailable}")
     if spec.is_dynamic:
         click.echo(
             "  note: this policy selects per request, so it has no single target or price. It works on "
-            "/v1/chat/completions, /v1/messages and /v1/responses; on the other model-taking endpoints "
-            "(embeddings, images, moderations, rerank, batches) it is not a resolvable model name."
+            f"{API_ROOT}/chat/completions, {API_ROOT}/messages and {API_ROOT}/responses; on the other "
+            "model-taking endpoints (embeddings, images, moderations, rerank, batches) it is not a "
+            "resolvable model name."
         )
 
 
+def register(group: click.Group) -> None:
+    """Attach the server commands to the `otari` CLI.
+
+    The console script belongs to the otari-agent distribution (cli/), which
+    calls this when the gateway is installed alongside it (Docker, a dev venv).
+    A Homebrew install of the light CLI never has this module. The group above
+    stays for `python -m gateway.cli` and the tests that invoke it directly.
+    """
+    for command in cli.commands.values():
+        group.add_command(command)
+
+
 def main() -> None:
-    """Entry point for the CLI."""
+    """Entry point for `python -m gateway.cli`."""
     cli()
 
 

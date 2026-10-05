@@ -8,7 +8,7 @@ Deploy Otari and Render Postgres from a Blueprint ([`render.yaml`](./render.yaml
 
 | Resource | Plan | Details |
 | --- | --- | --- |
-| `otari` | Free web service | Published image pinned in `render.yaml`, Oregon, health check at `/health/readiness` |
+| `otari` | Free web service | Published image pinned in `render.yaml`, Oregon, health check at `/api/v1/health/readiness` |
 | `otari-db` | Free Render Postgres 16 | Database and user `otari`, private connections only |
 
 The web service is stateless. Postgres stores users, API key hashes, budgets, pricing, and usage history. On first boot, Otari runs its database migrations and creates a bootstrap API key, which is printed once in the service logs.
@@ -39,19 +39,21 @@ The Blueprint wires the web service and database together. Otari settings use th
 | `OTARI_DEFAULT_PRICING` | `true` | Uses bundled prices for common models while fail-closed pricing stays enabled. |
 | `OTARI_AUTO_MIGRATE` | `true` | Runs Alembic migrations during startup. |
 | `OTARI_BOOTSTRAP_API_KEY` | `true` | Creates a first-use API key when the database has no keys. |
+| `OTARI_SECRET_KEY` | generated | Encrypts provider credentials added on the Providers page. |
+| `OTARI_PROVIDER_ACCOUNT_PEPPER` | generated | Names the provider account a copy of an attached file is in. Otari refuses to start without it while provider copies are on. |
 
 Render's `postgresql://` connection string works without modification. Otari selects the async database driver automatically.
 
 ### Provider credentials
 
-During initial setup, Render prompts for `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `MISTRAL_API_KEY`, and `GEMINI_API_KEY`. Each field is optional, but at least one provider credential is required before the gateway can serve requests. Leave unused fields blank.
+Add providers after deploy, on the dashboard's Providers page (sign in with `OTARI_MASTER_KEY`). That declares the provider, so it serves requests and its models are listed. Any [supported provider](https://docs.mozilla.ai/any-llm/providers/) works. The Blueprint generates `OTARI_SECRET_KEY`, which encrypts those credentials; keep it, since losing it makes them unrecoverable.
 
-The underlying [any-llm](https://github.com/mozilla-ai/any-llm) SDK reads each provider's native environment variables. To use another [supported provider](https://docs.mozilla.ai/any-llm/providers/), add its variable on the service's Environment tab. Render prompts for variables marked `sync: false` only during initial creation, so add or rotate credentials for an existing service from that tab.
+To keep keys in Render environment variables instead, declare the providers through `OTARI_CONFIG_YAML` with `api_key: ${ANTHROPIC_API_KEY}` references. See [Full config via environment](../../docs/configuration.md#full-config-via-environment). Setting a provider's native variable without declaring it is deprecated.
 
 ### Pricing
 
 The Blueprint sets `OTARI_REQUIRE_PRICING=true` (fail closed) and
-`OTARI_DEFAULT_PRICING=true` (bundled fallback prices). Database pricing always takes precedence. For a custom model that is not covered by the bundled data, add pricing through the `/v1/pricing` API, `OTARI_CONFIG_YAML`, or `OTARI_CONFIG_B64`. See [Full config via environment](../../docs/configuration.md#full-config-via-environment).
+`OTARI_DEFAULT_PRICING=true` (bundled fallback prices). Database pricing always takes precedence. For a custom model that is not covered by the bundled data, add pricing through the `/api/v1/pricing` API, `OTARI_CONFIG_YAML`, or `OTARI_CONFIG_B64`. See [Full config via environment](../../docs/configuration.md#full-config-via-environment).
 
 ## Deploy
 
@@ -62,25 +64,26 @@ The Blueprint sets `OTARI_REQUIRE_PRICING=true` (fail closed) and
    deploy/render/render.yaml
    ```
 
-3. Enter the provider credentials you need and leave unused fields blank.
-4. Review the two free resources, then apply the Blueprint.
-5. Wait for `otari` and `otari-db` to become live. Copy the web service's
+3. Review the two free resources, then apply the Blueprint.
+4. Wait for `otari` and `otari-db` to become live. Copy the web service's
    `*.onrender.com` URL from the Dashboard.
+5. Open that URL, sign in with `OTARI_MASTER_KEY` (from the Environment tab),
+   and add at least one provider on the Providers page.
 
 ## Verify
 
 ```bash
 export OTARI_URL=https://<your-service>.onrender.com
 
-curl "$OTARI_URL/health"
-curl "$OTARI_URL/health/readiness"
+curl "$OTARI_URL/api/v1/health"
+curl "$OTARI_URL/api/v1/health/readiness"
 ```
 
 Readiness should report that the database is connected. Find the bootstrap
 `gw-…` key in the `otari` service logs. It is printed in full only once, during the first successful startup.
 
 ```bash
-curl "$OTARI_URL/v1/chat/completions" \
+curl "$OTARI_URL/api/v1/chat/completions" \
   -H "Authorization: Bearer <gw-key>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -89,7 +92,7 @@ curl "$OTARI_URL/v1/chat/completions" \
   }'
 ```
 
-Use a `provider:model` value that matches a credential you supplied. Clients should use `$OTARI_URL/v1` as their OpenAI-compatible base URL.
+Use a `provider:model` value for a provider you added. Clients should use `$OTARI_URL/api/v1` as their OpenAI-compatible base URL.
 
 For a longer-lived deployment, use `OTARI_MASTER_KEY` to create a named API key, then revoke the bootstrap key through the key-management API.
 
@@ -111,7 +114,7 @@ A separate Blueprint, [`render.hybrid.yaml`](./render.hybrid.yaml), deploys hybr
 
 | Resource | Plan | Details |
 | --- | --- | --- |
-| `otari-hybrid` | Free web service | Published image pinned in `render.hybrid.yaml`, Oregon, health check at `/health/readiness` |
+| `otari-hybrid` | Free web service | Published image pinned in `render.hybrid.yaml`, Oregon, health check at `/api/v1/health/readiness` |
 
 No database is created. Otari keeps no local state in hybrid mode: users, budgets, and usage are managed by otari.ai instead.
 
@@ -123,7 +126,7 @@ No database is created. Otari keeps no local state in hybrid mode: users, budget
 | `OTARI_HOST` | `0.0.0.0` | Binds Otari on the container network. |
 | `OTARI_AI_TOKEN` | you provide | The gateway token (`gw_...`) for this Otari instance. Create it in otari.ai under **Organization > Gateways > Create token**. Setting this alone switches Otari into hybrid mode; no `OTARI_MODE` is needed. |
 
-`OTARI_MASTER_KEY`, `OTARI_DATABASE_URL`, the pricing flags, and the migration/bootstrap flags from the standalone Blueprint don't apply here: hybrid mode has no local database or management endpoints to protect. Only `/health`, `/health/liveness`, `/health/readiness`, `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` are exposed. Chat requests use `Authorization: Bearer <otari-user-token>` issued by otari.ai, not a locally minted API key.
+`OTARI_MASTER_KEY`, `OTARI_DATABASE_URL`, the pricing flags, and the migration/bootstrap flags from the standalone Blueprint don't apply here: hybrid mode has no local database or management endpoints to protect. Only `/api/v1/health`, `/api/v1/health/liveness`, `/api/v1/health/readiness`, `/api/v1/chat/completions`, `/api/v1/messages`, and `/api/v1/responses` are exposed. Chat requests use `Authorization: Bearer <otari-user-token>` issued by otari.ai, not a locally minted API key.
 
 ### Deploy
 
@@ -137,14 +140,14 @@ No database is created. Otari keeps no local state in hybrid mode: users, budget
 ```bash
 export OTARI_URL=https://<your-service>.onrender.com
 
-curl "$OTARI_URL/health"
-curl "$OTARI_URL/health/readiness"
+curl "$OTARI_URL/api/v1/health"
+curl "$OTARI_URL/api/v1/health/readiness"
 ```
 
-The `/health` response includes `"mode": "hybrid"` and platform reachability. Then verify a chat request using an otari.ai user token:
+The `/api/v1/health` response includes `"mode": "hybrid"` and platform reachability. Then verify a chat request using an otari.ai user token:
 
 ```bash
-curl "$OTARI_URL/v1/chat/completions" \
+curl "$OTARI_URL/api/v1/chat/completions" \
   -H "Authorization: Bearer <otari-user-token>" \
   -H "Content-Type: application/json" \
   -d '{

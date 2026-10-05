@@ -1,5 +1,13 @@
 ## Description
-<!-- What does this PR do and why? -->
+<!-- In plain English, for a reader with no context on this area: what changes
+     for someone using Otari, and why. A few sentences. Skip the file paths and
+     the class names; the diff and the commits carry those. -->
+
+
+## How to test it locally
+<!-- The steps a reviewer follows to see the change work: what to run, where to
+     look, what they should see. Name the automated checks that cover it too, so
+     a reviewer knows what is already proven and what is left to eyeball. -->
 
 
 ## PR Type
@@ -22,6 +30,7 @@
 - [ ] I ran the Definition of Done checks locally (`make lint`, `make typecheck`, `make test`).
 - [ ] Documentation was updated where necessary.
 - [ ] If the API contract changed, I regenerated the OpenAPI spec (`uv run python scripts/generate_openapi.py`).
+- [ ] If this changes a rule in `ARCHITECTURE.md` or `scripts/check_architecture.py`, the description names the rule and says why.
 
 ## AI Usage
 <!-- Check one -->

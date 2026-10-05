@@ -5,24 +5,33 @@ import re
 import types
 import typing
 from collections.abc import Container
-from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple
 from urllib.parse import urlsplit
 
 import yaml
 from any_llm import AnyLLM, LLMProvider
 from any_llm.exceptions import AnyLLMError
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gateway.core.addresses import normalized_address
 from gateway.core.env import otari_env
+from gateway.core.settings.budgets import BudgetSettings
+from gateway.core.settings.feedback import FeedbackSettings
+from gateway.core.settings.inference import InferenceSettings
+from gateway.core.settings.pricing import PricingSettings
+from gateway.core.settings_view import OMITTED, SECRET, SettingsGroup, Shown
 from gateway.log_config import logger
 from gateway.models.routing import RoutingConfig
+from gateway.models.tools import CodeExecutor
 
 API_KEY_HEADER = "Otari-Key"
+# What may run a code-execution tool call. ``protocol`` is a backend of the
+# operator's own, reached over the published contract; the rest are hosted
+# providers this process drives itself (``adapters/code_execution_adapter.py``).
+SANDBOX_PROVIDERS = frozenset({"protocol", "e2b"})
 # Aliases accepted for a provider instance's ``provider_type`` that map onto a
 # real any-llm implementation. The "openai-compatible" spelling mirrors the
 # naming opencode / pi use for self-hosted OpenAI-compatible backends.
@@ -39,7 +48,7 @@ GATEWAY_TOKEN_HEADER = "X-Gateway-Token"
 
 # The OAuth providers a deployment may configure dashboard sign-in with, in the
 # spelling that appears in a config key (``oauth_google_client_id``), on the
-# wire (``GET /v1/bootstrap``'s ``oauth_providers``, the route path segment),
+# wire (``GET /api/v1/bootstrap``'s ``oauth_providers``, the route path segment),
 # and in the ``user.oauth_provider`` column. One vocabulary rather than four,
 # and it lives here because the config fields are what make a provider real on
 # a deployment; ``services.oauth_service`` holds what each one means.
@@ -62,6 +71,22 @@ CONVERSATION_HEADER = "Otari-Conversation-Id"
 # pass-through until that partition alone is warm; records from other tasks never
 # influence it. Submit the matching label via the /rank task_id.
 ROUTER_TASK_HEADER = "Otari-Router-Task"
+# Response header naming one inference request: the platform's id in hybrid mode,
+# minted by the gateway in standalone. Clients use it to correlate a response with
+# its usage record.
+REQUEST_ID_HEADER = "Otari-Request-ID"
+# Response header naming the single provider attempt that served the request, or
+# the last one tried when every attempt failed. One request id spans several
+# attempt ids, so this is the finer grained of the two. Hybrid mode only: a
+# standalone gateway resolves no attempts to name.
+ATTEMPT_ID_HEADER = "Otari-Attempt-ID"
+# The version this deployment's API is served under. The root is built from it
+# rather than parsed back out of it, so nothing has to guess where the version
+# segment sits in a path.
+API_VERSION = "v1"
+API_ROOT = f"/api/{API_VERSION}"
+# Base only: OTel exporters append /otlp/v1/traces and the other signal paths.
+OTLP_ROOT = "/otlp"
 DEFAULT_PLATFORM_BASE_URL = "https://api.otari.ai/api/v1"
 # Where a hybrid gateway's control plane lives for a person, as opposed to
 # DEFAULT_PLATFORM_BASE_URL above, which is where it lives for the gateway. The
@@ -87,6 +112,13 @@ OTARI_ENV_PREFIX = "OTARI_"
 # (Railway, Render, Fly.io, Kubernetes) where mounting a config.yml is awkward.
 # These carry the entire YAML schema (providers, pricing, etc.), not just the
 # scalar fields reachable via OTARI_<FIELD>. Raw YAML wins when both are set.
+# Instance names a ``providers:`` entry may not take. ``otari`` is the reserved
+# pricing prefix for gateway-run tools; ``hosted`` is the namespace a hosted
+# edition serves its own deployment-owned offerings under, so a self-configured
+# instance of that name would be indistinguishable from one in the catalog.
+HOSTED_OFFERING_INSTANCE = "hosted"
+RESERVED_PROVIDER_INSTANCE_NAMES: frozenset[str] = frozenset({"otari", HOSTED_OFFERING_INSTANCE})
+
 OTARI_CONFIG_YAML_ENV = "OTARI_CONFIG_YAML"
 OTARI_CONFIG_B64_ENV = "OTARI_CONFIG_B64"
 # GatewayConfig fields promoted from ad hoc otari_env() reads in route/service
@@ -98,10 +130,13 @@ OTARI_CONFIG_B64_ENV = "OTARI_CONFIG_B64"
 ENV_BRIDGED_FIELDS = (
     "sandbox_url",
     "guardrails_url",
+    "guardrail_thread_pool_size",
     "tools_header",
     "sandbox_purpose_hint",
     "sandbox_session_image",
     "sandbox_allowed_session_images",
+    "sandbox_provider",
+    "code_execution_executor",
     "web_search_url",
     "web_search_purpose_hint",
     "web_search_engines",
@@ -114,10 +149,6 @@ ENV_BRIDGED_FIELDS = (
 )
 
 
-# Allowed values for the enum config fields. Defined once so the field
-# validators and the runtime-settings layer (which lets the dashboard hot-change
-# these) agree on the accepted set.
-STREAM_MISSING_USAGE_POLICIES = ("estimate", "fail", "allow_free")
 VISION_STRATEGIES = ("describe", "ocr", "off")
 ROUTER_GRANULARITIES = ("trace_sticky", "step")
 # Selectable mail transports, plus the two states that are not a transport:
@@ -125,7 +156,7 @@ ROUTER_GRANULARITIES = ("trace_sticky", "step")
 # even when it is. See GatewayConfig.mail_transport.
 MAIL_TRANSPORT_SETTINGS = ("auto", "smtp", "console", "none")
 
-# Search providers the standalone POST /v1/search endpoint can dispatch to.
+# Search providers the standalone POST /api/v1/search endpoint can dispatch to.
 # Declared here rather than in the adapter module so startup validation can
 # reject an unknown ``search_tools.<name>.provider`` without the config layer
 # importing the service layer.
@@ -165,13 +196,13 @@ def validate_search_tool_entry(name: str, entry: Any) -> None:
     """Validate one ``search_tools`` entry, raising ``ValueError`` on any problem.
 
     Module-level rather than a method so the runtime CRUD path
-    (``/v1/search-tools``) can hold a dashboard-written tool to the same rules
+    (``/api/v1/search-tools``) can hold a dashboard-written tool to the same rules
     the config file is held to at startup, instead of restating them.
 
     A tool on a provider that authenticates with an API key is rejected here
     without one, rather than at request time as an opaque upstream 401; a keyless
     provider (a self-hosted SearXNG or an adapter fronting one) is allowed to
-    declare none. The tool name doubles as a ``/v1/search/{tool}`` path segment,
+    declare none. The tool name doubles as a ``/api/v1/search/{tool}`` path segment,
     so it must not contain a slash.
 
     A missing backend URL is deliberately not fatal here; see
@@ -214,6 +245,61 @@ def validate_search_tool_entry(name: str, entry: Any) -> None:
         raise ValueError(msg)
 
 
+# Upstreams POST /api/v1/decisions can dispatch to. All take TypeSafe's
+# question-and-answer shape, which OpenRouter's alpha Decisions API and
+# llama-server's /v1/systemone adopted, and none is an any-llm provider, so they
+# are declared under ``decision_providers`` rather than ``providers``. Declared
+# here for the same reason as SEARCH_PROVIDERS.
+DECISION_PROVIDERS = ("typesafe", "openrouter", "llamacpp")
+# Self-hosted servers: no endpoint of their own to default to, and normally no key.
+DECISION_PROVIDERS_SELF_HOSTED = ("llamacpp",)
+
+
+def validate_decision_provider_entry(name: str, entry: Any) -> None:
+    """Validate one ``decision_providers`` entry, raising ``ValueError`` on any problem.
+
+    The name is the selector prefix a caller writes (``typesafe:jev-latest``),
+    so it follows the rules of a ``providers:`` instance name.
+    """
+    if not name or ":" in name or "/" in name:
+        msg = f"decision provider name '{name}' must be non-empty and must not contain ':' or '/'."
+        raise ValueError(msg)
+    if name in RESERVED_PROVIDER_INSTANCE_NAMES:
+        msg = f"decision provider name '{name}' is reserved."
+        raise ValueError(msg)
+    if not isinstance(entry, dict):
+        msg = f"decision_providers.{name} must be a mapping."
+        raise ValueError(msg)
+    provider = entry.get("provider") or name
+    if provider not in DECISION_PROVIDERS:
+        msg = (
+            f"decision_providers.{name}.provider '{provider}' is not a supported decision provider "
+            f"(one of: {', '.join(DECISION_PROVIDERS)})."
+        )
+        raise ValueError(msg)
+    self_hosted = provider in DECISION_PROVIDERS_SELF_HOSTED
+    api_key, api_base = entry.get("api_key"), entry.get("api_base")
+    if not api_key and not self_hosted:
+        msg = f"decision_providers.{name}.api_key is required for provider '{provider}'."
+        raise ValueError(msg)
+    if not api_base and self_hosted:
+        msg = f"decision_providers.{name}.api_base is required for provider '{provider}'."
+        raise ValueError(msg)
+    if api_base is not None:
+        try:
+            scheme = urlsplit(str(api_base).strip()).scheme.lower()
+        except ValueError:
+            scheme = ""
+        # Plain http only for a keyless self-hosted server, such as a llama-server on the same host.
+        if scheme != "https" and not (scheme == "http" and self_hosted and not api_key):
+            msg = f"decision_providers.{name}.api_base must use https when it carries an api_key."
+            raise ValueError(msg)
+    timeout = entry.get("timeout")
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0):
+        msg = f"decision_providers.{name}.timeout must be a number of seconds greater than 0."
+        raise ValueError(msg)
+
+
 class _NonScalarField(Exception):
     """Raised when a config field is not a simple scalar settable from a plain env string."""
 
@@ -223,11 +309,20 @@ def _get_platform_token_from_env() -> str | None:
     return token or None
 
 
+# Self-hosted backends any-llm calls without a key although each declares a
+# credential variable: each tolerates a missing key in ``_verify_and_set_api_key``
+# and defaults to a localhost or LAN base URL, so a bare ``vllm:my-model`` reaches
+# a local server with nothing configured. The declaration alone cannot tell them
+# from a keyed provider, so they are listed by hand and drift-guarded in
+# ``tests/unit/test_provider_instances.py``.
+KEYLESS_SELF_HOSTED_PROVIDERS = frozenset({"cascadia", "llamacpp", "lmstudio", "otari", "vllm"})
+
+
 def provider_credential_env_names(provider_type: str) -> tuple[str, ...] | None:
     """Environment variables any-llm reads for a provider's credential.
 
     Returns an empty tuple when the provider needs no API key: the keyless local
-    backends (ollama, llamacpp, llamafile) declare the literal string ``"None"``,
+    backends ollama and llamafile declare the literal string ``"None"``,
     and a provider authenticating through a cloud SDK (Vertex AI) declares an
     empty name. Returns ``None`` when the provider cannot be inspected at all
     (not a known implementation, or an optional SDK dependency that is not
@@ -249,65 +344,90 @@ def provider_credential_env_names(provider_type: str) -> tuple[str, ...] | None:
     return tuple(candidate for candidate in candidates if candidate)
 
 
-class PricingTierConfig(BaseModel):
-    """One whole-request context threshold price rule from configuration."""
+class RateLimitRule(BaseModel):
+    """One limit from ``rate_limits``, counted separately for each deployment, API key, user or model.
 
-    min_input_tokens: int = Field(gt=0)
-    input_price_per_million: float | None = Field(default=None, ge=0)
-    output_price_per_million: float | None = Field(default=None, ge=0)
-    cache_read_price_per_million: float | None = Field(default=None, ge=0)
-    cache_write_price_per_million: float | None = Field(default=None, ge=0)
-    cache_write_1h_price_per_million: float | None = Field(default=None, ge=0)
+    ``per: key`` counts each API key on its own; a request with no key (the
+    master key, a dashboard session) is not limited by it. ``per: user`` counts
+    the user a request is billed to, so a service key's end users each get their
+    own count. ``per: deployment`` is one count shared by every request.
 
-    @model_validator(mode="after")
-    def validate_has_rate_override(self) -> "PricingTierConfig":
-        rates = (
-            self.input_price_per_million,
-            self.output_price_per_million,
-            self.cache_read_price_per_million,
-            self.cache_write_price_per_million,
-            self.cache_write_1h_price_per_million,
-        )
-        if all(rate is None for rate in rates):
-            raise ValueError("pricing tier must override at least one price field")
-        return self
+    ``per: model`` counts each model in ``models`` on its own, whichever policy,
+    alias or direct call reaches it. It is checked when an attempt is about to
+    call the model rather than at admission, so a routing policy skips a full
+    model and tries its next candidate; a request with no candidate left is
+    refused.
+    """
 
+    model_config = ConfigDict(extra="forbid")
 
-class PricingConfig(BaseModel):
-    """Model pricing configuration."""
-
-    input_price_per_million: float = Field(ge=0)
-    output_price_per_million: float = Field(ge=0)
-    cache_read_price_per_million: float | None = Field(
-        default=None,
-        ge=0,
-        description="Price per 1M cached-input tokens (OpenAI/Gemini discount rate or Anthropic cache-read rate).",
+    name: str = Field(
+        pattern=r"^[A-Za-z0-9_.-]+$",
+        description="Names the rule in a 429's detail and in the counter's key. Unique across rate_limits.",
     )
-    cache_write_price_per_million: float | None = Field(
+    per: Literal["deployment", "key", "user", "model"] = Field(description="What one count is shared by.")
+    models: list[str] | None = Field(
         default=None,
-        ge=0,
-        description="Price per 1M cache-write (creation) tokens. Anthropic only.",
+        description=(
+            "The models a `per: model` rule limits, each as instance:model (the provider instance the "
+            "model is called through, then the model), each counted on its own. Required there and "
+            "refused on any other rule."
+        ),
     )
-    cache_write_1h_price_per_million: float | None = Field(
+    rpm: int | None = Field(default=None, ge=1, description="Requests per minute.")
+    tpm: int | None = Field(
         default=None,
-        ge=0,
-        description="Price per 1M Anthropic 1-hour cache-write tokens.",
+        ge=1,
+        description=(
+            "Tokens per minute. A request is admitted on its estimate (prompt plus max output, or "
+            "budget_estimate_default_output_tokens) and charged what it used once it completes."
+        ),
     )
-    pricing_tiers: list[PricingTierConfig] = Field(
-        default_factory=list,
-        description="Whole-request context threshold pricing rules.",
-    )
-    effective_at: datetime | None = Field(
-        default=None,
-        description="ISO 8601 datetime from which this price applies. Defaults to now if omitted.",
+    max_concurrent: int | None = Field(default=None, ge=1, description="Requests in flight at once.")
+    lease_sec: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            "How long a max_concurrent slot is held at most. A slot is given back when its response "
+            "ends; this bounds what a process that dies mid-request keeps."
+        ),
     )
 
     @model_validator(mode="after")
-    def validate_unique_tier_thresholds(self) -> "PricingConfig":
-        thresholds = [tier.min_input_tokens for tier in self.pricing_tiers]
-        if len(thresholds) != len(set(thresholds)):
-            raise ValueError("pricing_tiers must not repeat min_input_tokens")
+    def _requires_a_limit(self) -> "RateLimitRule":
+        if self.rpm is None and self.tpm is None and self.max_concurrent is None:
+            msg = f"rate limit rule '{self.name}' sets none of rpm, tpm or max_concurrent"
+            raise ValueError(msg)
         return self
+
+    @model_validator(mode="after")
+    def _models_belong_to_per_model(self) -> "RateLimitRule":
+        if self.per != "model":
+            if self.models is not None:
+                msg = f"rate limit rule '{self.name}' sets models, which only a per: model rule reads"
+                raise ValueError(msg)
+            return self
+        if not self.models:
+            msg = f"rate limit rule '{self.name}' is per: model and names no models"
+            raise ValueError(msg)
+        self.models = [_canonical_model(self.name, entry) for entry in self.models]
+        return self
+
+
+def _canonical_model(rule_name: str, entry: str) -> str:
+    """``entry`` as ``instance:model``, the spelling an attempt is matched on; ``instance/model`` is accepted too.
+
+    Split at whichever delimiter comes first, since a model id may contain the other one
+    (``together:meta-llama/Llama-3.3-70B``, ``ollama/llama3:latest``).
+    """
+    text = entry.strip()
+    positions = [index for index in (text.find(":"), text.find("/")) if index != -1]
+    split_at = min(positions) if positions else -1
+    instance, model = (text[:split_at], text[split_at + 1 :]) if split_at != -1 else ("", "")
+    if not instance or not model:
+        msg = f"rate limit rule '{rule_name}' names '{entry}'; write a model as instance:model"
+        raise ValueError(msg)
+    return f"{instance}:{model}"
 
 
 class ModelCapabilityConfig(BaseModel):
@@ -330,6 +450,16 @@ class ModelCapabilityConfig(BaseModel):
         default=False,
         description="Model can natively understand PDF/document content blocks.",
     )
+
+
+def _strip_path_slashes(url: str) -> str:
+    """Drop trailing slashes from a URL's path, leaving any query as written.
+
+    A slash at the end of a query value (``?edge=team/``) is part of that value,
+    and stripping the whole string would hand every link a different one.
+    """
+    location, separator, query = url.partition("?")
+    return f"{location.rstrip('/')}{separator}{query}"
 
 
 def _host_of(url: str | None) -> str:
@@ -370,7 +500,9 @@ class RelyingParty(NamedTuple):
         return host == self.rp_id or host.endswith(f".{self.rp_id}")
 
 
-class GatewayConfig(BaseSettings):
+# Gotcha: fields are ordered last base first, then this class's own.
+# The settings view keeps that order, so moving a base reorders it.
+class GatewayConfig(InferenceSettings, BudgetSettings, PricingSettings, FeedbackSettings, BaseSettings):
     """Gateway configuration with support for YAML files and environment variables."""
 
     model_config = SettingsConfigDict(
@@ -384,31 +516,59 @@ class GatewayConfig(BaseSettings):
         # and an empty bearer token would then satisfy is_valid_master_key.
         env_ignore_empty=True,
     )
+    host: Annotated[str, Shown(SettingsGroup.SERVER)] = Field(
+        default="0.0.0.0", description="Host to bind the server to"
+    )  # noqa: S104
+    port: Annotated[int, Shown(SettingsGroup.SERVER)] = Field(default=8000, description="Port to bind the server to")
+    forwarded_allow_ips: Annotated[str | None, Shown(SettingsGroup.SERVER)] = Field(
+        default=None,
+        description=(
+            "Comma-separated addresses or networks of the proxies whose X-Forwarded-For and "
+            "X-Forwarded-Proto headers `otari serve` trusts, or '*' for any peer. The per-IP sign-in "
+            "and public-catalog limits key on the address these headers resolve to, so behind a "
+            "proxy that is not listed every visitor shares the proxy's address. Use '*' only where "
+            "the proxy is the sole path to the server, as on Railway. Unset leaves it to uvicorn: "
+            "FORWARDED_ALLOW_IPS if set, otherwise 127.0.0.1."
+        ),
+    )
 
-    database_url: str = Field(
+    database_url: Annotated[str, Shown(SettingsGroup.SERVER)] = Field(
         default="sqlite:///./otari.db",
         description="Database connection URL (SQLite default for local use; PostgreSQL recommended for production)",
     )
-    auto_migrate: bool = Field(
+    mode: Annotated[str | None, Shown(SettingsGroup.SERVER)] = Field(
+        default=None,
+        description=(
+            "Otari operating mode: 'standalone', 'hosted' or 'hybrid'. When unset (the default), the "
+            "mode is derived from the platform token: hybrid if a token is present (OTARI_AI_TOKEN), "
+            "else standalone. Set explicitly to assert the intended mode: 'hybrid' requires a token, "
+            "and 'standalone' or 'hosted' with a token present is rejected at startup as conflicting "
+            "configuration. 'hosted' is standalone's multi-tenant sibling: it owns its own database "
+            "and serves the whole management API, and it reports the per-organization provider-key "
+            "surface rather than the process-global one. "
+            "Legacy value 'platform' is accepted as an alias for 'hybrid'."
+        ),
+    )
+    auto_migrate: Annotated[bool, Shown(SettingsGroup.SERVER)] = Field(
         default=True,
         description="Automatically run database migrations on startup",
     )
-    db_pool_size: int = Field(
+    db_pool_size: Annotated[int, Shown(SettingsGroup.SERVER)] = Field(
         default=10,
         ge=1,
         description="Number of persistent connections in the DB pool per worker.",
     )
-    db_max_overflow: int = Field(
+    db_max_overflow: Annotated[int, Shown(SettingsGroup.SERVER)] = Field(
         default=20,
         ge=0,
         description="Extra connections the pool can open above db_pool_size during bursts.",
     )
-    db_pool_timeout: float = Field(
+    db_pool_timeout: Annotated[float, Shown(SettingsGroup.SERVER)] = Field(
         default=30.0,
         ge=0,
         description="Seconds to wait for an available connection before raising TimeoutError.",
     )
-    db_pool_recycle: int = Field(
+    db_pool_recycle: Annotated[int, Shown(SettingsGroup.SERVER)] = Field(
         default=1800,
         description=(
             "Recycle connections older than this many seconds, so one is never old enough to "
@@ -416,12 +576,12 @@ class GatewayConfig(BaseSettings):
             "-1 disables."
         ),
     )
-    db_connect_timeout: float = Field(
+    db_connect_timeout: Annotated[float, Shown(SettingsGroup.SERVER)] = Field(
         default=10.0,
         gt=0,
         description="Seconds to wait for a new database connection to be established.",
     )
-    db_command_timeout: float = Field(
+    db_command_timeout: Annotated[float, Shown(SettingsGroup.SERVER)] = Field(
         default=60.0,
         ge=0,
         description=(
@@ -430,7 +590,7 @@ class GatewayConfig(BaseSettings):
             "away silently. 0 disables."
         ),
     )
-    db_statement_timeout_ms: int = Field(
+    db_statement_timeout_ms: Annotated[int, Shown(SettingsGroup.SERVER)] = Field(
         default=65000,
         ge=0,
         description=(
@@ -440,7 +600,7 @@ class GatewayConfig(BaseSettings):
             "0 disables."
         ),
     )
-    db_log_pool_size: int = Field(
+    db_log_pool_size: Annotated[int, Shown(SettingsGroup.SERVER)] = Field(
         default=5,
         ge=1,
         description=(
@@ -448,10 +608,10 @@ class GatewayConfig(BaseSettings):
             "metering is not starved by traffic. No overflow above this."
         ),
     )
-    host: str = Field(default="0.0.0.0", description="Host to bind the server to")  # noqa: S104
-    port: int = Field(default=8000, description="Port to bind the server to")
-    master_key: str | None = Field(default=None, description="Master key for protecting management endpoints")
-    dashboard_session_ttl_hours: int = Field(
+    master_key: Annotated[str | None, SECRET] = Field(
+        default=None, description="Master key for protecting management endpoints"
+    )
+    dashboard_session_ttl_hours: Annotated[int, OMITTED] = Field(
         default=168,
         ge=1,
         description=(
@@ -460,7 +620,7 @@ class GatewayConfig(BaseSettings):
             "lifetime; the master key itself never expires."
         ),
     )
-    activation_guide: bool = Field(
+    activation_guide: Annotated[bool, OMITTED] = Field(
         default=True,
         description=(
             "Offer the dashboard's first-request setup guide in a workspace that has not served "
@@ -469,15 +629,38 @@ class GatewayConfig(BaseSettings):
             "is already open stops offering it too."
         ),
     )
-    rate_limit_rpm: int | None = Field(
+    rate_limit_rpm: Annotated[int | None, Shown(SettingsGroup.RATE_LIMITING)] = Field(
         default=None, ge=1, description="Maximum requests per minute per user (None disables rate limiting)"
     )
-    dashboard_login_rate_limit_per_minute: int | None = Field(
+    rate_limit_store: Annotated[Literal["memory", "redis"], Shown(SettingsGroup.RATE_LIMITING)] = Field(
+        default="memory",
+        description=(
+            "Where rate_limit_rpm is counted: 'memory' (each process counts on its own, so N "
+            "replicas admit N times the limit) or 'redis' (every replica shares one count, at "
+            "rate_limit_redis_url). Needs the redis extra for 'redis'."
+        ),
+    )
+    rate_limit_redis_url: Annotated[str | None, SECRET] = Field(
+        default=None,
+        description=(
+            "Redis URL for the 'redis' rate-limit store, e.g. 'redis://redis:6379/0' or "
+            "'rediss://user:password@host:6380/0'. Required when rate_limit_store is 'redis'."
+        ),
+    )
+    rate_limits: Annotated[list[RateLimitRule], OMITTED] = Field(
+        default_factory=list,
+        description=(
+            "Limits on requests per minute, tokens per minute and requests in flight, each counted "
+            "per deployment, per API key, per user or per model, in rate_limit_store. Applies to chat "
+            "completions, messages and responses."
+        ),
+    )
+    dashboard_login_rate_limit_per_minute: Annotated[int | None, Shown(SettingsGroup.RATE_LIMITING)] = Field(
         default=10,
         ge=1,
         description=(
             "Maximum calls per client IP per minute to the app's unauthenticated "
-            "surfaces (None disables this limit): failed POST /v1/auth/session "
+            "surfaces (None disables this limit): failed POST /api/v1/auth/session "
             "attempts (a correct master key is never throttled there), every call "
             "to the two public invitation-accept routes, and every call to the "
             "signup, verification and password-reset routes, counted whether they "
@@ -485,20 +668,43 @@ class GatewayConfig(BaseSettings):
             "authenticated users and does not cover any of these pre-auth paths."
         ),
     )
-    cors_allow_origins: list[str] = Field(
-        default_factory=list, description="Allowed CORS origins (empty list disables CORS)"
-    )
-    public_base_url: str | None = Field(
-        default=None,
+    public_catalog_rate_limit_per_minute: Annotated[int | None, Shown(SettingsGroup.RATE_LIMITING)] = Field(
+        default=60,
+        ge=1,
         description=(
-            "This deployment's own externally-reachable URL, with no trailing slash "
-            "(e.g. 'https://otari.example.com'). Used to build absolute links in outgoing "
-            "email (an invitation's accept link) and to derive the WebAuthn relying-party "
-            "ID a passkey is bound to; nothing else here needs to describe its own "
-            "address, since every other reference is relative to the request."
+            "Maximum anonymous reads per client IP per minute of GET /api/v1/catalog/models and its "
+            "detail while public_catalog is on (None disables this limit). A signed-in caller "
+            "or an API key is never counted here. Its own budget rather than "
+            "dashboard_login_rate_limit_per_minute's, because a visitor browsing a catalog "
+            "reads it faster than anyone should be trying a password."
         ),
     )
-    docs_url: str | None = Field(
+    cors_allow_origins: Annotated[list[str], Shown(SettingsGroup.RATE_LIMITING)] = Field(
+        default_factory=list, description="Allowed CORS origins (empty list disables CORS)"
+    )
+    enable_metrics: Annotated[bool, Shown(SettingsGroup.GENERAL)] = Field(
+        default=False,
+        description="Enable Prometheus metrics endpoint at /metrics",
+    )
+    accept_incoming_trace_context: Annotated[bool, Shown(SettingsGroup.GENERAL)] = Field(
+        default=False,
+        description=(
+            "Honor incoming OpenTelemetry context propagation headers. The default "
+            "propagator uses W3C Trace Context (traceparent/tracestate); the "
+            "OTEL_PROPAGATORS environment variable controls the configured set. "
+            "Disabled by default: the headers are unauthenticated (the middleware "
+            "runs before route auth) and, once enabled, let any caller pick the "
+            "trace id, parent span id, and sampling flag that reach the operator's "
+            "collector. Enable only for backend/service-to-service deployments "
+            "where callers are trusted, ideally behind a proxy that strips these "
+            "headers from untrusted edges."
+        ),
+    )
+    enable_docs: Annotated[bool, Shown(SettingsGroup.GENERAL)] = Field(
+        default=True,
+        description="Enable FastAPI docs endpoints (/docs, /redoc, /openapi.json). Enabled by default.",
+    )
+    docs_url: Annotated[str | None, Shown(SettingsGroup.GENERAL)] = Field(
         default=None,
         description=(
             "Where this deployment's documentation lives, as an absolute http(s) URL "
@@ -509,7 +715,7 @@ class GatewayConfig(BaseSettings):
             "/#/docs either way."
         ),
     )
-    terms_url: str | None = Field(
+    terms_url: Annotated[str | None, Shown(SettingsGroup.GENERAL)] = Field(
         default=None,
         description=(
             "Where this deployment's terms of service live, as an absolute http(s) URL "
@@ -519,7 +725,7 @@ class GatewayConfig(BaseSettings):
             "operator configured, held to the same bar as docs_url."
         ),
     )
-    privacy_url: str | None = Field(
+    privacy_url: Annotated[str | None, Shown(SettingsGroup.GENERAL)] = Field(
         default=None,
         description=(
             "Where this deployment's privacy notice lives, as an absolute http(s) URL "
@@ -530,23 +736,42 @@ class GatewayConfig(BaseSettings):
             "same bar as docs_url."
         ),
     )
-    data_plane_url: str | None = Field(
+    site_url: Annotated[str | None, Shown(SettingsGroup.GENERAL)] = Field(
+        default=None,
+        description=(
+            "Where this deployment's public website lives, as an absolute http(s) URL "
+            "(e.g. 'https://otari.ai/'). Set, the logo on the pages a visitor reaches "
+            "without an account (the sign-in pages and the public model catalog) links to it; "
+            "unset, it links to the catalog where one is published, and is not a link "
+            "otherwise. A link target an operator configured, held to the same bar as docs_url."
+        ),
+    )
+    data_plane_url: Annotated[str | None, Shown(SettingsGroup.GENERAL)] = Field(
         default=None,
         description=(
             "Where this deployment's inference traffic belongs, as an absolute http(s) URL "
-            "with no trailing slash and no '/v1' path segment anywhere in it, not even as part "
-            "of a full endpoint like '/v1/chat/completions' (e.g. 'https://gateway.otari.ai'): "
-            "the dashboard appends that path itself. It carries no credential either, so no "
-            "query string, fragment, or user:password. Only a hosted control "
+            f"with no trailing slash and no '{API_ROOT}' or '/v1' path segment anywhere in it, not "
+            f"even as part of a full endpoint like '{API_ROOT}/chat/completions' (e.g. "
+            "'https://gateway.otari.ai'): the dashboard appends that path itself. It carries no "
+            "credential either, so no query string, fragment, or user:password. Only a hosted control "
             "plane needs it: a standalone gateway and a hybrid one both serve inference at "
             "their own address, so whatever reached the dashboard reaches the API, and this "
             "stays unset. A control plane serving many organizations does not, so it has to "
             "say where the data-plane gateway is or the dashboard has nothing runnable to "
             "hand somebody with a new key. Unlike platform.management_url, which is a human "
-            "link target, this is the base URL a client suffixes with /v1."
+            "link target, this is the base URL a client suffixes with the API root."
         ),
     )
-    webauthn_rp_id: str | None = Field(
+    ui_base_url: Annotated[str | None, Shown(SettingsGroup.GENERAL)] = Field(
+        default=None,
+        description=(
+            "Where a browser reaches this deployment's user interface: an absolute http(s) URL "
+            "with no trailing slash (e.g. 'https://otari.example.com/ui'). Unset, public_base_url "
+            "answers for it. Set it when an edge serves the interface from an origin or path this "
+            "process does not answer on."
+        ),
+    )
+    webauthn_rp_id: Annotated[str | None, OMITTED] = Field(
         default=None,
         description=(
             "The WebAuthn relying-party ID passkeys registered here are bound to: a bare "
@@ -558,14 +783,14 @@ class GatewayConfig(BaseSettings):
             "to the ID it stored it under."
         ),
     )
-    webauthn_rp_name: str = Field(
+    webauthn_rp_name: Annotated[str, OMITTED] = Field(
         default="otari",
         description=(
             "The human-readable relying-party name an authenticator shows while a passkey "
             "is being created, and files it under afterwards. Cosmetic: nothing verifies it."
         ),
     )
-    webauthn_allowed_origins: list[str] = Field(
+    webauthn_allowed_origins: Annotated[list[str], OMITTED] = Field(
         default_factory=list,
         description=(
             "Origins a passkey ceremony may be performed from, each with a scheme and no "
@@ -575,7 +800,7 @@ class GatewayConfig(BaseSettings):
             "which is checked at startup."
         ),
     )
-    oauth_google_client_id: str | None = Field(
+    oauth_google_client_id: Annotated[str | None, OMITTED] = Field(
         default=None,
         description=(
             "The Google OAuth client ID dashboard sign-in uses. Set this and "
@@ -584,11 +809,11 @@ class GatewayConfig(BaseSettings):
             "public_base_url has to be set too, because the redirect URI is derived from it."
         ),
     )
-    oauth_google_client_secret: str | None = Field(
+    oauth_google_client_secret: Annotated[str | None, SECRET] = Field(
         default=None,
         description="The Google OAuth client secret paired with oauth_google_client_id.",
     )
-    oauth_github_client_id: str | None = Field(
+    oauth_github_client_id: Annotated[str | None, OMITTED] = Field(
         default=None,
         description=(
             "The GitHub OAuth client ID dashboard sign-in uses. Set this and "
@@ -597,11 +822,11 @@ class GatewayConfig(BaseSettings):
             "public_base_url has to be set too, because the redirect URI is derived from it."
         ),
     )
-    oauth_github_client_secret: str | None = Field(
+    oauth_github_client_secret: Annotated[str | None, SECRET] = Field(
         default=None,
         description="The GitHub OAuth client secret paired with oauth_github_client_id.",
     )
-    mail_transport: str = Field(
+    mail_transport: Annotated[str, Shown(SettingsGroup.MAIL)] = Field(
         default="auto",
         description=(
             "Which transport delivers outgoing mail: 'auto' (default) uses SMTP when "
@@ -612,41 +837,75 @@ class GatewayConfig(BaseSettings):
             "in its link), and 'none' turns mail off even where SMTP is configured."
         ),
     )
-    smtp_host: str | None = Field(
+    public_base_url: Annotated[str | None, Shown(SettingsGroup.MAIL)] = Field(
         default=None,
         description=(
-            "SMTP server host for outgoing mail. Unset disables mail entirely under the "
-            "default 'auto' transport."
+            "This deployment's own externally-reachable URL, with no trailing slash "
+            "(e.g. 'https://otari.example.com'). Used to build absolute links in outgoing "
+            "email (an invitation's accept link) and to derive the WebAuthn relying-party "
+            "ID a passkey is bound to; nothing else here needs to describe its own "
+            "address, since every other reference is relative to the request."
         ),
     )
-    smtp_port: int = Field(default=587, ge=1, le=65535, description="SMTP server port.")
-    smtp_user: str | None = Field(default=None, description="SMTP username, if the server requires auth.")
-    smtp_password: str | None = Field(default=None, description="SMTP password, if the server requires auth.")
-    smtp_tls: bool = Field(default=True, description="Use STARTTLS when connecting to the SMTP server.")
-    mail_from_email: str | None = Field(
+    smtp_host: Annotated[str | None, Shown(SettingsGroup.MAIL)] = Field(
+        default=None,
+        description=(
+            "SMTP server host for outgoing mail. Unset disables mail entirely under the default 'auto' transport."
+        ),
+    )
+    smtp_port: Annotated[int, Shown(SettingsGroup.MAIL)] = Field(
+        default=587, ge=1, le=65535, description="SMTP server port."
+    )
+    smtp_user: Annotated[str | None, SECRET] = Field(
+        default=None, description="SMTP username, if the server requires auth."
+    )
+    smtp_password: Annotated[str | None, SECRET] = Field(
+        default=None, description="SMTP password, if the server requires auth."
+    )
+    smtp_tls: Annotated[bool, Shown(SettingsGroup.MAIL)] = Field(
+        default=True, description="Use STARTTLS when connecting to the SMTP server."
+    )
+    mail_from_email: Annotated[str | None, Shown(SettingsGroup.MAIL)] = Field(
         default=None,
         description=(
             "The 'From' address on outgoing mail. Required, alongside smtp_host, before the "
             "default 'auto' transport sends anything over SMTP."
         ),
     )
-    mail_from_name: str = Field(default="Otari", description="The 'From' display name on outgoing mail.")
-    invitation_expiry_hours: int = Field(
+    mail_from_name: Annotated[str, Shown(SettingsGroup.MAIL)] = Field(
+        default="Otari", description="The 'From' display name on outgoing mail."
+    )
+    invitation_expiry_hours: Annotated[int, Shown(SettingsGroup.MAIL)] = Field(
         default=168,
         ge=1,
         description="How long an organization invitation stays acceptable, in hours (default 7 days).",
     )
-    email_verification_expiry_hours: int = Field(
+    open_signup: Annotated[bool, OMITTED] = Field(
+        default=False,
+        description=(
+            "Whether POST /api/v1/auth/signup may create an identity from nothing, each with an "
+            "organization and workspace of its own. False (the default) keeps signup to claiming "
+            "an address an admin already put on the roster, which is what a single-tenant "
+            "deployment wants: anyone who could reach the dashboard could otherwise register on "
+            "it. True is the multi-tenant posture a control plane runs, and it needs mail "
+            "configured, since a self-serve account is unusable until its address is verified. "
+            "Turning it on puts tenant creation on an unauthenticated route: the per-IP throttle "
+            "that guards the public auth routes is the only bound on it, and nothing yet expires "
+            "the organization an unverified signup leaves behind, so run it behind whatever edge "
+            "controls the deployment has."
+        ),
+    )
+    email_verification_expiry_hours: Annotated[int, Shown(SettingsGroup.MAIL)] = Field(
         default=48,
         ge=1,
         description="How long an email-verification link stays acceptable, in hours.",
     )
-    password_reset_expiry_hours: int = Field(
+    password_reset_expiry_hours: Annotated[int, Shown(SettingsGroup.MAIL)] = Field(
         default=2,
         ge=1,
         description="How long a password-reset link stays acceptable, in hours.",
     )
-    providers: dict[str, dict[str, Any]] = Field(
+    providers: Annotated[dict[str, dict[str, Any]], OMITTED] = Field(
         default_factory=dict,
         description=(
             "Pre-configured provider credentials, keyed by instance name. The key is "
@@ -654,20 +913,20 @@ class GatewayConfig(BaseSettings):
             "instances of one implementation (e.g. real OpenAI plus a self-hosted "
             "OpenAI-compatible backend), give each a distinct instance name and set "
             "'provider_type' to the underlying implementation. An optional 'models' "
-            "list declares model ids for instances whose backend has no /v1/models."
+            "list declares model ids for instances whose backend has no /api/v1/models."
         ),
     )
-    aliases: dict[str, str] = Field(
+    aliases: Annotated[dict[str, str], OMITTED] = Field(
         default_factory=dict,
         description=(
             "Model name aliases (display name -> target selector). A request naming an alias "
             "is routed to its target ('instance:model' or 'provider:model'), and the alias is "
-            "what users see in GET /v1/models and in response 'model' fields, so the underlying "
+            "what users see in GET /api/v1/models and in response 'model' fields, so the underlying "
             "provider/model can stay hidden. Pricing, budgets, and usage logs key on the resolved "
             "target. Standalone-mode only (hybrid resolves models against the platform)."
         ),
     )
-    routing: RoutingConfig = Field(
+    routing: Annotated[RoutingConfig, OMITTED] = Field(
         default_factory=RoutingConfig,
         description=(
             "Named routing policies. A policy is a model name callers use like any other, which "
@@ -681,7 +940,7 @@ class GatewayConfig(BaseSettings):
     # There is no on/off switch here on purpose: a policy naming the router is the
     # switch, so the router cannot be enabled globally behind an operator's back,
     # and two policies can never disagree about whether routing is on.
-    router_alpha: float = Field(
+    router_alpha: Annotated[float, OMITTED] = Field(
         default=0.3,
         ge=0.0,
         description=(
@@ -690,7 +949,7 @@ class GatewayConfig(BaseSettings):
             "cheaper candidates more aggressively."
         ),
     )
-    router_k: int = Field(
+    router_k: Annotated[int, OMITTED] = Field(
         default=5,
         ge=1,
         description=(
@@ -698,7 +957,7 @@ class GatewayConfig(BaseSettings):
             "than k comparable examples stays on the policy's default target."
         ),
     )
-    router_embedding_model: str = Field(
+    router_embedding_model: Annotated[str, OMITTED] = Field(
         default="openai:text-embedding-3-small",
         description=(
             "provider:model used to embed the task signal. Changing it invalidates existing "
@@ -706,7 +965,7 @@ class GatewayConfig(BaseSettings):
             "returns to pass-through until the new space is re-taught."
         ),
     )
-    router_confidence_floor: float = Field(
+    router_confidence_floor: Annotated[float, OMITTED] = Field(
         default=0.0,
         ge=0.0,
         le=1.0,
@@ -715,7 +974,7 @@ class GatewayConfig(BaseSettings):
             "the policy's default target leads and the router's order becomes the failover chain."
         ),
     )
-    router_seed_count: int = Field(
+    router_seed_count: Annotated[int, OMITTED] = Field(
         default=20,
         ge=0,
         description=(
@@ -723,14 +982,14 @@ class GatewayConfig(BaseSettings):
             "request through the policy serves the default target."
         ),
     )
-    router_granularity: str = Field(
+    router_granularity: Annotated[str, OMITTED] = Field(
         default="trace_sticky",
         description=(
             "'trace_sticky' (default) decides once per conversation and reuses that decision on "
             "later turns; 'step' re-decides on every call."
         ),
     )
-    router_max_records_per_user: int = Field(
+    router_max_records_per_user: Annotated[int, OMITTED] = Field(
         default=5000,
         ge=0,
         description=(
@@ -740,36 +999,32 @@ class GatewayConfig(BaseSettings):
             "bound, so the store grows without limit while each decision stays bounded."
         ),
     )
-    pricing: dict[str, PricingConfig] = Field(
+    decision_providers: Annotated[dict[str, dict[str, Any]], OMITTED] = Field(
         default_factory=dict,
         description=(
-            "Pre-configured model USD pricing (model_key -> {input_price_per_million, output_price_per_million})"
+            "Upstreams served by POST /api/v1/decisions, keyed by the selector prefix callers "
+            "write ('typesafe:jev-latest'). Each entry may declare a 'provider' (one of: typesafe, "
+            "openrouter, llamacpp; defaults to the key), an 'api_key' (required except for llamacpp), "
+            "an 'api_base' (required for llamacpp; https whenever a key is set), and a 'timeout' "
+            "in seconds. Standalone-mode only."
         ),
     )
-    search_tools: dict[str, dict[str, Any]] = Field(
+    search_tools: Annotated[dict[str, dict[str, Any]], OMITTED] = Field(
         default_factory=dict,
         description=(
-            "Search tools served by POST /v1/search, keyed by the name callers pass as "
-            "'search_tool_name' (or in the /v1/search/{tool} path). Each entry may declare a "
+            "Search tools served by POST /api/v1/search, keyed by the name callers pass as "
+            "'search_tool_name' (or in the /api/v1/search/{tool} path). Each entry may declare a "
             "'provider' (one of: exa, searxng; defaults to the tool name), an 'api_key' "
             "(required for exa), an 'api_base' (required for searxng unless web_search_url is "
             "set, which it then inherits), a 'timeout' in seconds, and an 'options' mapping of "
             "provider-native defaults. Standalone-mode only."
         ),
     )
-    enable_metrics: bool = Field(
-        default=False,
-        description="Enable Prometheus metrics endpoint at /metrics",
-    )
-    enable_docs: bool = Field(
-        default=True,
-        description="Enable FastAPI docs endpoints (/docs, /redoc, /openapi.json). Enabled by default.",
-    )
-    bootstrap_api_key: bool = Field(
+    bootstrap_api_key: Annotated[bool, Shown(SettingsGroup.GENERAL)] = Field(
         default=True,
         description="Create a first-use API key on startup when no API keys exist",
     )
-    bootstrap: str | None = Field(
+    bootstrap: Annotated[str | None, OMITTED] = Field(
         default=None,
         description=(
             "Composition-root bootstrap, as a 'module:callable' selector (OTARI_BOOTSTRAP). "
@@ -778,129 +1033,44 @@ class GatewayConfig(BaseSettings):
             "nothing is imported. Unrelated to bootstrap_api_key."
         ),
     )
-    log_writer_strategy: str = Field(
+    log_writer_strategy: Annotated[str, Shown(SettingsGroup.GENERAL)] = Field(
         default="single",
         description="How usage log rows are written: 'single' (inline) or 'batch' (background).",
     )
-    budget_strategy: str = Field(
-        default="for_update",
-        description="Budget validation strategy: 'for_update' (default), 'cas' (lock-free), or 'disabled'.",
-    )
-    require_pricing: bool = Field(
-        default=True,
-        description=(
-            "Reject requests for models that have no configured pricing (fail-closed, default). "
-            "When False, unpriced models are served and logged without cost (legacy behavior). "
-            "Audio and moderation endpoints are always exempt — they have no token-based pricing."
-        ),
-    )
-    default_pricing: bool = Field(
-        default=False,
-        description=(
-            "When a model has no pricing in the database, fall back to community-maintained "
-            "default pricing from the bundled genai-prices dataset. Off by default: a billing "
-            "gateway should price from rates you control, and these community estimates can lag "
-            "or differ from real provider rates. Database pricing always takes precedence. Enable "
-            "to auto-price common models without configuring each one; while off, require_pricing "
-            "stays fail-closed for any model you have not priced explicitly."
-        ),
-    )
-    reject_user_mismatch: bool = Field(
-        default=True,
-        description=(
-            "When True (default), a non-master key whose request names a 'user' other than its own "
-            "is rejected with 403. When False, the client-supplied 'user' is still forwarded to the "
-            "provider (OpenAI-style end-user tag) but spend is always bound to the key's own user; "
-            "use this if clients send arbitrary 'user' values for abuse tracking. This setting "
-            "is the deployment-wide default: an individual key can override it in either "
-            "direction with its own reject_user_mismatch (null inherits this setting). The "
-            "master key may always bill an arbitrary user regardless of this setting."
-        ),
-    )
-    capture_agent_telemetry: bool = Field(
+    capture_agent_telemetry: Annotated[bool, OMITTED] = Field(
         default=True,
         description=(
             "When True (default), content-free coding-agent telemetry is stored as agent_telemetry "
             "rows: behavioral log events (tool_result, tool_decision, user_prompt, api_error) "
-            "received at POST /v1/logs, and outcome-metric data points (lines of code, commits, "
-            "pull requests, active time) received at POST /v1/metrics. When False, both are "
+            "received at POST /otlp/v1/logs, and outcome-metric data points (lines of code, commits, "
+            "pull requests, active time) received at POST /otlp/v1/metrics. When False, both are "
             "discarded before storage; usage capture and billing are unaffected either way. This "
             "is the deployment-wide default: an individual key can override it in either direction "
             "with its own capture_agent_telemetry (null inherits this setting)."
         ),
     )
-    budget_reservation_ttl_sec: int = Field(
-        default=900,
-        gt=0,
-        description=(
-            "How long a budget reservation may stay in flight before the sweep treats it as "
-            "leaked and returns the hold. It must comfortably exceed the slowest request this "
-            "deployment serves, because reclaiming a hold that is still live would let a "
-            "concurrent request past a cap the in-flight one is already spending against."
-        ),
-    )
-    budget_reservation_sweep_interval_sec: int = Field(
-        default=300,
-        ge=0,
-        description=(
-            "How often to sweep for leaked budget reservations across all users. 0 disables the "
-            "sweep, leaving the opportunistic per-user reclaim that runs when a user next "
-            "reserves. Standalone mode only."
-        ),
-    )
-    budget_reservation_sweep_batch: int = Field(
-        default=500,
-        gt=0,
-        description="Maximum leaked budget reservations one sweep pass reclaims before yielding.",
-    )
-    budget_reservation_retention_sec: int = Field(
-        default=604800,
-        ge=0,
-        description=(
-            "How long a settled, released or reclaimed budget reservation is kept before the "
-            "sweep deletes it. The row exists to make an in-flight hold reclaimable; what a "
-            "request cost is recorded durably in usage_logs, so this is an audit window rather "
-            "than an accounting record. 0 keeps every row forever. Standalone mode only."
-        ),
-    )
-    budget_estimate_default_output_tokens: int = Field(
-        default=1024,
-        ge=0,
-        description=(
-            "Output-token count assumed when reserving budget for a request whose max output is "
-            "unbounded. Used by the pre-debit estimate; reconciled to actual usage on completion."
-        ),
-    )
-    stream_missing_usage_policy: str = Field(
-        default="estimate",
-        description=(
-            "How to bill a streamed response that completes without provider usage data: "
-            "'estimate' (charge the pre-debit estimate, default), 'fail' (charge estimate and mark "
-            "the request errored), or 'allow_free' (release the reservation, legacy behavior)."
-        ),
-    )
-    streaming_keepalive_interval_ms: int = Field(
+    streaming_keepalive_interval_ms: Annotated[int, Shown(SettingsGroup.GENERAL)] = Field(
         default=15000,
         ge=0,
         description=(
             "Idle interval in milliseconds after which a streaming response emits a transport "
-            "keepalive while it waits on the provider: a 'ping' event on /v1/messages, an SSE "
-            "comment line on /v1/chat/completions and /v1/responses. Keeps an intermediary with a "
+            "keepalive while it waits on the provider: a 'ping' event on /api/v1/messages, an SSE "
+            "comment line on /api/v1/chat/completions and /api/v1/responses. Keeps an intermediary with a "
             "read timeout (Cloudflare's default Proxy Read Timeout is 125s) from severing a connection "
             "during a long time-to-first-token. Does not extend any first-chunk or failover deadline. "
             "0 disables."
         ),
     )
-    model_discovery: bool = Field(
+    model_discovery: Annotated[bool, Shown(SettingsGroup.MODELS)] = Field(
         default=True,
-        description="Enable auto-discovery of models from configured providers via GET /v1/models",
+        description="Enable auto-discovery of models from configured providers via GET /api/v1/models",
     )
-    model_cache_ttl_seconds: int = Field(
+    model_cache_ttl_seconds: Annotated[int, Shown(SettingsGroup.MODELS)] = Field(
         default=300,
         ge=0,
         description="TTL in seconds for the in-memory model discovery cache (0 disables caching)",
     )
-    model_discovery_timeout_seconds: float = Field(
+    model_discovery_timeout_seconds: Annotated[float, Shown(SettingsGroup.MODELS)] = Field(
         default=10.0,
         gt=0,
         description=(
@@ -909,7 +1079,7 @@ class GatewayConfig(BaseSettings):
             "before it is treated as failed and the declared models: fallback is used."
         ),
     )
-    model_discovery_negative_ttl_seconds: float = Field(
+    model_discovery_negative_ttl_seconds: Annotated[float, Shown(SettingsGroup.MODELS)] = Field(
         default=30.0,
         ge=0,
         description=(
@@ -922,7 +1092,7 @@ class GatewayConfig(BaseSettings):
             "is seen again."
         ),
     )
-    models_dev_metadata: bool = Field(
+    models_dev_metadata: Annotated[bool, Shown(SettingsGroup.MODELS)] = Field(
         default=True,
         description=(
             "Enrich the dashboard's model detail with metadata (modalities, "
@@ -931,40 +1101,51 @@ class GatewayConfig(BaseSettings):
             "falls back to the bundled genai-prices data."
         ),
     )
-    models_dev_cache_ttl_seconds: int = Field(
+    models_dev_cache_ttl_seconds: Annotated[int, Shown(SettingsGroup.MODELS)] = Field(
         default=86400,
         ge=0,
         description=(
             "TTL in seconds for the cached models.dev catalog, and the interval at which a "
-            "background task refetches it (floored at 5 minutes). Above 0, GET /v1/models/metadata "
+            "background task refetches it (floored at 5 minutes). Above 0, GET /api/v1/models/metadata "
             "answers from the cache instead of waiting on the fetch; a failed fetch is held for one "
             "minute rather than the refresh interval. 0 disables caching, so every read fetches."
         ),
     )
-    files_enabled: bool = Field(
+    public_catalog: Annotated[bool, Shown(SettingsGroup.MODELS)] = Field(
+        default=False,
+        description=(
+            "Serve GET /api/v1/catalog/models and the dashboard's Models pages to a visitor with no session or "
+            "key. An anonymous read sees the configured provider instances and the hosted models, priced "
+            "from the deployment list and the defaults, and nothing tenant-specific. Off by default."
+        ),
+    )
+    files_enabled: Annotated[bool, Shown(SettingsGroup.FILES)] = Field(
         default=True,
-        description="Enable the /v1/files upload/storage endpoints (standalone mode).",
+        description="Enable the /api/v1/files upload/storage endpoints (standalone mode).",
     )
-    files_backend: str = Field(
+    files_backend: Annotated[str, Shown(SettingsGroup.FILES)] = Field(
         default="local",
-        description="Blob backend for uploaded file bytes: 'local' (filesystem) or 's3'. Future: 'gcs'.",
+        description=(
+            "Blob backend for uploaded file bytes: 'local' (a directory), 's3' (boto3), or 'fsspec' "
+            "(any filesystem fsspec has an implementation for, named by files_url)."
+        ),
     )
-    files_local_dir: str = Field(
+    files_local_dir: Annotated[str, Shown(SettingsGroup.FILES)] = Field(
         default="./otari-files",
         description="Directory for the 'local' files backend to store uploaded bytes.",
     )
-    files_s3_bucket: str | None = Field(
+    files_s3_bucket: Annotated[str | None, OMITTED] = Field(
         default=None,
         description="Bucket name for the 's3' files backend. Required when files_backend is 's3'.",
     )
-    files_s3_endpoint_url: str | None = Field(
+    files_s3_endpoint_url: Annotated[str | None, OMITTED] = Field(
         default=None,
         description=(
             "S3-compatible endpoint URL for the 's3' files backend, e.g. a self-hosted MinIO "
             "instance. None uses AWS S3's default endpoint resolution (region-based)."
         ),
     )
-    files_s3_region: str | None = Field(
+    files_s3_region: Annotated[str | None, OMITTED] = Field(
         default=None,
         description=(
             "AWS region for the 's3' files backend. Most self-hosted S3-compatible stores "
@@ -972,21 +1153,108 @@ class GatewayConfig(BaseSettings):
             "'us-east-1' when unset."
         ),
     )
-    files_max_bytes: int = Field(
+    files_url: Annotated[str | None, Shown(SettingsGroup.FILES)] = Field(
+        default=None,
+        description=(
+            "Root URL for the 'fsspec' files backend, e.g. 'gcs://bucket/otari-files', "
+            "'abfs://container/prefix', 's3://bucket/prefix', 'sftp://host/path' or "
+            "'file:///var/lib/otari/files'. Needs the fsspec extra and the protocol's own "
+            "implementation package (gcsfs, adlfs, s3fs, paramiko, ...). Required when files_backend "
+            "is 'fsspec'."
+        ),
+    )
+    files_storage_options: Annotated[dict[str, Any], SECRET] = Field(
+        default_factory=dict,
+        description=(
+            "Keyword arguments for the fsspec implementation behind files_url: credentials, "
+            "endpoint URLs, regions, project ids. Passed through untouched and never logged; "
+            "most implementations also read their standard environment variables, so this "
+            "can usually stay empty."
+        ),
+    )
+    files_max_bytes: Annotated[int, Shown(SettingsGroup.FILES)] = Field(
         default=512 * 1024 * 1024,
         ge=1,
         description="Maximum size in bytes for a single uploaded file.",
     )
-    files_retention_hours: int | None = Field(
+    files_output_max_files: Annotated[int, Shown(SettingsGroup.FILES)] = Field(
+        default=20,
+        ge=0,
+        description=(
+            "Most files one code-execution call may have stored from its sandbox workspace. "
+            "The same count separately bounds how many files one request may copy from a "
+            "provider's own sandbox, so a request that uses both has one allowance of each. "
+            "Files past a count are not stored."
+        ),
+    )
+    files_output_max_bytes: Annotated[int, Shown(SettingsGroup.FILES)] = Field(
+        default=64 * 1024 * 1024,
+        ge=1,
+        description=(
+            "Total bytes one code-execution call may have stored from its sandbox workspace, across "
+            "all the files it produced. The same total separately bounds what one request may copy "
+            "from a provider's own sandbox. A file that would go past an allowance is not stored."
+        ),
+    )
+    files_provider_copy_max_sec: Annotated[float, Shown(SettingsGroup.FILES)] = Field(
+        default=60.0,
+        gt=0,
+        description=(
+            "How long one request may spend copying the files a provider's own sandbox produced, "
+            "across every call it makes. The copy runs before the caller sees a file id, so this "
+            "is time the reply or the stream waits; a stream emits its usual keepalive meanwhile "
+            "(streaming_keepalive_interval_ms). A file the limit cuts short is not stored."
+        ),
+    )
+    files_retention_hours: Annotated[int | None, Shown(SettingsGroup.FILES)] = Field(
         default=None,
         ge=1,
         description=(
             "Stop serving files older than this many hours: expired files become inaccessible "
-            "(404) and can no longer be referenced. Their stored bytes are not yet reclaimed "
-            "automatically, so periodic cleanup is an operator task. None keeps files indefinitely."
+            "(404) and can no longer be referenced, and the file sweep then reclaims their bytes "
+            "and rows. None keeps files indefinitely."
         ),
     )
-    file_understanding_enabled: bool = Field(
+    files_sweep_interval_sec: Annotated[int, Shown(SettingsGroup.FILES)] = Field(
+        default=3600,
+        ge=0,
+        description=(
+            "How often the background file sweep reclaims the bytes and rows of expired and "
+            "deleted files. 0 disables the sweep, leaving cleanup to the operator."
+        ),
+    )
+    files_provider_upload_enabled: Annotated[bool, Shown(SettingsGroup.FILES)] = Field(
+        default=True,
+        description=(
+            "Upload a copy of an attached file to the provider when the provider's own code "
+            "execution needs one to name it. This does not decide whether a file's contents "
+            "reach the provider, which they do either way; it decides whether a copy is stored "
+            "in the provider's account until it expires. When False, a request that asks the "
+            "provider to run code over an attached file is refused."
+        ),
+    )
+    provider_account_pepper: Annotated[str | None, SECRET] = Field(
+        default=None,
+        min_length=32,
+        description=(
+            "Key for the keyed digest that names the provider account a copy of an attached file "
+            "is in. Required while files_provider_upload_enabled is on, and must differ from "
+            "OTARI_SECRET_KEY and the master key. Rotating it only makes the next request copy "
+            "each file again."
+        ),
+    )
+    files_provider_upload_ttl_hours: Annotated[int, Shown(SettingsGroup.FILES)] = Field(
+        default=1,
+        ge=1,
+        le=2160,
+        description=(
+            "Ceiling on how long a copy uploaded to a provider may live before the provider "
+            "expires it. The ceiling is the 90 days Anthropic's Files API accepts, and a copy "
+            "never outlives the file it was made from. Otari reuses a copy that still has time "
+            "left rather than uploading the same file again."
+        ),
+    )
+    file_understanding_enabled: Annotated[bool, Shown(SettingsGroup.VISION)] = Field(
         default=True,
         description=(
             "Normalize file/image content blocks before the provider call: pass through for "
@@ -994,7 +1262,7 @@ class GatewayConfig(BaseSettings):
             "blocks are forwarded unchanged (legacy pass-through)."
         ),
     )
-    vision_strategy: str = Field(
+    vision_strategy: Annotated[str, Shown(SettingsGroup.VISION)] = Field(
         default="describe",
         description=(
             "How image blocks are handled for text-only models: 'describe' (side-call a vision "
@@ -1002,7 +1270,7 @@ class GatewayConfig(BaseSettings):
             "or 'off' (drop with a log line)."
         ),
     )
-    vision_describe_model: str | None = Field(
+    vision_describe_model: Annotated[str | None, Shown(SettingsGroup.VISION)] = Field(
         default=None,
         description=(
             "provider/model used to caption images for text-only target models when "
@@ -1010,7 +1278,7 @@ class GatewayConfig(BaseSettings):
             "to keep captioning free. When unset, 'describe' falls back to a logged drop."
         ),
     )
-    vision_describe_max_tokens: int = Field(
+    vision_describe_max_tokens: Annotated[int, Shown(SettingsGroup.VISION)] = Field(
         default=1024,
         gt=0,
         description=(
@@ -1019,7 +1287,7 @@ class GatewayConfig(BaseSettings):
             "once per page for scanned PDFs)."
         ),
     )
-    model_capabilities: dict[str, ModelCapabilityConfig] = Field(
+    model_capabilities: Annotated[dict[str, ModelCapabilityConfig], OMITTED] = Field(
         default_factory=dict,
         description=(
             "Per-model multimodal capability overrides (provider/model -> {supports_image, "
@@ -1027,28 +1295,39 @@ class GatewayConfig(BaseSettings):
             "local models behind OpenAI-compatible servers."
         ),
     )
-    sandbox_url: str | None = Field(
+    sandbox_url: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Base URL of the code-execution sandbox backend for otari_code_execution tools. "
             "When unset, otari_code_execution requests are rejected with 400."
         ),
     )
-    guardrails_url: str | None = Field(
+    guardrails_url: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Default URL of the input-guardrails service used when a request does not pass its "
             "own guardrail `url`. docker-compose sets this to the bundled guardrails container."
         ),
     )
-    tools_header: str | None = Field(
+    guardrail_thread_pool_size: Annotated[int | None, Shown(SettingsGroup.TOOLS)] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Threads reserved for the guardrails this gateway builds and runs itself. "
+            "any-guardrail calls its vendor synchronously, so a check holds one thread for "
+            "its whole deadline and the bound is what stops a hung vendor from taking the "
+            "threads the rest of the process needs. Sized once, so config or environment "
+            "only. Does not apply to the remote guardrails service."
+        ),
+    )
+    tools_header: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Per-deployment override for the purpose-hint preamble header injected ahead of "
             "gateway-managed tool hints. When unset, a built-in default header is used."
         ),
     )
-    sandbox_purpose_hint: str | None = Field(
+    sandbox_purpose_hint: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Default purpose hint forwarded to the sandbox backend when an otari_code_execution "
@@ -1064,7 +1343,7 @@ class GatewayConfig(BaseSettings):
     # every leased session, and (via ``pinnable_sandbox_images``) offering it to
     # workspaces. This names the narrower thing it actually is: the image a leased
     # session runs, not the image the backend process is.
-    sandbox_session_image: str | None = Field(
+    sandbox_session_image: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         max_length=255,
         description=(
@@ -1074,17 +1353,65 @@ class GatewayConfig(BaseSettings):
             "image only if sandbox_allowed_session_images lists it."
         ),
     )
-    sandbox_allowed_session_images: str | None = Field(
+    sandbox_allowed_session_images: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Comma-separated sandbox images a workspace's code-execution policy may pin "
             "(e.g. 'mzdotai/otari-sandbox-container:latest,ghcr.io/acme/sandbox:2'). Deliberately "
             "not editable from the dashboard: it is the operator's supply-chain allow-list, and "
             "sandbox_session_image is always pinnable whether or not it appears here. When unset, a "
-            "workspace may not pin an image at all."
+            "workspace may not pin an image at all. Applies to the 'protocol' sandbox provider: a hosted "
+            "provider names its workspaces its own way and ignores this."
         ),
     )
-    web_search_url: str | None = Field(
+    sandbox_provider: Annotated[str, Shown(SettingsGroup.TOOLS)] = Field(
+        default="protocol",
+        description=(
+            "What runs the code a code-execution tool call asks for: 'protocol' (the default) speaks the "
+            "published code-execution protocol to the backend at sandbox_url, which is a container the "
+            "operator runs; 'e2b' drives E2B's hosted sandboxes from this process and needs no sandbox_url, "
+            "only the e2b extra and E2B_API_KEY."
+        ),
+    )
+    sandbox_container_idle_ttl_sec: Annotated[int, Shown(SettingsGroup.TOOLS)] = Field(
+        default=600,
+        ge=0,
+        description=(
+            "How long a code-execution sandbox is held after its request ends, for a request that asked to "
+            "hold one by sending container: auto; the clock restarts on every use. A request that asks for "
+            "nothing is never held, whatever this says, so this is the lifetime rather than the switch. 0 "
+            "refuses to hold a sandbox at all, which is how a deployment behaved before container reuse existed."
+        ),
+    )
+    sandbox_container_max_lifetime_sec: Annotated[int, Shown(SettingsGroup.TOOLS)] = Field(
+        default=3600,
+        ge=60,
+        description=(
+            "The longest a resumed sandbox may live from its first lease, whatever the idle clock says, so "
+            "one conversation cannot hold a sandbox open on the provider indefinitely."
+        ),
+    )
+    code_execution_executor: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
+        default=None,
+        description=(
+            "Who runs the code a provider-native code-execution declaration asks for "
+            "(Anthropic's code_execution_<date>, OpenAI's code_interpreter, the bare code_execution). "
+            "'auto' (the default when unset) forwards it to the provider when that provider runs the "
+            "tool natively for the model, and runs it on this gateway's sandbox otherwise, so a request "
+            "written for a frontier model keeps working when the model is swapped. 'otari' always runs it "
+            "on the sandbox; 'provider' always forwards it. A workspace policy may pin a value and the "
+            "Otari-Code-Execution header may choose one per request where the workspace has not. "
+            "The explicit otari_code_execution type is always run by the gateway."
+        ),
+    )
+    web_fetch_enabled: Annotated[bool, Shown(SettingsGroup.TOOLS)] = Field(
+        default=False,
+        description=(
+            "Whether Otari may execute the managed otari_web_fetch tool. Off by default because "
+            "enabling it permits model-directed outbound requests to public web destinations."
+        ),
+    )
+    web_search_url: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Base URL of the web-search backend (SearXNG instance or a search adapter) for "
@@ -1092,7 +1419,7 @@ class GatewayConfig(BaseSettings):
             "docker-compose sets this to the bundled SearXNG container."
         ),
     )
-    web_search_provider: str | None = Field(
+    web_search_provider: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Licensed search API the web-search backend calls directly ('tavily' or 'brave'), "
@@ -1100,38 +1427,38 @@ class GatewayConfig(BaseSettings):
             "web_search_provider_api_key. When both are set, web_search_url is not needed."
         ),
     )
-    web_search_provider_api_key: str | None = Field(
+    web_search_provider_api_key: Annotated[str | None, SECRET] = Field(
         default=None,
         description=(
             "Credential for web_search_provider. Held by whichever process runs the search: on a "
             "hosted deployment that is the control plane, never the data plane."
         ),
     )
-    web_search_backend_token: str | None = Field(
+    web_search_backend_token: Annotated[str | None, SECRET] = Field(
         default=None,
         description=(
-            "Shared secret GET /v1/web-search/search requires as X-Gateway-Token. Set on a hosted "
+            "Shared secret GET /api/v1/web-search/search requires as X-Gateway-Token. Set on a hosted "
             "control plane so its data-plane gateway can search through it; without it the route "
             "is not served, because it spends the deployment's own search quota. The gateway "
             "presents its platform token (OTARI_AI_TOKEN) and nothing else, so this must be that "
             "token, and rotating it stops web search for that data plane until both are updated."
         ),
     )
-    web_search_purpose_hint: str | None = Field(
+    web_search_purpose_hint: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Default purpose hint for the web-search backend when an otari_web_search tool entry "
             "does not supply its own."
         ),
     )
-    web_search_engines: str | None = Field(
+    web_search_engines: Annotated[str | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Comma-separated SearXNG engine list for the web-search backend (e.g. 'google,bing'). "
             "When unset, the backend default engines are used."
         ),
     )
-    web_search_max_results: int | None = Field(
+    web_search_max_results: Annotated[int | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         ge=1,
         description=(
@@ -1139,14 +1466,14 @@ class GatewayConfig(BaseSettings):
             "max_results still overrides it)."
         ),
     )
-    web_search_extract: bool | None = Field(
+    web_search_extract: Annotated[bool | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Whether the web-search backend extracts page content in-process (True) or returns "
             "snippet-only results (False). When unset, the backend default (extraction on) applies."
         ),
     )
-    web_search_intercept: bool | None = Field(
+    web_search_intercept: Annotated[bool | None, Shown(SettingsGroup.TOOLS)] = Field(
         default=None,
         description=(
             "Whether a provider-named web-search declaration (bare 'web_search', Anthropic-native "
@@ -1155,54 +1482,51 @@ class GatewayConfig(BaseSettings):
             "gateway, and every other keyword reaches the provider untouched. Requires web_search_url."
         ),
     )
-    web_search_allow_private_hosts: bool = Field(
+    web_search_allow_private_hosts: Annotated[bool, Shown(SettingsGroup.TOOLS)] = Field(
         default=False,
         description=(
             "SSRF gate: allow the web-search backend to fetch private/loopback/reserved hosts. "
             "Off by default. Only enable for unusual setups such as a private search index."
         ),
     )
-    mcp_allow_loopback: bool = Field(
-        default=True,
+    web_retrieval_trust_env_proxy: Annotated[bool, Shown(SettingsGroup.TOOLS)] = Field(
+        default=False,
         description=(
-            "SSRF gate: allow MCP server URLs that resolve to loopback (useful for same-host "
-            "sidecars). On by default."
+            "Trust HTTP_PROXY, HTTPS_PROXY, and ALL_PROXY for web retrieval. The proxy must enforce "
+            "address safety when resolving and connecting to destinations. Local URL, domain, and "
+            "address checks remain enabled; direct requests, including NO_PROXY matches, remain IP-pinned. "
+            "Off by default. Only enable for an operator-controlled SSRF-filtering proxy."
         ),
     )
-    mcp_allow_private_hosts: bool = Field(
+    mcp_allow_loopback: Annotated[bool, Shown(SettingsGroup.TOOLS)] = Field(
+        default=True,
+        description=(
+            "SSRF gate: allow MCP server URLs that resolve to loopback (useful for same-host sidecars). On by default."
+        ),
+    )
+    mcp_allow_private_hosts: Annotated[bool, Shown(SettingsGroup.TOOLS)] = Field(
         default=False,
         description=(
             "SSRF gate: allow MCP server URLs that resolve to private/reserved hosts, and accept "
             "hostnames that fail to resolve at validation time. Off by default."
         ),
     )
-    provider_allow_private_hosts: bool = Field(
+    provider_allow_private_hosts: Annotated[bool, Shown(SettingsGroup.TOOLS)] = Field(
         default=True,
         description=(
             "SSRF gate: allow a provider api_base that resolves to private/loopback/reserved hosts. "
             "On by default (the opposite of the other SSRF gates) because operator-supplied api_base "
             "values are master-key gated and the home-lab / self-hosted use case depends on private "
             "endpoints. Set to false to make provider connection tests, model discovery, and the "
-            "credential write path (POST /v1/provider-credentials and PATCH /v1/provider-credentials/{instance}) "
-            "refuse an internal api_base. "
+            f"credential write path (POST {API_ROOT}/provider-credentials and PATCH "
+            f"{API_ROOT}/provider-credentials/{{instance}}) refuse an internal api_base. "
             "Chat dispatch (which dials the endpoint on every request) is not gated, so this is not a "
             "general egress control. Also settable via OTARI_PROVIDER_ALLOW_PRIVATE_HOSTS."
         ),
     )
-    mode: str | None = Field(
-        default=None,
-        description=(
-            "Otari operating mode: 'standalone', 'hosted' or 'hybrid'. When unset (the default), the "
-            "mode is derived from the platform token: hybrid if a token is present (OTARI_AI_TOKEN), "
-            "else standalone. Set explicitly to assert the intended mode: 'hybrid' requires a token, "
-            "and 'standalone' or 'hosted' with a token present is rejected at startup as conflicting "
-            "configuration. 'hosted' is standalone's multi-tenant sibling: it owns its own database "
-            "and serves the whole management API, and it reports the per-organization provider-key "
-            "surface rather than the process-global one. "
-            "Legacy value 'platform' is accepted as an alias for 'hybrid'."
-        ),
+    platform: Annotated[dict[str, Any], OMITTED] = Field(
+        default_factory=dict, description="otari.ai connection settings"
     )
-    platform: dict[str, Any] = Field(default_factory=dict, description="otari.ai connection settings")
 
     # Resolved once from the environment (primed by load_config, or lazily on
     # first access for a directly-constructed config) so the runtime mode stays
@@ -1222,6 +1546,10 @@ class GatewayConfig(BaseSettings):
     # The same idea for ``search_tools``: the config-file tools as loaded, before
     # any dashboard-stored tool is overlaid by ``search_tool_store_service``.
     _search_tool_baseline: dict[str, dict[str, Any]] | None = PrivateAttr(default=None)
+
+    # The same idea for ``rate_limits``: the config-file rules, before the
+    # dashboard's stored rules are added by the rate-limits service.
+    _rate_limit_baseline: list["RateLimitRule"] | None = PrivateAttr(default=None)
 
     # SHA-256 hash of a master key generated on first run (see
     # ``master_key_service``). Set at startup when no ``master_key`` is
@@ -1292,6 +1620,36 @@ class GatewayConfig(BaseSettings):
         return self.effective_mode == "hosted"
 
     @property
+    def effective_ui_base_url(self) -> str:
+        """Where a browser reaches this deployment's interface, with no trailing slash on its path.
+
+        ``ui_base_url`` when set, ``public_base_url`` otherwise, empty when neither is.
+        """
+        return _strip_path_slashes((self.ui_base_url or "").strip()) or _strip_path_slashes(
+            (self.public_base_url or "").strip()
+        )
+
+    def ui_link(self, path: str) -> str:
+        """An absolute link into the interface, or ``path`` itself when the address is unknown.
+
+        A query on ``ui_base_url`` travels with every link, placed before the hash
+        route: ``https://app.example.com/ui/?edge=a`` and ``/#/verify-email?token=t``
+        give ``https://app.example.com/ui/?edge=a#/verify-email?token=t``, which is
+        the one order a browser keeps the query in the page's own location rather
+        than in the route's.
+        """
+        base = self.effective_ui_base_url
+        if not base:
+            return path
+        location, _, query = base.partition("?")
+        location = location.rstrip("/")
+        if not query:
+            return f"{location}{path}"
+        before, hash_mark, route = path.partition("#")
+        joiner = "&" if "?" in before else "?"
+        return f"{location}{before}{joiner}{query}{hash_mark}{route}"
+
+    @property
     def effective_mail_transport(self) -> str:
         """Which transport a send would actually use: ``smtp``, ``console`` or ``none``.
 
@@ -1346,7 +1704,7 @@ class GatewayConfig(BaseSettings):
         """Which settings stand between this deployment and a delivered link, in config order.
 
         Empty exactly when :attr:`mail_ready` is true. Reported to the operator
-        (``GET /v1/settings/mail``) so "mail is unavailable" names what to set
+        (``GET /api/v1/settings/mail``) so "mail is unavailable" names what to set
         rather than leaving them to guess, which is the whole difference between
         an honest no-transport mode and an opaque one.
         """
@@ -1373,7 +1731,7 @@ class GatewayConfig(BaseSettings):
 
         None is a deployment that did not configure this provider, which is a
         setting and not a failure: the sign-in screen simply does not offer it
-        (``GET /v1/bootstrap``'s ``oauth_providers``).
+        (``GET /api/v1/bootstrap``'s ``oauth_providers``).
 
         ``public_base_url`` is part of being configured rather than a separate
         check, because the redirect URI is derived from it
@@ -1594,8 +1952,7 @@ class GatewayConfig(BaseSettings):
                 raise ValueError(msg)
             if ":" in name or "/" in name:
                 msg = (
-                    f"routing policy name '{name}' must not contain ':' or '/' "
-                    "(it would shadow a real model selector)."
+                    f"routing policy name '{name}' must not contain ':' or '/' (it would shadow a real model selector)."
                 )
                 raise ValueError(msg)
             if name in self.providers:
@@ -1674,6 +2031,12 @@ class GatewayConfig(BaseSettings):
             if ":" in instance or "/" in instance:
                 msg = f"provider instance name '{instance}' must not contain ':' or '/'."
                 raise ValueError(msg)
+            if instance in RESERVED_PROVIDER_INSTANCE_NAMES:
+                msg = (
+                    f"provider instance name '{instance}' is reserved: 'otari' prices the gateway's own tools "
+                    "and 'hosted' names a deployment-owned offering."
+                )
+                raise ValueError(msg)
             if not isinstance(entry, dict):
                 continue
             declared = entry.get("provider_type")
@@ -1682,10 +2045,7 @@ class GatewayConfig(BaseSettings):
                 try:
                     LLMProvider(impl)
                 except ValueError as exc:
-                    msg = (
-                        f"providers.{instance}.provider_type '{declared}' is not a known provider "
-                        "implementation."
-                    )
+                    msg = f"providers.{instance}.provider_type '{declared}' is not a known provider implementation."
                     raise ValueError(msg) from exc
             models = entry.get("models")
             if models is not None and not (isinstance(models, list) and all(isinstance(m, str) for m in models)):
@@ -1711,7 +2071,7 @@ class GatewayConfig(BaseSettings):
         env_names = provider_credential_env_names(instance)
         # Empty: a keyless backend, nothing to warn about. None: a provider we
         # cannot inspect, so we do not know that a credential is needed.
-        if not env_names:
+        if not env_names or instance in KEYLESS_SELF_HOSTED_PROVIDERS:
             return
         if any(os.getenv(name) for name in env_names):
             return
@@ -1738,7 +2098,7 @@ class GatewayConfig(BaseSettings):
         annotation would otherwise reject with a type error. Normalize it to
         ``{}``, which means "this instance is configured, with no settings": the
         instance is then routable and, since discovery is scoped to the configured
-        instances, also discoverable in ``GET /v1/models`` (issue #389).
+        instances, also discoverable in ``GET /api/v1/models`` (issue #389).
 
         A ``providers:`` block with no entries at all gets the same treatment, so
         commenting out every entry reads as "no providers" rather than the same
@@ -1811,6 +2171,27 @@ class GatewayConfig(BaseSettings):
             and not entry.get("api_base")
         ]
 
+    def effective_code_executor(self) -> CodeExecutor:
+        """The deployment's answer to who runs a provider-named code-execution tool.
+
+        ``auto`` when nothing is set, so an upgrade changes nothing for a request the
+        provider was already serving and only claims the ones it could not.
+        """
+        configured = (self.code_execution_executor or "").strip() or otari_env("CODE_EXECUTION_EXECUTOR")
+        return CodeExecutor.parse(configured) or CodeExecutor.AUTO
+
+    def sandbox_configured(self) -> bool:
+        """Whether this deployment can run ``otari_code_execution`` at all.
+
+        A hosted provider needs no URL, so selecting one is itself the answer;
+        the default ``protocol`` provider needs a backend to point at.
+
+        Gotcha: a cleared dashboard override leaves ``sandbox_url`` as ``None``, so the environment value still counts.
+        """
+        if (self.sandbox_provider or "").strip().lower() not in ("", "protocol"):
+            return True
+        return bool(self.sandbox_url or otari_env("SANDBOX_URL"))
+
     def effective_sandbox_image(self) -> str | None:
         """The image this deployment asks a sandbox session for, or ``None``.
 
@@ -1867,7 +2248,7 @@ class GatewayConfig(BaseSettings):
         if self.web_search_backend_token and not self.web_search_provider_configured():
             logger.warning(
                 "web_search_backend_token is set but no web-search provider is configured, so "
-                "GET /v1/web-search/search is not served. Set web_search_provider and "
+                "GET /api/v1/web-search/search is not served. Set web_search_provider and "
                 "web_search_provider_api_key on the process that holds the search key."
             )
         if bool(self.web_search_provider) == bool(self.web_search_provider_api_key):
@@ -1898,6 +2279,11 @@ class GatewayConfig(BaseSettings):
             if provider in SEARCH_PROVIDERS_REQUIRING_API_BASE and not entry.get("api_base"):
                 validate_search_tool_transport(name, self.web_search_url, entry.get("api_key"))
 
+    def validate_decision_providers(self) -> None:
+        """Validate the ``decision_providers`` map at startup so misconfig fails fast."""
+        for name, entry in self.decision_providers.items():
+            validate_decision_provider_entry(name, entry)
+
     @model_validator(mode="after")
     def _validate_database_timeout_ordering(self) -> "GatewayConfig":
         """Keep the server-side statement timeout behind the client-side one.
@@ -1921,6 +2307,28 @@ class GatewayConfig(BaseSettings):
             raise ValueError(msg)
         return self
 
+    @field_validator("master_key")
+    @classmethod
+    def _blank_master_key_is_unset(cls, value: str | None) -> str | None:
+        """Read a blank key as unset, so it falls back to a generated one.
+
+        ``${OTARI_MASTER_KEY}`` resolves to ``""`` when Compose forwards an unset
+        variable, and an empty configured key would accept an empty token.
+        """
+        if value is not None and not value.strip():
+            return None
+        return value
+
+    @field_validator("rate_limits")
+    @classmethod
+    def _validate_rate_limit_names(cls, rules: list[RateLimitRule]) -> list[RateLimitRule]:
+        names = [rule.name for rule in rules]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            msg = f"rate_limits names must be unique, repeated: {', '.join(duplicates)}"
+            raise ValueError(msg)
+        return rules
+
     @field_validator("web_search_provider")
     @classmethod
     def _validate_web_search_provider(cls, value: str | None) -> str | None:
@@ -1934,16 +2342,7 @@ class GatewayConfig(BaseSettings):
             raise ValueError(msg)
         return normalized
 
-    @field_validator("stream_missing_usage_policy")
-    @classmethod
-    def _validate_stream_missing_usage_policy(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized not in STREAM_MISSING_USAGE_POLICIES:
-            msg = f"stream_missing_usage_policy must be one of {sorted(STREAM_MISSING_USAGE_POLICIES)}, got '{value}'"
-            raise ValueError(msg)
-        return normalized
-
-    @field_validator("docs_url", "terms_url", "privacy_url")
+    @field_validator("docs_url", "terms_url", "privacy_url", "site_url")
     @classmethod
     def _validate_link_url(cls, value: str | None, info: ValidationInfo) -> str | None:
         """Reject a menu link that is not an absolute http(s) URL.
@@ -1958,7 +2357,7 @@ class GatewayConfig(BaseSettings):
         request from it rather than following it.
 
         Userinfo is the one refusal these three fields share with ``data_plane_url``, and
-        they share it for its reason rather than theirs: ``GET /v1/bootstrap``
+        they share it for its reason rather than theirs: ``GET /api/v1/bootstrap``
         is unauthenticated, so a credential written into any of these would
         reach every browser that asked, which no redaction in the operator-gated
         config viewer would cover.
@@ -1977,6 +2376,39 @@ class GatewayConfig(BaseSettings):
             raise ValueError(msg)
         return normalized
 
+    @field_validator("ui_base_url")
+    @classmethod
+    def _validate_ui_base_url(cls, value: str | None) -> str | None:
+        """Reject an interface address a browser could not be sent to.
+
+        Absolute, so that what this builds is absolute too: the same value has to
+        survive a redirect and an inbox, and a relative reference means nothing
+        in the second. A path-prefixed interface writes the whole URL, the way
+        ``public_base_url`` already does. A query string is kept, since an edge
+        that serves one interface for several deployments may need each link to
+        say which one built it; ``ui_link`` places it ahead of the hash route.
+        """
+        stripped = (value or "").strip()
+        if not stripped:
+            return None
+        normalized = _strip_path_slashes(stripped)
+        if not normalized:
+            # Slashes alone, which would otherwise strip to empty and read as
+            # unset. Refused rather than silently answered by public_base_url.
+            msg = f"ui_base_url must be an absolute http(s) URL, got '{value}'"
+            raise ValueError(msg)
+        if "#" in normalized:
+            msg = "ui_base_url must carry no fragment"
+            raise ValueError(msg)
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            msg = f"ui_base_url must be an absolute http(s) URL, got '{value}'"
+            raise ValueError(msg)
+        if parsed.username is not None or parsed.password is not None:
+            msg = "ui_base_url must carry no username or password"
+            raise ValueError(msg)
+        return normalized
+
     @field_validator("data_plane_url")
     @classmethod
     def _validate_data_plane_url(cls, value: str | None) -> str | None:
@@ -1988,28 +2420,28 @@ class GatewayConfig(BaseSettings):
         command an operator copies and cannot explain.
 
         The trailing slash is normalized away here so no consumer has to: the
-        dashboard suffixes this with ``/v1``, and ``https://host//v1`` is a
-        different path on a strict router.
+        dashboard suffixes this with ``/api/v1``, and ``https://host//api/v1``
+        is a different path on a strict router.
 
         A query string or a fragment is refused for the same reason, and it is
         the case a scheme check alone would miss: this is a base URL a client
-        appends to, so ``https://host?trace=1`` would put ``/v1/chat/completions``
+        appends to, so ``https://host?trace=1`` would put ``/api/v1/chat/completions``
         inside the query value rather than in the path, and the snippet would
         reach the deployment's root with a very strange parameter. Unlike
         ``docs_url``, which is a link a person follows, nothing downstream can
         recover from that.
 
-        A ``/v1`` suffix is refused too, and it is the likelier mistake of the
-        two: everywhere else a client meets one, "base URL" means the ``/v1``
-        address (the OpenAI SDK's own ``base_url`` includes it), so writing that
-        here is the natural error, and it renders a snippet posting to
-        ``/v1/v1/chat/completions``, which looks right and 404s on first use.
-        Refused rather than stripped, because stripping would be silent and
-        would be wrong for a gateway genuinely mounted under such a path, while
-        refusing costs one edit. Any segment counts and not just the last, so
-        pasting the whole endpoint (``https://host/v1/chat/completions``, the
-        likelier copy-paste of the two) is refused as well rather than rendering
-        that path twice. Any other prefix is left alone: a gateway proxied at
+        A path carrying the API root is refused too, and it is the likelier
+        mistake of the two: everywhere else a client meets one, "base URL"
+        means the ``/api/v1`` address (the OpenAI SDK's own ``base_url``
+        includes it), so writing it here is the natural error, and it renders
+        a snippet posting to ``/api/v1/api/v1/chat/completions``, which looks
+        right and 404s on first use. Refused rather than stripped, because
+        stripping would be silent and wrong for a gateway genuinely mounted
+        under such a path, while refusing costs one edit. Any ``v1`` segment
+        counts, not just a trailing root, so a pasted endpoint
+        (``https://host/api/v1/chat/completions``) is refused as well. Any
+        other prefix is left alone: a gateway proxied at
         ``https://api.example.com/otari`` is a real deployment.
         """
         normalized = (value or "").strip().rstrip("/")
@@ -2023,7 +2455,7 @@ class GatewayConfig(BaseSettings):
             msg = f"data_plane_url must carry no query string or fragment, got '{value}'"
             raise ValueError(msg)
         # Userinfo is refused rather than redacted downstream, because this value
-        # is published *unauthenticated*: `GET /v1/bootstrap` hands it to any
+        # is published *unauthenticated*: `GET /api/v1/bootstrap` hands it to any
         # browser that asks, which no redaction in the operator-gated config
         # viewer would cover. A credential has no business here either way, since
         # the snippet built from this puts the whole address in a curl command
@@ -2040,9 +2472,9 @@ class GatewayConfig(BaseSettings):
             raise ValueError(msg)
         if any(segment.lower() == "v1" for segment in parsed.path.split("/")):
             msg = (
-                "data_plane_url must not contain a /v1 segment: the dashboard appends that path "
-                f"itself, so give the gateway's own address (for example 'https://gateway.otari.ai'). "
-                f"Got '{value}'"
+                f"data_plane_url must not carry the API root ({API_ROOT}) or any /v1 segment: the "
+                "dashboard appends that path itself, so give the gateway's own address (for example "
+                f"'https://gateway.otari.ai'). Got '{value}'"
             )
             raise ValueError(msg)
         return normalized
@@ -2055,6 +2487,26 @@ class GatewayConfig(BaseSettings):
             msg = f"mail_transport must be one of {sorted(MAIL_TRANSPORT_SETTINGS)}, got '{value}'"
             raise ValueError(msg)
         return normalized
+
+    @field_validator("sandbox_provider")
+    @classmethod
+    def _validate_sandbox_provider(cls, value: str) -> str:
+        normalized = (value or "protocol").strip().lower() or "protocol"
+        if normalized not in SANDBOX_PROVIDERS:
+            msg = f"sandbox_provider must be one of {sorted(SANDBOX_PROVIDERS)}, got '{value}'"
+            raise ValueError(msg)
+        return normalized
+
+    @field_validator("code_execution_executor")
+    @classmethod
+    def _validate_code_execution_executor(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        executor = CodeExecutor.parse(value)
+        if executor is None:
+            msg = f"code_execution_executor must be one of {[e.value for e in CodeExecutor]}, got '{value}'"
+            raise ValueError(msg)
+        return executor.value
 
     @field_validator("vision_strategy")
     @classmethod
@@ -2089,9 +2541,7 @@ class GatewayConfig(BaseSettings):
             try:
                 inline_timeout = int(raw_inline_timeout)
             except (TypeError, ValueError):
-                raise ValueError(
-                    f"{inline_key} must be a positive integer, got {raw_inline_timeout!r}"
-                ) from None
+                raise ValueError(f"{inline_key} must be a positive integer, got {raw_inline_timeout!r}") from None
             if (
                 isinstance(raw_inline_timeout, bool)
                 or (isinstance(raw_inline_timeout, float) and not raw_inline_timeout.is_integer())
@@ -2169,7 +2619,7 @@ class GatewayConfig(BaseSettings):
         :meth:`validate_webauthn_relying_party`: nothing here is *wrong*, and
         refusing to boot would take a gateway offline over a sign-in method
         that is optional. But the failure is otherwise completely silent. The
-        provider is absent from ``GET /v1/bootstrap``, the sign-in screen simply
+        provider is absent from ``GET /api/v1/bootstrap``, the sign-in screen simply
         does not draw its button, and an operator who set two of the three
         settings has nothing anywhere telling them why the button they
         configured never appeared.
@@ -2381,6 +2831,7 @@ def load_config(config_path: str | None = None) -> GatewayConfig:
     config.validate_aliases()
     config.validate_routing_policies()
     config.validate_search_tools()
+    config.validate_decision_providers()
     config.validate_mail_transport()
     config.validate_webauthn_relying_party()
     config.warn_about_half_configured_oauth()

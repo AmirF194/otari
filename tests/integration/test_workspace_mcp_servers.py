@@ -24,13 +24,25 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gateway.api.routes import chat
-from gateway.api.routes._pipeline import RequestContext, prepare_gateway_tools
+from gateway.adapters.code_execution_policy_adapter import LocalCodeExecutionPolicy
+from gateway.adapters.mcp_server_adapter import LocalMcpServers
+from gateway.adapters.web_search_policy_adapter import LocalWebSearchPolicy
+from gateway.api.deps import ToolPorts
+from gateway.api.routes import chat, messages
+from gateway.api.routes._pipeline import DeclaredTools, RequestContext, ToolBackends, prepare_gateway_tools
 from gateway.api.routes.chat import ChatCompletionRequest
 from gateway.core.config import GatewayConfig
-from gateway.models.entities import WorkspaceMcpServer
+from gateway.core.unit_of_work import UnitOfWork
+from gateway.exceptions.organizations_exceptions import NotAuthorizedError, WorkspaceNotFoundError
+from gateway.exceptions.tools_exceptions import (
+    WorkspaceMcpServerAlreadyExistsError,
+    WorkspaceMcpServerLimitReachedError,
+    WorkspaceMcpServerNotFoundError,
+    WorkspaceMcpServerUnsafeUrlError,
+)
 from gateway.models.mcp import MAX_MCP_SERVER_IDS, McpServerConfig
 from gateway.models.tenancy import Organization, User, Workspace
+from gateway.models.tools import WorkspaceMcpServer
 from gateway.repositories.tenancy import (
     OrganizationMemberRepository,
     OrganizationRepository,
@@ -39,20 +51,13 @@ from gateway.repositories.tenancy import (
     WorkspaceRepository,
 )
 from gateway.services.secret_box import decrypt_secret, generate_secret_key
-from gateway.services.tenancy.errors import (
-    NotAuthorizedError,
-    WorkspaceMcpServerAlreadyExistsError,
-    WorkspaceMcpServerLimitReachedError,
-    WorkspaceMcpServerNotFoundError,
-    WorkspaceMcpServerUnsafeUrlError,
-    WorkspaceNotFoundError,
-)
 from gateway.services.tenancy.workspace_mcp_server_service import (
     MAX_ALLOWED_TOOLS,
     MAX_MCP_SERVERS_PER_WORKSPACE,
     WorkspaceMcpServerCreate,
     WorkspaceMcpServerService,
     WorkspaceMcpServerUpdate,
+    resolve_workspace_mcp_server,
     resolve_workspace_mcp_servers,
 )
 
@@ -61,6 +66,15 @@ pytestmark = pytest.mark.asyncio
 # A public IP literal, so the safety check never reaches a DNS resolver.
 PUBLIC_URL = "https://93.184.216.34/mcp"
 OTHER_PUBLIC_URL = "https://93.184.216.35/mcp"
+
+
+def _tool_ports(db: AsyncSession) -> ToolPorts:
+    return ToolPorts(
+        code_execution=None,
+        code_execution_policy=LocalCodeExecutionPolicy(db),
+        mcp_server=LocalMcpServers(db),
+        web_search_policy=LocalWebSearchPolicy(db),
+    )
 
 
 async def _organization(db: AsyncSession, *, slug: str = "acme") -> Organization:
@@ -208,9 +222,7 @@ async def test_creating_a_server_locks_the_workspace(async_db: AsyncSession, mon
         await original(self, workspace_id)
 
     monkeypatch.setattr(WorkspaceRepository, "lock", recording_lock)
-    await WorkspaceMcpServerService(async_db).create_server(
-        user=owner, workspace_id=workspace.id, request=_create()
-    )
+    await WorkspaceMcpServerService(async_db).create_server(user=owner, workspace_id=workspace.id, request=_create())
 
     assert locked == [workspace.id]
 
@@ -561,9 +573,7 @@ async def test_resolve_skips_a_disabled_server(async_db: AsyncSession) -> None:
     workspace = await _workspace(async_db, organization, owner=owner)
     service = WorkspaceMcpServerService(async_db)
 
-    created = await service.create_server(
-        user=owner, workspace_id=workspace.id, request=_create(enabled=False)
-    )
+    created = await service.create_server(user=owner, workspace_id=workspace.id, request=_create(enabled=False))
 
     assert await resolve_workspace_mcp_servers(async_db, workspace_id=workspace.id, server_ids=[created.id]) == []
 
@@ -634,6 +644,7 @@ def _request_context(
     return RequestContext(
         config=GatewayConfig(),
         db=db,
+        uow=UnitOfWork(db),
         log_writer=None,  # type: ignore[arg-type]
         hybrid_mode=False,
         route=None,
@@ -668,14 +679,19 @@ async def test_prepare_gateway_tools_hands_the_tool_loop_the_workspaces_servers(
     tool_ctx = await prepare_gateway_tools(
         adapter=chat._ADAPTER,
         ctx=_request_context(async_db, workspace.id, organization.id),
+        backends=ToolBackends(
+            ports=_tool_ports(async_db),
+        ),
         response=Response(),
-        guardrails=None,
-        guardrail_text="",
-        tools=None,
-        mcp_servers=None,
-        mcp_server_ids=[stored.id],
-        max_tool_iterations=None,
-        tools_header=None,
+        declared=DeclaredTools(
+            guardrails=None,
+            guardrail_text="",
+            tools=None,
+            mcp_servers=None,
+            mcp_server_ids=[stored.id],
+            max_tool_iterations=None,
+            tools_header=None,
+        ),
     )
 
     assert tool_ctx.use_tool_loop is True
@@ -695,14 +711,19 @@ async def test_prepare_gateway_tools_merges_stored_servers_after_inline_ones(asy
     tool_ctx = await prepare_gateway_tools(
         adapter=chat._ADAPTER,
         ctx=_request_context(async_db, workspace.id, organization.id),
+        backends=ToolBackends(
+            ports=_tool_ports(async_db),
+        ),
         response=Response(),
-        guardrails=None,
-        guardrail_text="",
-        tools=None,
-        mcp_servers=[McpServerConfig(name="inline", url=OTHER_PUBLIC_URL)],
-        mcp_server_ids=[stored.id],
-        max_tool_iterations=None,
-        tools_header=None,
+        declared=DeclaredTools(
+            guardrails=None,
+            guardrail_text="",
+            tools=None,
+            mcp_servers=[McpServerConfig(name="inline", url=OTHER_PUBLIC_URL)],
+            mcp_server_ids=[stored.id],
+            max_tool_iterations=None,
+            tools_header=None,
+        ),
     )
 
     assert tool_ctx.mcp_server_configs is not None
@@ -723,14 +744,19 @@ async def test_prepare_gateway_tools_is_unchanged_when_nothing_is_configured(asy
     tool_ctx = await prepare_gateway_tools(
         adapter=chat._ADAPTER,
         ctx=_request_context(async_db, workspace.id, organization.id),
+        backends=ToolBackends(
+            ports=_tool_ports(async_db),
+        ),
         response=Response(),
-        guardrails=None,
-        guardrail_text="",
-        tools=None,
-        mcp_servers=[McpServerConfig(name="inline", url=PUBLIC_URL)],
-        mcp_server_ids=None,
-        max_tool_iterations=None,
-        tools_header=None,
+        declared=DeclaredTools(
+            guardrails=None,
+            guardrail_text="",
+            tools=None,
+            mcp_servers=[McpServerConfig(name="inline", url=PUBLIC_URL)],
+            mcp_server_ids=None,
+            max_tool_iterations=None,
+            tools_header=None,
+        ),
     )
 
     assert tool_ctx.mcp_server_configs is not None
@@ -775,14 +801,19 @@ async def test_a_stored_servers_unsafe_url_is_not_named_to_the_caller(
         await prepare_gateway_tools(
             adapter=chat._ADAPTER,
             ctx=_request_context(async_db, workspace.id, organization.id),
+            backends=ToolBackends(
+                ports=_tool_ports(async_db),
+            ),
             response=Response(),
-            guardrails=None,
-            guardrail_text="",
-            tools=None,
-            mcp_servers=None,
-            mcp_server_ids=[stored.id],
-            max_tool_iterations=None,
-            tools_header=None,
+            declared=DeclaredTools(
+                guardrails=None,
+                guardrail_text="",
+                tools=None,
+                mcp_servers=None,
+                mcp_server_ids=[stored.id],
+                max_tool_iterations=None,
+                tools_header=None,
+            ),
         )
 
     assert exc_info.value.status_code == 500
@@ -800,17 +831,52 @@ async def test_prepare_gateway_tools_refuses_an_unknown_id(async_db: AsyncSessio
         await prepare_gateway_tools(
             adapter=chat._ADAPTER,
             ctx=_request_context(async_db, workspace.id, organization.id),
+            backends=ToolBackends(
+                ports=_tool_ports(async_db),
+            ),
             response=Response(),
-            guardrails=None,
-            guardrail_text="",
-            tools=None,
-            mcp_servers=None,
-            mcp_server_ids=[uuid.uuid4()],
-            max_tool_iterations=None,
-            tools_header=None,
+            declared=DeclaredTools(
+                guardrails=None,
+                guardrail_text="",
+                tools=None,
+                mcp_servers=None,
+                mcp_server_ids=[uuid.uuid4()],
+                max_tool_iterations=None,
+                tools_header=None,
+            ),
         )
 
     assert exc_info.value.status_code == 404
+
+
+async def test_the_anthropic_envelope_names_an_unknown_id_as_not_found(async_db: AsyncSession) -> None:
+    """A hybrid gateway answers `not_found_error` for this, so a caller moving between them sees one contract."""
+    organization = await _organization(async_db)
+    owner = await _member(async_db, organization, role="owner", full_name="Owner")
+    workspace = await _workspace(async_db, organization, owner=owner)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await prepare_gateway_tools(
+            adapter=messages._ADAPTER,
+            ctx=_request_context(async_db, workspace.id, organization.id),
+            backends=ToolBackends(
+                ports=_tool_ports(async_db),
+            ),
+            response=Response(),
+            declared=DeclaredTools(
+                guardrails=None,
+                guardrail_text="",
+                tools=None,
+                mcp_servers=None,
+                mcp_server_ids=[uuid.uuid4()],
+                max_tool_iterations=None,
+                tools_header=None,
+            ),
+        )
+
+    assert exc_info.value.status_code == 404
+    assert isinstance(exc_info.value.detail, dict)
+    assert exc_info.value.detail["error"]["type"] == "not_found_error"
 
 
 # --------------------------------------------------------------------------- #
@@ -881,3 +947,124 @@ async def test_mcp_server_ids_is_bounded_on_the_request() -> None:
             messages=[{"role": "user", "content": "hi"}],
             mcp_server_ids=[uuid.uuid4() for _ in range(MAX_MCP_SERVER_IDS + 1)],
         )
+
+
+# --------------------------------------------------------------------------- #
+# Single stored-server resolution, for the caller-orchestrated endpoints
+# --------------------------------------------------------------------------- #
+
+
+async def test_single_resolution_returns_the_stored_server_and_its_revision(async_db: AsyncSession) -> None:
+    organization = await _organization(async_db)
+    owner = await _member(async_db, organization, role="owner", full_name="Owner")
+    workspace = await _workspace(async_db, organization, owner=owner)
+    service = WorkspaceMcpServerService(async_db)
+    created = await service.create_server(
+        user=owner,
+        workspace_id=workspace.id,
+        request=_create(authorization_token="ghp_token", allowed_tools=["list_issues"], purpose_hint="Issues"),
+    )
+
+    resolved = await resolve_workspace_mcp_server(async_db, workspace_id=workspace.id, server_id=created.id)
+
+    assert resolved is not None
+    assert resolved.id == created.id
+    assert resolved.url == PUBLIC_URL
+    assert resolved.authorization_token == "ghp_token"
+    assert resolved.enabled is True
+    assert resolved.allowed_tools == ["list_issues"]
+    assert resolved.revision
+
+
+async def test_single_resolution_of_an_unchanged_server_is_stable(async_db: AsyncSession) -> None:
+    """The revision has to survive being derived twice, on any worker."""
+    organization = await _organization(async_db)
+    owner = await _member(async_db, organization, role="owner", full_name="Owner")
+    workspace = await _workspace(async_db, organization, owner=owner)
+    service = WorkspaceMcpServerService(async_db)
+    created = await service.create_server(user=owner, workspace_id=workspace.id, request=_create())
+
+    first = await resolve_workspace_mcp_server(async_db, workspace_id=workspace.id, server_id=created.id)
+    second = await resolve_workspace_mcp_server(async_db, workspace_id=workspace.id, server_id=created.id)
+
+    assert first is not None and second is not None
+    assert first.revision == second.revision
+
+
+async def test_single_resolution_revision_moves_when_the_stored_url_changes(async_db: AsyncSession) -> None:
+    organization = await _organization(async_db)
+    owner = await _member(async_db, organization, role="owner", full_name="Owner")
+    workspace = await _workspace(async_db, organization, owner=owner)
+    service = WorkspaceMcpServerService(async_db)
+    created = await service.create_server(user=owner, workspace_id=workspace.id, request=_create())
+    before = await resolve_workspace_mcp_server(async_db, workspace_id=workspace.id, server_id=created.id)
+
+    await service.update_server(
+        user=owner,
+        workspace_id=workspace.id,
+        server_id=created.id,
+        request=WorkspaceMcpServerUpdate(url=OTHER_PUBLIC_URL),
+    )
+    after = await resolve_workspace_mcp_server(async_db, workspace_id=workspace.id, server_id=created.id)
+
+    assert before is not None and after is not None
+    assert before.revision != after.revision
+
+
+async def test_single_resolution_revision_ignores_a_rename(async_db: AsyncSession) -> None:
+    """Retitling a server must not invalidate an authorization already granted."""
+    organization = await _organization(async_db)
+    owner = await _member(async_db, organization, role="owner", full_name="Owner")
+    workspace = await _workspace(async_db, organization, owner=owner)
+    service = WorkspaceMcpServerService(async_db)
+    created = await service.create_server(user=owner, workspace_id=workspace.id, request=_create())
+    before = await resolve_workspace_mcp_server(async_db, workspace_id=workspace.id, server_id=created.id)
+
+    await service.update_server(
+        user=owner,
+        workspace_id=workspace.id,
+        server_id=created.id,
+        request=WorkspaceMcpServerUpdate(name="github-enterprise", purpose_hint="Tickets"),
+    )
+    after = await resolve_workspace_mcp_server(async_db, workspace_id=workspace.id, server_id=created.id)
+
+    assert before is not None and after is not None
+    assert before.revision == after.revision
+
+
+async def test_single_resolution_reports_a_disabled_server_rather_than_skipping_it(async_db: AsyncSession) -> None:
+    """The plural resolver drops a disabled server; this one has to name it.
+
+    The stored-server endpoints answer a disabled server with a 404 that both
+    modes share, and a resolver that silently returned nothing would be
+    indistinguishable from an id belonging to another workspace.
+    """
+    organization = await _organization(async_db)
+    owner = await _member(async_db, organization, role="owner", full_name="Owner")
+    workspace = await _workspace(async_db, organization, owner=owner)
+    service = WorkspaceMcpServerService(async_db)
+    created = await service.create_server(user=owner, workspace_id=workspace.id, request=_create(enabled=False))
+
+    resolved = await resolve_workspace_mcp_server(async_db, workspace_id=workspace.id, server_id=created.id)
+
+    assert resolved is not None
+    assert resolved.enabled is False
+
+
+async def test_single_resolution_of_another_workspaces_server_finds_nothing(async_db: AsyncSession) -> None:
+    organization = await _organization(async_db)
+    owner = await _member(async_db, organization, role="owner", full_name="Owner")
+    first = await _workspace(async_db, organization, name="First", owner=owner)
+    second = await _workspace(async_db, organization, name="Second", owner=owner)
+    service = WorkspaceMcpServerService(async_db)
+    created = await service.create_server(user=owner, workspace_id=first.id, request=_create())
+
+    assert await resolve_workspace_mcp_server(async_db, workspace_id=second.id, server_id=created.id) is None
+
+
+async def test_single_resolution_of_an_unknown_id_finds_nothing(async_db: AsyncSession) -> None:
+    organization = await _organization(async_db)
+    owner = await _member(async_db, organization, role="owner", full_name="Owner")
+    workspace = await _workspace(async_db, organization, owner=owner)
+
+    assert await resolve_workspace_mcp_server(async_db, workspace_id=workspace.id, server_id=uuid.uuid4()) is None

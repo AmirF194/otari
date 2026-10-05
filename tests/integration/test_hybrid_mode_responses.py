@@ -1,4 +1,4 @@
-"""Hybrid-mode integration tests for /v1/responses.
+"""Hybrid-mode integration tests for /api/v1/responses.
 
 Mirror of :mod:`tests.integration.test_hybrid_mode_messages` for the OpenAI
 Responses endpoint. Tool-loop platform requests are tested only in the
@@ -18,16 +18,18 @@ from fastapi.testclient import TestClient
 from openai.types.responses import ResponseUsage
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 
+from conftest import InstallControlPlane
 from gateway.api.deps import reset_config
-from gateway.core.config import GatewayConfig
+from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.core.database import reset_db
-from gateway.main import create_app
+
+from .conftest import app_for
 
 
 @pytest.fixture
 def platform_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient]:
     monkeypatch.setenv("OTARI_AI_TOKEN", "gw_test_token")
-    app = create_app(
+    app = app_for(
         GatewayConfig(
             mode="hybrid",
             platform={"base_url": "http://platform.test/api/v1"},
@@ -102,19 +104,20 @@ def _response_object() -> Response:
     )
 
 
-def test_hybrid_mode_requires_authorization_header(platform_client: TestClient) -> None:
+def test_hybrid_mode_requires_credentials(platform_client: TestClient) -> None:
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={"model": "openai:gpt-4o-mini", "input": "hi"},
     )
 
     assert response.status_code == 401
-    assert response.json() == {"detail": "Missing authentication token"}
+    assert response.json() == {"detail": "Missing Otari-Key, Authorization, or x-api-key header"}
 
 
 def test_hybrid_mode_sets_correlation_id_and_reports_usage(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     usage_reports: list[dict[str, Any]] = []
     attempt_id = "3f1b6a1e-0000-4000-8000-000000000002"
@@ -148,18 +151,18 @@ def test_hybrid_mode_sets_correlation_id_and_reports_usage(
         assert kwargs["api_key"] == "sk-platform-key"
         return _response_object()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.responses.aresponses", fake_aresponses)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={"model": "gpt-4o-mini", "input": "hi"},
         headers={"Authorization": "Bearer user_test_token"},
     )
 
     assert response.status_code == 200, response.text
-    assert response.headers["X-Correlation-ID"] == attempt_id
-    assert response.headers["X-Otari-Request-ID"] == "req-1"
+    assert response.headers["Otari-Attempt-ID"] == attempt_id
+    assert response.headers["Otari-Request-ID"] == "req-1"
     assert response.json()["usage"]["cost_usd"] == "0.012345"
     assert response.json()["usage"]["pricing_source"] == "managed"
     assert usage_reports == [
@@ -181,6 +184,7 @@ def test_hybrid_mode_sets_correlation_id_and_reports_usage(
 def test_hybrid_mode_forwards_extra_params(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """The Responses adapter's own ``attempt_kwargs`` override (which does not
     delegate to ``default_attempt_kwargs``) must forward an attempt's
@@ -220,11 +224,11 @@ def test_hybrid_mode_forwards_extra_params(
         assert kwargs["client_args"] == {"region_name": "us-east-1"}
         return _response_object()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.responses.aresponses", fake_aresponses)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={"model": "gpt-4o-mini", "input": "hi"},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -235,6 +239,7 @@ def test_hybrid_mode_forwards_extra_params(
 def test_hybrid_mode_rejects_caller_supplied_client_args(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """The Responses request schema allows extra fields (``extra="allow"``),
     so a caller could smuggle a ``client_args`` field into the request body.
@@ -266,11 +271,11 @@ def test_hybrid_mode_rejects_caller_supplied_client_args(
         assert "client_args" not in kwargs
         return _response_object()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.responses.aresponses", fake_aresponses)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={
             "model": "gpt-4o-mini",
             "input": "hi",
@@ -288,6 +293,7 @@ def test_hybrid_mode_forwards_codex_metadata_only_to_openai(
     monkeypatch: pytest.MonkeyPatch,
     provider: str,
     preserves_codex_metadata: bool,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """Hybrid non-streaming requests preserve the extension only for OpenAI."""
     captured: dict[str, Any] = {}
@@ -309,7 +315,7 @@ def test_hybrid_mode_forwards_codex_metadata_only_to_openai(
         captured.update(kwargs)
         return _response_object()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.responses.aresponses", fake_aresponses)
 
     input_data = [
@@ -321,7 +327,7 @@ def test_hybrid_mode_forwards_codex_metadata_only_to_openai(
         }
     ]
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={
             "model": "gpt-4o-mini",
             "client_metadata": {"session_id": "session_123"},
@@ -350,6 +356,7 @@ def test_hybrid_mode_forwards_codex_metadata_only_to_openai(
 def test_hybrid_mode_falls_through_on_first_attempt_failure(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     usage_reports: list[dict[str, Any]] = []
 
@@ -384,17 +391,17 @@ def test_hybrid_mode_falls_through_on_first_attempt_failure(
             )
         return _response_object()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.responses.aresponses", fake_aresponses)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={"model": "gpt-4o-mini", "input": "hi"},
         headers={"Authorization": "Bearer user_test_token"},
     )
 
     assert response.status_code == 200, response.text
-    assert response.headers["X-Correlation-ID"] == "att-fallback"
+    assert response.headers["Otari-Attempt-ID"] == "att-fallback"
     assert len(calls) == 2
     outcomes = [report["status"] for report in usage_reports]
     assert "error" in outcomes
@@ -404,9 +411,51 @@ def test_hybrid_mode_falls_through_on_first_attempt_failure(
     assert reports_by_id["att-fallback"]["is_final_attempt"] is True
 
 
+def test_hybrid_mode_single_attempt_failure_names_the_attempt(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """A lone attempt keeps its classified upstream status and names the attempt.
+
+    A single attempt takes the classifier's terminal path rather than the
+    aggregate 502, so the attempt id has to be attached on both.
+    """
+
+    async def fake_post_platform(
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        timeout_seconds: float,
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return httpx.Response(200, json=_resolve_payload([_attempt(0, "att-only", "gpt-4o-mini", "sk-1")]))
+        return httpx.Response(204)
+
+    async def fake_aresponses(**kwargs: Any) -> Response:
+        raise httpx.HTTPStatusError(
+            "404",
+            request=httpx.Request("POST", "http://upstream"),
+            response=httpx.Response(404, request=httpx.Request("POST", "http://upstream")),
+        )
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes.responses.aresponses", fake_aresponses)
+
+    response = platform_client.post(
+        f"{API_ROOT}/responses",
+        json={"model": "gpt-4o-mini", "input": "hi"},
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 404
+    assert response.headers["Otari-Attempt-ID"] == "att-only"
+
+
 def test_hybrid_mode_returns_502_when_all_attempts_fail(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     usage_reports: list[dict[str, Any]] = []
 
@@ -436,17 +485,18 @@ def test_hybrid_mode_returns_502_when_all_attempts_fail(
             response=httpx.Response(500, request=httpx.Request("POST", "http://upstream")),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.responses.aresponses", fake_aresponses)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={"model": "gpt-4o-mini", "input": "hi"},
         headers={"Authorization": "Bearer user_test_token"},
     )
 
     assert response.status_code == 502
     assert response.json() == {"detail": "All upstream providers failed"}
+    assert response.headers["Otari-Attempt-ID"] == "att-2"
     reports_by_id = {report["correlation_id"]: report for report in usage_reports}
     assert reports_by_id["att-1"]["is_final_attempt"] is False
     assert reports_by_id["att-2"]["is_final_attempt"] is True
@@ -454,7 +504,7 @@ def test_hybrid_mode_returns_502_when_all_attempts_fail(
 
 def test_hybrid_mode_provider_without_responses_support_returns_400(
     platform_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """The ``SUPPORTS_RESPONSES`` guard rejects an unsupported fallback before
     any upstream call and marks the first planned attempt as terminal.
@@ -480,10 +530,10 @@ def test_hybrid_mode_provider_without_responses_support_returns_400(
         usage_reports.append(body)
         return httpx.Response(204)
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={"model": "claude-3-5-sonnet-20241022", "input": "hi"},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -550,8 +600,9 @@ def _two_attempt_resolve_response_openai_first(*, request_id: str) -> httpx.Resp
 def test_hybrid_mode_tool_loop_falls_through_pre_lock_in(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
-    """Non-streaming MCP request on /v1/responses: first attempt errors before
+    """Non-streaming MCP request on /api/v1/responses: first attempt errors before
     any tool round completes → fallback to the second attempt.
     """
     usage_reports: list[dict[str, Any]] = []
@@ -575,12 +626,12 @@ def test_hybrid_mode_tool_loop_falls_through_pre_lock_in(
             raise _FakeAuthError("simulated upstream 401 on primary")
         return _response_object()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.MCPClientPool", _FakeMcpPool)
     monkeypatch.setattr("gateway.services.mcp_loop_responses.aresponses", fake_loop_aresponses)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={
             "model": "gpt-4o-mini",
             "input": "hi",
@@ -590,7 +641,7 @@ def test_hybrid_mode_tool_loop_falls_through_pre_lock_in(
     )
 
     assert response.status_code == 200, response.text
-    assert response.headers["X-Correlation-ID"] == "tool-att-fallback"
+    assert response.headers["Otari-Attempt-ID"] == "tool-att-fallback"
     assert len(calls) == 2
     error_reports = [r for r in usage_reports if r.get("status") == "error"]
     assert len(error_reports) == 1
@@ -600,6 +651,7 @@ def test_hybrid_mode_tool_loop_falls_through_pre_lock_in(
 def test_hybrid_mode_tool_loop_no_fallback_after_lock_in(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """First attempt returns a function_call (lock-in fires), then upstream
     dies on round 2. The gateway must NOT try the second attempt — the
@@ -655,12 +707,12 @@ def test_hybrid_mode_tool_loop_no_fallback_after_lock_in(
             )
         raise RuntimeError("simulated upstream 5xx on round 2")
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.MCPClientPool", _FakeMcpPool)
     monkeypatch.setattr("gateway.services.mcp_loop_responses.aresponses", fake_loop_aresponses)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={
             "model": "gpt-4o-mini",
             "input": "hi",
@@ -680,7 +732,7 @@ def test_hybrid_mode_tool_loop_no_fallback_after_lock_in(
 
 def test_hybrid_mode_tool_loop_streaming_sets_correlation_id_and_reports_usage(
     platform_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """Tool-loop streaming returns settled cost on response.completed."""
     usage_reports: list[dict[str, Any]] = []
@@ -708,7 +760,7 @@ def test_hybrid_mode_tool_loop_streaming_sets_correlation_id_and_reports_usage(
             },
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
 
     from unittest.mock import AsyncMock, patch
 
@@ -733,7 +785,7 @@ def test_hybrid_mode_tool_loop_streaming_sets_correlation_id_and_reports_usage(
     ):
         with platform_client.stream(
             "POST",
-            "/v1/responses",
+            f"{API_ROOT}/responses",
             json={
                 "model": "gpt-4o-mini",
                 "input": "hi",
@@ -743,8 +795,8 @@ def test_hybrid_mode_tool_loop_streaming_sets_correlation_id_and_reports_usage(
             headers={"Authorization": "Bearer user_test_token"},
         ) as response:
             assert response.status_code == 200, response.read().decode()
-            assert response.headers["X-Correlation-ID"] == attempt_id
-            assert response.headers["X-Otari-Request-ID"] == "req-1"
+            assert response.headers["Otari-Attempt-ID"] == attempt_id
+            assert response.headers["Otari-Request-ID"] == "req-1"
             wire = response.read().decode()
 
     assert '"cost_usd":"0.012345"' in wire
@@ -757,7 +809,7 @@ def test_hybrid_mode_tool_loop_streaming_sets_correlation_id_and_reports_usage(
 
 def test_hybrid_mode_supports_responses_guard_checks_every_attempt(
     platform_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """Regression test for the SUPPORTS_RESPONSES guard. Previously only the
     primary attempt was checked; a fallback to an unsupported provider would
@@ -779,10 +831,10 @@ def test_hybrid_mode_supports_responses_guard_checks_every_attempt(
             )
         return httpx.Response(204)
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={"model": "gpt-4o-mini", "input": "hi"},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -796,6 +848,7 @@ def test_hybrid_mode_supports_responses_guard_checks_every_attempt(
 def test_hybrid_mode_streaming_single_attempt_classifies_provider_error(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """A single-attempt streaming request that fails before its first chunk
     surfaces the classified status (404), not a generic 502."""
@@ -820,11 +873,11 @@ def test_hybrid_mode_streaming_single_attempt_classifies_provider_error(
             response=httpx.Response(404, request=httpx.Request("POST", "http://upstream")),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.responses.aresponses", fake_aresponses)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={"model": "gpt-4o-mini", "input": "hi", "stream": True},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -832,11 +885,13 @@ def test_hybrid_mode_streaming_single_attempt_classifies_provider_error(
     assert response.status_code == 404
     assert response.json() == {"detail": "The requested model was not found on the provider"}
 
+
 def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
-    """Streaming MCP request on /v1/responses: the first attempt errors before
+    """Streaming MCP request on /api/v1/responses: the first attempt errors before
     yielding any event, so the gateway falls through to the second attempt and
     streams its response (same pre-lock-in semantics as chat, which this
     format previously collapsed to a single attempt)."""
@@ -868,12 +923,12 @@ def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
             sequence_number=0,
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.MCPClientPool", _FakeMcpPool)
     monkeypatch.setattr("gateway.api.routes.responses.responses_tool_loop_stream", fake_loop_stream)
 
     response = platform_client.post(
-        "/v1/responses",
+        f"{API_ROOT}/responses",
         json={
             "model": "gpt-4o-mini",
             "input": "hi",
@@ -884,8 +939,8 @@ def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
     )
 
     assert response.status_code == 200, response.text
-    assert response.headers["X-Correlation-ID"] == "tool-att-fallback"
-    assert response.headers["X-Otari-Request-ID"] == "tool-stream-req-1"
+    assert response.headers["Otari-Attempt-ID"] == "tool-att-fallback"
+    assert response.headers["Otari-Request-ID"] == "tool-stream-req-1"
     assert "response.completed" in response.text
     # Both attempts were tried in order: the tool-loop gate is gone.
     assert calls == ["sk-openai-broken", "sk-openai-real"]

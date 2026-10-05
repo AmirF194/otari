@@ -7,18 +7,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from prometheus_client import generate_latest
 
-from gateway.core.config import GatewayConfig
+from gateway.core.config import API_ROOT, API_VERSION, OTLP_ROOT, GatewayConfig
 from gateway.metrics import (
     REGISTRY,
     MetricsMiddleware,
+    _endpoint_label,
     metrics_endpoint,
-    record_abandoned_attempt,
-    record_auth_failure,
-    record_budget_exceeded,
-    record_cost,
-    record_inline_cost_settlement,
-    record_rate_limit_hit,
-    record_tokens,
 )
 
 
@@ -27,97 +21,51 @@ def _sample(name: str, labels: dict[str, str] | None = None) -> float:
     return REGISTRY.get_sample_value(name, labels or {}) or 0.0
 
 
-def test_record_tokens_increments_counters() -> None:
-    input_labels = {"provider": "test-prov", "model": "test-model", "type": "input"}
-    output_labels = {"provider": "test-prov", "model": "test-model", "type": "output"}
-    before_in = _sample("gateway_tokens_total", input_labels)
-    before_out = _sample("gateway_tokens_total", output_labels)
-
-    record_tokens("test-prov", "test-model", 100, 50)
-
-    assert _sample("gateway_tokens_total", input_labels) - before_in == 100.0
-    assert _sample("gateway_tokens_total", output_labels) - before_out == 50.0
-
-
-def test_record_tokens_skips_zero_values() -> None:
-    labels_in = {"provider": "zero-prov", "model": "zero-model", "type": "input"}
-    labels_out = {"provider": "zero-prov", "model": "zero-model", "type": "output"}
-    before_in = _sample("gateway_tokens_total", labels_in)
-    before_out = _sample("gateway_tokens_total", labels_out)
-
-    record_tokens("zero-prov", "zero-model", 0, 0)
-
-    assert _sample("gateway_tokens_total", labels_in) == before_in
-    assert _sample("gateway_tokens_total", labels_out) == before_out
-
-
-def test_record_cost_observes_histogram() -> None:
-    labels = {"provider": "cost-prov", "model": "cost-model"}
-    before_count = _sample("gateway_request_cost_dollars_count", labels)
-
-    record_cost("cost-prov", "cost-model", 1.23)
-
-    assert _sample("gateway_request_cost_dollars_count", labels) - before_count == 1.0
-    assert _sample("gateway_request_cost_dollars_sum", labels) >= 1.23
+# Every family the gateway registers, as (name, type, label names). A metric
+# may move to the module that increments it, but the scrape is an external
+# contract: dashboards, recording rules and alerts outside this repository
+# key on these names and labels.
+_EXPOSED_FAMILIES: set[tuple[str, str, tuple[str, ...]]] = {
+    ("gateway_abandoned_attempts", "counter", ("provider", "model", "reason", "position")),
+    ("gateway_active_requests", "gauge", ()),
+    ("gateway_auth_failures", "counter", ("reason",)),
+    ("gateway_budget_exceeded", "counter", ()),
+    ("gateway_db_pool_capacity", "gauge", ("pool",)),
+    ("gateway_db_pool_connections_checked_out", "gauge", ("pool",)),
+    ("gateway_db_pool_connections_idle", "gauge", ("pool",)),
+    ("gateway_db_pool_overflow_connections", "gauge", ("pool",)),
+    ("gateway_inline_cost_settlements", "counter", ("outcome",)),
+    ("gateway_rate_limit_hits", "counter", ()),
+    ("gateway_rate_limit_model_full", "counter", ("rule", "model")),
+    ("gateway_request_cost_dollars", "histogram", ("provider", "model")),
+    ("gateway_request_duration_seconds", "histogram", ("method", "endpoint", "api_version")),
+    ("gateway_requests", "counter", ("method", "endpoint", "api_version", "status")),
+    ("gateway_tokens", "counter", ("provider", "model", "type")),
+    ("gateway_usage_log_batch_size", "histogram", ("writer",)),
+    ("gateway_usage_log_flush_duration_seconds", "histogram", ("writer", "result")),
+    ("gateway_usage_log_queue_depth", "gauge", ()),
+    ("gateway_usage_log_rows", "counter", ("writer", "result")),
+}
 
 
-@pytest.mark.parametrize("outcome", ["attached", "unattached", "timeout"])
-def test_record_inline_cost_settlement_increments_counter(outcome: str) -> None:
-    labels = {"outcome": outcome}
-    before = _sample("gateway_inline_cost_settlements_total", labels)
+def test_scrape_exposes_the_pinned_families() -> None:
+    """The set of gateway metric families, with their types and label names, is fixed.
 
-    record_inline_cost_settlement(outcome)
+    A labeled family with no series yet shows only its HELP and TYPE lines in a
+    scrape, so the label names are read off the collector, or off the family it
+    yields where the collector is a custom one that keeps no label names.
+    """
+    import gateway.main  # noqa: F401  # imports every module that registers a metric
 
-    assert _sample("gateway_inline_cost_settlements_total", labels) - before == 1.0
+    families: set[tuple[str, str, tuple[str, ...]]] = set()
+    for collector in REGISTRY._collector_to_names:
+        describe = getattr(collector, "describe", collector.collect)
+        for metric in describe():
+            if metric.name.startswith("gateway_"):
+                labelnames = getattr(collector, "_labelnames", ()) or getattr(metric, "_labelnames", ())
+                families.add((metric.name, metric.type, tuple(labelnames)))
 
-
-def test_record_rate_limit_hit_increments_counter() -> None:
-    before = _sample("gateway_rate_limit_hits_total")
-
-    record_rate_limit_hit()
-
-    assert _sample("gateway_rate_limit_hits_total") - before == 1.0
-
-
-def test_record_budget_exceeded_increments_counter() -> None:
-    before = _sample("gateway_budget_exceeded_total")
-
-    record_budget_exceeded()
-
-    assert _sample("gateway_budget_exceeded_total") - before == 1.0
-
-
-def test_record_auth_failure_increments_counter() -> None:
-    labels = {"reason": "unit-test-reason"}
-    before = _sample("gateway_auth_failures_total", labels)
-
-    record_auth_failure("unit-test-reason")
-
-    assert _sample("gateway_auth_failures_total", labels) - before == 1.0
-
-
-def test_record_abandoned_attempt_increments_counter() -> None:
-    labels = {"provider": "ab-prov", "model": "ab-model", "reason": "timeout", "position": "0"}
-    before = _sample("gateway_abandoned_attempts_total", labels)
-
-    record_abandoned_attempt("ab-prov", "ab-model", "timeout", 0)
-
-    assert _sample("gateway_abandoned_attempts_total", labels) - before == 1.0
-
-
-def test_record_abandoned_attempt_labels_by_reason_and_position() -> None:
-    """Each (reason, position) pair is its own series so operators can spot which
-    plan entry and failure phase dominates the fallback waste."""
-    build_labels = {"provider": "ab-prov2", "model": "ab-model2", "reason": "build_error", "position": "1"}
-    upstream_labels = {"provider": "ab-prov2", "model": "ab-model2", "reason": "upstream_error", "position": "2"}
-    before_build = _sample("gateway_abandoned_attempts_total", build_labels)
-    before_upstream = _sample("gateway_abandoned_attempts_total", upstream_labels)
-
-    record_abandoned_attempt("ab-prov2", "ab-model2", "build_error", 1)
-    record_abandoned_attempt("ab-prov2", "ab-model2", "upstream_error", 2)
-
-    assert _sample("gateway_abandoned_attempts_total", build_labels) - before_build == 1.0
-    assert _sample("gateway_abandoned_attempts_total", upstream_labels) - before_upstream == 1.0
+    assert families == _EXPOSED_FAMILIES
 
 
 def test_config_enable_metrics_defaults_to_false() -> None:
@@ -152,7 +100,7 @@ def _make_test_app(*, enable_metrics: bool = True) -> FastAPI:
 def test_middleware_increments_request_counter() -> None:
     app = _make_test_app()
     client = TestClient(app)
-    labels = {"method": "GET", "endpoint": "/ok", "status": "200"}
+    labels = {"method": "GET", "endpoint": "/ok", "api_version": "", "status": "200"}
     before = _sample("gateway_requests_total", labels)
 
     client.get("/ok")
@@ -163,7 +111,7 @@ def test_middleware_increments_request_counter() -> None:
 def test_middleware_records_duration() -> None:
     app = _make_test_app()
     client = TestClient(app)
-    labels = {"method": "GET", "endpoint": "/ok"}
+    labels = {"method": "GET", "endpoint": "/ok", "api_version": ""}
     before = _sample("gateway_request_duration_seconds_count", labels)
 
     client.get("/ok")
@@ -175,7 +123,7 @@ def test_middleware_records_duration() -> None:
 def test_middleware_tracks_error_status_codes() -> None:
     app = _make_test_app()
     client = TestClient(app, raise_server_exceptions=False)
-    labels = {"method": "GET", "endpoint": "/error", "status": "503"}
+    labels = {"method": "GET", "endpoint": "/error", "api_version": "", "status": "503"}
     before = _sample("gateway_requests_total", labels)
 
     client.get("/error")
@@ -187,23 +135,23 @@ def test_middleware_labels_parameterized_route_with_template() -> None:
     """Different path params collapse to one series; unknown paths bucket as 'unmatched'."""
     app = FastAPI()
 
-    @app.get("/v1/files/{file_id}")
+    @app.get(f"{API_ROOT}/files/{{file_id}}")
     async def get_file(file_id: str) -> dict[str, str]:
         return {"id": file_id}
 
     app.add_middleware(MetricsMiddleware)
     client = TestClient(app, raise_server_exceptions=False)
 
-    template_labels = {"method": "GET", "endpoint": "/v1/files/{file_id}", "status": "200"}
-    raw_labels_a = {"method": "GET", "endpoint": "/v1/files/aaa", "status": "200"}
-    raw_labels_b = {"method": "GET", "endpoint": "/v1/files/bbb", "status": "200"}
-    unmatched_labels = {"method": "GET", "endpoint": "unmatched", "status": "404"}
+    template_labels = {"method": "GET", "endpoint": "/files/{file_id}", "api_version": "v1", "status": "200"}
+    raw_labels_a = {"method": "GET", "endpoint": "/files/aaa", "api_version": "v1", "status": "200"}
+    raw_labels_b = {"method": "GET", "endpoint": "/files/bbb", "api_version": "v1", "status": "200"}
+    unmatched_labels = {"method": "GET", "endpoint": "unmatched", "api_version": "", "status": "404"}
 
     before_template = _sample("gateway_requests_total", template_labels)
     before_unmatched = _sample("gateway_requests_total", unmatched_labels)
 
-    assert client.get("/v1/files/aaa").status_code == 200
-    assert client.get("/v1/files/bbb").status_code == 200
+    assert client.get(f"{API_ROOT}/files/aaa").status_code == 200
+    assert client.get(f"{API_ROOT}/files/bbb").status_code == 200
     assert client.get("/no/such/route").status_code == 404
 
     # Two distinct ids produce a single labeled series keyed by the route template.
@@ -215,10 +163,43 @@ def test_middleware_labels_parameterized_route_with_template() -> None:
     assert _sample("gateway_requests_total", unmatched_labels) - before_unmatched == 1.0
 
 
+def test_the_endpoint_label_does_not_carry_the_api_root() -> None:
+    """A metric series has to outlive the root moving, which is why the root is not in it.
+
+    The label is what a dashboard, a recording rule and an alert expression are
+    keyed on, and those live outside this repository and far longer than any
+    one prefix. Splitting the root off means moving the API renames no series,
+    and two roots served side by side stay countable apart instead of summing
+    into one.
+    """
+    from starlette.routing import Route
+
+    def endpoint_for(path: str) -> tuple[str, str]:
+        return _endpoint_label({"route": Route(path, endpoint=lambda request: None)})
+
+    assert endpoint_for(f"{API_ROOT}/chat/completions") == ("/chat/completions", "v1")
+    assert endpoint_for(f"{API_ROOT}/files/{{file_id}}") == ("/files/{file_id}", "v1")
+    # Outside the root, the template is the whole identity: /metrics is ours to
+    # name and an OTel signal path belongs to OTel.
+    assert endpoint_for("/metrics") == ("/metrics", "")
+    assert endpoint_for(f"{OTLP_ROOT}/v1/traces") == (f"{OTLP_ROOT}/v1/traces", "")
+    # A sibling root is not silently folded into this one, or a v2 rollout would
+    # be invisible: both versions would sum into one series.
+    assert endpoint_for("/api/v2/chat/completions") == ("/api/v2/chat/completions", "")
+    # The root is matched on the segment boundary, not as a byte prefix. This is
+    # the bug class that has bitten this migration more than once.
+    assert endpoint_for(f"{API_ROOT}beta/chat") == (f"{API_ROOT}beta/chat", "")
+    assert endpoint_for(f"{API_ROOT}-internal/x") == (f"{API_ROOT}-internal/x", "")
+    # The root itself is a resource, not an empty label.
+    assert endpoint_for(API_ROOT) == ("/", API_VERSION)
+    # The version reported is the one the app was built with, not a literal.
+    assert endpoint_for(f"{API_ROOT}/chat/completions")[1] == API_VERSION
+
+
 def test_middleware_skips_metrics_endpoint() -> None:
     app = _make_test_app()
     client = TestClient(app)
-    labels = {"method": "GET", "endpoint": "/metrics", "status": "200"}
+    labels = {"method": "GET", "endpoint": "/metrics", "api_version": "", "status": "200"}
     before = _sample("gateway_requests_total", labels)
 
     client.get("/metrics")
@@ -255,22 +236,6 @@ def test_active_requests_returns_to_zero() -> None:
     client.get("/ok")
 
     assert _sample("gateway_active_requests") == before
-
-
-def test_rate_limiter_records_metric_on_429() -> None:
-    """RateLimiter.check() records a metric before raising 429."""
-    from gateway.rate_limit import RateLimiter
-
-    limiter = RateLimiter(rpm=1)
-    limiter.check("metric-rl-user")
-
-    before = _sample("gateway_rate_limit_hits_total")
-
-    with pytest.raises(HTTPException) as exc_info:
-        limiter.check("metric-rl-user")
-
-    assert exc_info.value.status_code == 429
-    assert _sample("gateway_rate_limit_hits_total") - before == 1.0
 
 
 @pytest.mark.skipif(not os.path.exists("/proc/stat"), reason="ProcessCollector needs /proc")

@@ -112,7 +112,8 @@ root, which is a prop for something `.otari-table` currently neutralizes by hand
 for re-skinning something HeroUI already styles.
 
 **4. Discouraged, and only when nothing above reaches it: a rule against the component's own
-classes.** `.otari-*` in `globals.css` is the namespace for it (see
+classes.** `.otari-*` is the namespace for it, in `design-system/design-system.css` when the
+subject is a primitive's own DOM and in `globals.css` otherwise (see
 [design-tokens.md](./design-tokens.md)), and some cases genuinely land here: a keyframe,
 something that has to outrank an inline style, or a value the library paints in a place it gives
 you no other name for. HeroUI documents the route rather than forbidding it, and Tailwind says
@@ -140,14 +141,28 @@ rather than in a wrapper: it does not just style the component, it takes the cal
 to restyle it away.
 
 When you do write one, name in its comment which of the three rungs above does not reach the
-value, so a reader can tell a deliberate last resort from a shortcut.
+value, so a reader can tell a deliberate last resort from a shortcut. **The comment goes on the
+block of related selectors, not on every selector in it**: a table's column widths are one
+decision written as nine rules, and nine copies of the same sentence is not the point. One
+sentence heading the run is what the rule asks for.
+
+A per-table block paired with `TableScrollFrame` is the sanctioned shape rather than a last
+resort, so it owes the reader what the sizing is *for* rather than an argument for existing at
+all. `globals.css:2731`'s "Key lanes stay fixed while the name absorbs the available width" is
+the model.
 
 ## Check the shared primitives before hand-rolling
 
-`shared/components/` is a directory per design topic (`layout/`, `metrics/`, `feedback/`,
-`forms/`, `actions/`, `data/`, `navigation/`, `indicators/`, `access/`), named after the topic
-file in `web/design/` that documents each one, plus `deprecated/` for the four that must not
-be used in new code. A new primitive is a file of its own in the topic it belongs to.
+`design-system/` is a directory per design topic (`layout/`, `metrics/`, `feedback/`,
+`forms/`, `actions/`, `data/`, `navigation/`, `indicators/`, `overlays/`), named after the
+topic file in `web/design/` that documents each one. A new primitive is a file of its own in
+the topic it belongs to, and it owes a `.stories.tsx` beside it.
+
+`shared/components/` keeps the two directories that are not primitives: `access/`, which
+renders what a deployment does not serve, and `deprecated/`, the three that must not be used
+in new code. The split is the extraction contract in DESIGN.md: `design-system/` may import
+nothing else under `src/`, so anything reading the transport, the deployment or a generated
+type lives on the other side of that line.
 `web/design/DESIGN.md` maps every export to its module.
 
 The table below gives each need its module. These are hand-rolled rather than rehomed (they
@@ -160,8 +175,9 @@ than duplicating their markup. See [design-tokens.md](./design-tokens.md).
 | Labeled metric tile | `KpiStrip` + `KpiCell` (`metrics/`). **Not** `StatCard`, which is in `deprecated/` |
 | Error alert from an unknown thrown value | `ErrorBanner` (`feedback/`; pairs with `errorMessage(error)` from `feedback/errorMessage`) |
 | Info/warning callout | `InfoBanner` (`feedback/`; `tone="info" \| "warning"`) |
-| Page title + description + action | `PageIntro` (`layout/`). **Not** `PageHeader`, which is in `deprecated/` |
-| Destructive action without a modal | `ConfirmButton` (`actions/`; two-click arm/confirm), or `ConfirmRowAction` inside a table row |
+| Page title + description + action | `PageIntro` (`layout/`) |
+| Deleting a record | `ConfirmDialog` (`feedback/`), always, one row or a selection. A neutral `RowAction` or ghost `Button` opens it and the dialog carries the danger confirm; the delete's `isPending` and `error` go to the dialog, not to the page's `ErrorBanner`. See [actions.md](../../../web/design/actions.md) |
+| Destructive action that deletes nothing (regenerate, archive, reset) | `ConfirmButton` (`actions/`; two-click arm/confirm), or `ConfirmRowAction` inside a table row |
 | Filter over a small fixed option set | `FilterSelect` (`navigation/`; a HeroUI `Select`, so the list is a popover anchored under the trigger) |
 | Filter over a large or open option set | `FilterMultiComboBox` (`navigation/`; type-to-filter, holds a set of values; `allowsCustom` when the value space is not enumerable) |
 | Applied filters, each removable | `FilterChips` (`navigation/`); one chip per value, and pass `clearLabel` so several chips of one dimension stay distinguishable |
@@ -173,7 +189,7 @@ than duplicating their markup. See [design-tokens.md](./design-tokens.md).
 
 ### The divided surface's own vocabulary
 
-The topic directories under `shared/components/` hold the pieces the pages are built from. They are there rather
+The topic directories under `design-system/` hold the pieces the pages are built from. They are there rather
 than in a feature because the second page to want one was the proof that it is the system
 rather than that screen's layout, and because a copy per page is how two pages come to disagree
 about what a thing is. Every one of them was extracted after the duplication had already

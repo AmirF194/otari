@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { render, screen, within } from "@testing-library/react"
+import { render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import type { ReactElement } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -11,8 +11,10 @@ import type {
   Workspace,
   WorkspaceBudgetDefault,
   WorkspaceMember,
+  WorkspaceProviderKeyOverride,
 } from "@/client"
 import { WorkspacesPage } from "@/features/workspaces/WorkspacesPage"
+import { API_ROOT } from "@/shared/api/client"
 import {
   budget,
   organizationContext,
@@ -20,6 +22,7 @@ import {
   workspace,
   workspaceBudgetDefault,
   workspaceMember,
+  workspaceProviderKeyOverride,
 } from "@/tests/fixtures"
 
 interface Request {
@@ -45,7 +48,9 @@ function mockApi(
     // Keyed by workspace id, so a test can give one workspace a default and
     // leave another without one.
     budgetDefaults?: Record<string, WorkspaceBudgetDefault[]>
-    /** A refusal for `POST /v1/workspaces`, for the error paths. */
+    /** This workspace's view of its organization's keys, keyed the same way. */
+    providerKeys?: Record<string, WorkspaceProviderKeyOverride[]>
+    /** A refusal for `POST ${API_ROOT}/workspaces`, for the error paths. */
     createRefusal?: { status: number; detail: string }
   } = {},
 ) {
@@ -55,6 +60,7 @@ function mockApi(
   const orgMembers = opts.orgMembers ?? [organizationMember()]
   const budgets = opts.budgets ?? []
   const budgetDefaults = opts.budgetDefaults ?? {}
+  const providerKeys = opts.providerKeys ?? {}
   const requests: Request[] = []
 
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -66,21 +72,28 @@ function mockApi(
       body: init?.body ? JSON.parse(String(init.body)) : undefined,
     })
 
-    if (url.includes("/members") && url.includes("/v1/workspaces/")) {
+    if (url.includes("/members") && url.includes(`${API_ROOT}/workspaces/`)) {
       if (method === "GET") {
         return jsonResponse({ data: members, count: members.length })
       }
       return jsonResponse(members[0] ?? workspaceMember())
     }
+    if (url.includes("provider-keys")) {
+      if (url.includes(`${API_ROOT}/workspaces/`)) {
+        const id = url.split(`${API_ROOT}/workspaces/`)[1]?.split("/")[0] ?? ""
+        return jsonResponse({ data: providerKeys[id] ?? [] })
+      }
+      return jsonResponse({ data: [], count: 0 })
+    }
     if (url.includes("member-budget-policies")) {
-      const id = url.split("/v1/workspaces/")[1]?.split("/")[0] ?? ""
+      const id = url.split(`${API_ROOT}/workspaces/`)[1]?.split("/")[0] ?? ""
       const rows = budgetDefaults[id] ?? []
       return jsonResponse({ data: rows, count: rows.length })
     }
-    if (url.includes("/v1/budgets")) {
+    if (url.includes(`${API_ROOT}/budgets`)) {
       return jsonResponse(budgets)
     }
-    if (url.includes("/v1/workspaces")) {
+    if (url.includes(`${API_ROOT}/workspaces`)) {
       if (method === "GET") {
         return jsonResponse({ data: list, count: list.length })
       }
@@ -93,7 +106,7 @@ function mockApi(
       }
       return jsonResponse(workspace({ name: "Created" }))
     }
-    if (url.includes("/v1/organizations/me/members")) {
+    if (url.includes(`${API_ROOT}/organizations/me/members`)) {
       return jsonResponse({ data: orgMembers, count: orgMembers.length })
     }
     return jsonResponse(context)
@@ -146,11 +159,164 @@ describe("WorkspacesPage", () => {
     await user.click(screen.getByRole("button", { name: "Create workspace" }))
 
     const post = requests.find((request) => request.method === "POST")
-    expect(post?.url).toContain("/v1/workspaces")
+    expect(post?.url).toContain(`${API_ROOT}/workspaces`)
     expect(post?.body).toEqual({
       name: "Research",
       description: "Experiments",
     })
+  })
+
+  // The form itself carries no band, so that the scope switcher can put it in a
+  // modal (otari-ai#2107). The band belongs to this page, and it is pinned here
+  // because losing it is invisible in jsdom: the fields render either way.
+  it("opens the create form in the dialog rather than as a band of the page", async () => {
+    // The contract this asserts is the opposite of the one it used to: the form
+    // was a bleeding band between the page's header and its table, and the same
+    // form in the scope switcher was a Modal of its own. One frame now, and it
+    // is over the page rather than in it.
+    mockApi({})
+    const user = userEvent.setup()
+    renderPage(<WorkspacesPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: "Create workspace" }),
+    )
+
+    const dialog = await screen.findByRole("dialog", { name: "New workspace" })
+    expect(within(dialog).getByLabelText("Name")).toBeInTheDocument()
+    expect(
+      screen.getByLabelText("Name").closest("section.otari-bleed"),
+    ).toBeNull()
+  })
+
+  it("offers a fresh draft on each open of the create dialog", async () => {
+    // Reset on the way in, not on the way out: the dialog keeps its content
+    // while it animates out, so clearing on close blanks the body in front of
+    // the operator. The page keys the form on an open counter instead.
+    mockApi({})
+    const user = userEvent.setup()
+    renderPage(<WorkspacesPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: "Create workspace" }),
+    )
+    await user.type(screen.getByLabelText("Name"), "half-typed")
+
+    // Out through the guard, which is the only way out of a dirty form.
+    await user.keyboard("{Escape}")
+    await user.click(screen.getByRole("button", { name: "Discard" }))
+
+    await user.click(
+      await screen.findByRole("button", { name: "Create workspace" }),
+    )
+    expect(screen.getByLabelText("Name")).toHaveValue("")
+  })
+
+  it("keeps the empty state under the dialog, so focus has somewhere to return", async () => {
+    // The empty state used to unmount while the form was open, which was right
+    // for a band on the page and wrong for a dialog over it: it takes away the
+    // node react-aria stored, and closing drops focus to `<body>` where the
+    // next Tab starts at the top of the document.
+    mockApi({ workspaces: [] })
+    const user = userEvent.setup()
+    renderPage(<WorkspacesPage />)
+
+    const trigger = await screen.findByRole("button", {
+      name: "Create a workspace",
+    })
+    await user.click(trigger)
+    await screen.findByRole("dialog", { name: "New workspace" })
+
+    expect(screen.getByText("No workspaces yet")).toBeInTheDocument()
+    // Nothing typed, so Escape closes rather than arming the guard.
+    await user.keyboard("{Escape}")
+    await waitFor(() => expect(trigger).toHaveFocus())
+  })
+
+  it("guards a chosen default budget on the way out, with nothing typed", async () => {
+    // The guard reads one snapshot of the whole draft, so it sees the fields
+    // nobody remembered to list. It used to read the name and the description
+    // only: pick a budget, press Escape, and the choice went with no warning.
+    mockApi({
+      budgets: [budget({ budget_id: "bud-team", name: "Team standard" })],
+    })
+    const user = userEvent.setup()
+    renderPage(<WorkspacesPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: "Create workspace" }),
+    )
+    await user.click(
+      screen.getByRole("button", { name: /Default member budget/ }),
+    )
+    await user.click(
+      await screen.findByRole("option", { name: /Team standard/ }),
+    )
+
+    // Through Cancel rather than Escape: in jsdom focus lands on `<body>` after
+    // picking from a `Select`, so a keystroke reaches nothing.
+    await user.click(screen.getByRole("button", { name: "Cancel" }))
+
+    expect(
+      await screen.findByRole("button", { name: "Discard" }),
+    ).toBeInTheDocument()
+    // Behind the guard rather than gone, so Keep editing returns to the choice.
+    await user.click(screen.getByRole("button", { name: "Keep editing" }))
+    expect(
+      screen.getByRole("button", { name: /Default member budget/ }),
+    ).toHaveTextContent("Team standard")
+  })
+
+  it("offers an unnamed budget by what it caps, and tells two of them apart", async () => {
+    // A picker exists to let somebody choose, and the head of a uuid supports no
+    // choice: two unnamed budgets used to read as two opaque strings, and picking
+    // the wrong one silently hands every member the wrong ceiling (#2130).
+    mockApi({
+      budgets: [
+        budget({
+          budget_id: "04f2f38a-1111-1111-1111-111111111111",
+          name: null,
+          max_budget: 50,
+          budget_duration_sec: null,
+          reset_alignment: "calendar_month",
+        }),
+        budget({
+          budget_id: "9b71c0de-2222-2222-2222-222222222222",
+          name: null,
+          max_budget: 50,
+          budget_duration_sec: null,
+          reset_alignment: "calendar_month",
+        }),
+        budget({
+          budget_id: "c0ffee00-3333-3333-3333-333333333333",
+          name: null,
+          max_budget: 500,
+          budget_duration_sec: null,
+          reset_alignment: "calendar_month",
+        }),
+      ],
+    })
+    const user = userEvent.setup()
+    renderPage(<WorkspacesPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: "Create workspace" }),
+    )
+    await user.click(
+      screen.getByRole("button", { name: /Default member budget/ }),
+    )
+
+    // The two that cap the same figure carry their ids; the one that does not
+    // needs no qualifier.
+    expect(
+      await screen.findByRole("option", { name: "$50.00 / month (04f2f38a)" }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("option", { name: "$50.00 / month (9b71c0de)" }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("option", { name: "$500.00 / month" }),
+    ).toBeInTheDocument()
   })
 
   it("puts a refused create on the name that caused it, not in a banner", async () => {
@@ -224,7 +390,7 @@ describe("WorkspacesPage", () => {
 
     const remove = requests.find((request) => request.method === "DELETE")
     expect(remove?.url).toContain(
-      "/v1/workspaces/44444444-4444-4444-4444-444444444444",
+      `${API_ROOT}/workspaces/44444444-4444-4444-4444-444444444444`,
     )
   })
 
@@ -259,6 +425,19 @@ describe("WorkspacesPage", () => {
     expect(screen.getAllByRole("button", { name: "Delete" })[0]).toBeDisabled()
   })
 
+  it("opens the edit form in a dialog, naming the workspace", async () => {
+    mockApi({})
+    const user = userEvent.setup()
+    renderPage(<WorkspacesPage />)
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }))
+
+    // A dialog rather than a band above the table: the row keeps its place, and
+    // the page under it does not shift by the height of a form (otari-ai#2125).
+    const dialog = await screen.findByRole("dialog", { name: "Edit workspace" })
+    expect(within(dialog).getByText("Default Workspace")).toBeInTheDocument()
+  })
+
   it("renames a workspace through the update endpoint", async () => {
     const requests = mockApi({})
     const user = userEvent.setup()
@@ -268,11 +447,11 @@ describe("WorkspacesPage", () => {
     const name = screen.getByLabelText("Name")
     await user.clear(name)
     await user.type(name, "Renamed")
-    await user.click(screen.getByRole("button", { name: "Save changes" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
 
     const patch = requests.find((request) => request.method === "PATCH")
     expect(patch?.url).toContain(
-      "/v1/workspaces/44444444-4444-4444-4444-444444444444",
+      `${API_ROOT}/workspaces/44444444-4444-4444-4444-444444444444`,
     )
     expect(patch?.body).toEqual({ name: "Renamed", description: null })
   })
@@ -323,7 +502,7 @@ describe("WorkspacesPage", () => {
     await screen.findByText("Bravo")
     expect(screen.queryByText("Default member budget")).toBeNull()
     expect(
-      requests.some((request) => request.url.includes("/v1/budgets")),
+      requests.some((request) => request.url.includes(`${API_ROOT}/budgets`)),
     ).toBe(false)
     expect(
       requests.some((request) =>
@@ -352,8 +531,76 @@ describe("WorkspacesPage", () => {
     const post = requests.find((request) => request.method === "POST")
     expect(post?.body).toEqual({ name: "Research", description: null })
     expect(
-      requests.some((request) => request.url.includes("/v1/budgets")),
+      requests.some((request) => request.url.includes(`${API_ROOT}/budgets`)),
     ).toBe(false)
+  })
+
+  it("confirms before removing a per-provider budget default", async () => {
+    // otari-ai#2110: this Remove used to delete on the click, with no
+    // confirmation of any kind. It was the only delete in the dashboard that
+    // asked nothing.
+    const requests = mockApi({
+      budgets: [budget({ budget_id: "bud-team", name: "Team standard" })],
+      budgetDefaults: {
+        "44444444-4444-4444-4444-444444444444": [
+          workspaceBudgetDefault({
+            id: "default-openai",
+            budget_id: "bud-team",
+            provider_key_id: "openai",
+          }),
+        ],
+      },
+    })
+    const user = userEvent.setup()
+    renderPage(<WorkspacesPage />)
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }))
+    await screen.findByText("Per-provider defaults")
+    await user.click(
+      screen.getByRole("button", { name: "Remove default for openai" }),
+    )
+
+    // The click opens the dialog and sends nothing.
+    const dialog = await screen.findByRole("alertdialog")
+    expect(within(dialog).getByText(/openai fall back to/)).toBeVisible()
+    expect(requests.some((request) => request.method === "DELETE")).toBe(false)
+
+    await user.click(
+      within(dialog).getByRole("button", { name: "Remove default" }),
+    )
+
+    const removed = requests.find((request) => request.method === "DELETE")
+    expect(removed?.url).toContain("default-openai")
+  })
+
+  it("keeps a per-provider default when the confirm is cancelled", async () => {
+    const requests = mockApi({
+      budgets: [budget({ budget_id: "bud-team", name: "Team standard" })],
+      budgetDefaults: {
+        "44444444-4444-4444-4444-444444444444": [
+          workspaceBudgetDefault({
+            id: "default-openai",
+            budget_id: "bud-team",
+            provider_key_id: "openai",
+          }),
+        ],
+      },
+    })
+    const user = userEvent.setup()
+    renderPage(<WorkspacesPage />)
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }))
+    await screen.findByText("Per-provider defaults")
+    await user.click(
+      screen.getByRole("button", { name: "Remove default for openai" }),
+    )
+    await user.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Cancel",
+      }),
+    )
+
+    expect(requests.some((request) => request.method === "DELETE")).toBe(false)
   })
 
   it("withholds the default-budget controls from a non-operator's edit form", async () => {
@@ -374,19 +621,143 @@ describe("WorkspacesPage", () => {
     // default: no delete for a "none" the caller never picked.
     await user.clear(name)
     await user.type(name, "Renamed")
-    await user.click(screen.getByRole("button", { name: "Save changes" }))
+    await user.click(screen.getByRole("button", { name: "Save" }))
 
     const patch = requests.find((request) => request.method === "PATCH")
     expect(patch?.body).toEqual({ name: "Renamed", description: null })
     const operatorOnly = [
-      "/v1/budgets",
-      "/v1/providers",
+      `${API_ROOT}/budgets`,
+      `${API_ROOT}/providers`,
       "member-budget-policies",
     ]
     expect(
       requests.filter((request) =>
         operatorOnly.some((path) => request.url.includes(path)),
       ),
+    ).toEqual([])
+  })
+
+  it("offers the workspace's provider keys on an admin's edit form", async () => {
+    // The per-workspace half of the organization's provider keys, which the
+    // roles matrix has at Edit for an admin and hidden from everyone else. Not
+    // withheld from a non-operator, unlike the budget controls above it: these
+    // are the tenant's own credentials rather than the deployment's.
+    const requests = mockApi({
+      context: organizationContext({ deployment_operator: false }),
+    })
+    const user = userEvent.setup()
+    renderPage(<WorkspacesPage />)
+
+    await user.click(await screen.findByRole("button", { name: "Edit" }))
+
+    // Named twice on the page once the column exists, so this is the section
+    // inside the form rather than the header above the list.
+    expect(
+      within(await screen.findByRole("dialog")).getByText("Provider keys"),
+    ).toBeInTheDocument()
+    expect(
+      requests.some((request) =>
+        request.url.includes(
+          `${API_ROOT}/workspaces/44444444-4444-4444-4444-444444444444/provider-keys`,
+        ),
+      ),
+    ).toBe(true)
+    expect(
+      requests.some((request) =>
+        request.url.includes(`${API_ROOT}/organizations/me/provider-keys`),
+      ),
+    ).toBe(true)
+  })
+
+  it("counts a workspace's departures on the list", async () => {
+    // The support question this answers is "why is gpt-4o missing in Bravo",
+    // which until now meant opening Edit on each workspace in turn (#2106).
+    mockApi({
+      workspaces: [workspace(), workspace({ id: SECOND, name: "Bravo" })],
+      providerKeys: {
+        [SECOND]: [
+          workspaceProviderKeyOverride({ allowed_models: ["gpt-4o"] }),
+          workspaceProviderKeyOverride({
+            org_provider_key_id: "88888888-8888-8888-8888-888888888888",
+            disabled: true,
+          }),
+        ],
+      },
+    })
+    renderPage(<WorkspacesPage />)
+
+    const row = (await screen.findByText("Bravo")).closest("tr")
+    expect(row).not.toBeNull()
+    expect(
+      within(row as HTMLElement).getByText("1 narrowed, 1 never used"),
+    ).toBeInTheDocument()
+  })
+
+  it("shows no provider-key column where the organization holds no keys", async () => {
+    // Every standalone deployment: organization-owned keys are a hosted
+    // surface, so the column would be a header over blank cells.
+    mockApi()
+    renderPage(<WorkspacesPage />)
+
+    await screen.findByText("Default Workspace")
+    expect(
+      screen.queryByRole("columnheader", { name: "Provider keys" }),
+    ).toBeNull()
+  })
+
+  it("stops fanning out across a tenant with many workspaces", async () => {
+    // The column costs one read per workspace and the list walk above it is
+    // bounded only at 100k, so past a sane count the column is dropped rather
+    // than fetched.
+    const many = Array.from({ length: 26 }, (_, i) =>
+      workspace({
+        id: `00000000-0000-0000-0000-${String(i).padStart(12, "0")}`,
+        name: `Workspace ${i}`,
+      }),
+    )
+    const requests = mockApi({ workspaces: many })
+    renderPage(<WorkspacesPage />)
+
+    await screen.findByText("Workspace 25")
+    expect(
+      screen.queryByRole("columnheader", { name: "Provider keys" }),
+    ).toBeNull()
+    expect(
+      requests.filter((request) => request.url.includes("provider-keys")),
+    ).toEqual([])
+  })
+
+  it("says a workspace that departs from nothing inherits every key", async () => {
+    // Distinct from the empty cell an organization holding no keys gets: this
+    // workspace could depart and has not.
+    mockApi({
+      providerKeys: {
+        "44444444-4444-4444-4444-444444444444": [
+          workspaceProviderKeyOverride(),
+        ],
+      },
+    })
+    renderPage(<WorkspacesPage />)
+
+    expect(await screen.findByText("Inherits all")).toBeInTheDocument()
+  })
+
+  it("keeps the provider keys and their reads away from a member", async () => {
+    // A member cannot open the edit form, which is where the section lives, so
+    // it is never mounted and neither of its reads is made. The gateway agrees
+    // on the writes (`require_workspace_management_access`) and refuses the
+    // organization's key list to anyone who does not manage the organization.
+    const requests = mockApi({
+      context: organizationContext({ role: "member" }),
+      workspaces: [workspace(), workspace({ id: SECOND, name: "Bravo" })],
+    })
+    renderPage(<WorkspacesPage />)
+
+    await screen.findByText("Bravo")
+    expect(screen.getAllByRole("button", { name: "Edit" })[0]).toBeDisabled()
+    expect(screen.queryByText("Provider keys")).toBeNull()
+    expect(
+      requests.filter((request) => request.url.includes("provider-keys")),
     ).toEqual([])
   })
 })

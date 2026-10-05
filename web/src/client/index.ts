@@ -18,14 +18,19 @@ export type { components, operations, paths } from "./schema"
 type Schemas = components["schemas"]
 
 /**
- * Make the fields the gateway defaults optional on the way in.
+ * Make a named set of fields optional, where the generator promised them.
  *
  * The generator marks a property with a schema default as always present, which
  * is true of a response and false of a request body: the point of a default is
  * that a client may omit it. Applied only where the dashboard actually omits
  * one, so it stays a correction rather than a blanket loosening.
+ *
+ * Exported because the response side has the same problem from the other
+ * direction: a gateway older than a field does not send it, whatever the
+ * current schema says. `WireBootstrap` in `shared/helpers/bootstrap.ts` is that
+ * case, and reuses this rather than restating it.
  */
-type Defaulted<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>
+export type Defaulted<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>
 
 // ---------------------------------------------------------------------------
 // Deployment bootstrap
@@ -50,7 +55,7 @@ export type SessionType = DeploymentBootstrap["session_type"]
  * type.
  */
 export type GatewayHealth =
-  operations["health_check_health_get"]["responses"][200]["content"]["application/json"]
+  operations["health-health_check"]["responses"][200]["content"]["application/json"]
 
 // ---------------------------------------------------------------------------
 // Dashboard sign-in credentials
@@ -62,6 +67,14 @@ export type GatewayHealth =
 // ---------------------------------------------------------------------------
 export type SetPasswordRequest = Schemas["SetPasswordRequest"]
 export type PasswordResponse = Schemas["PasswordResponse"]
+
+// ---------------------------------------------------------------------------
+// The one thing about itself an identity may change that is not a credential:
+// the name it goes by. `PATCH /v1/auth/profile` answers with the same
+// `CallerIdentity` the membership context carries, so the account page can seat
+// the new name where the shell read the old one.
+// ---------------------------------------------------------------------------
+export type UpdateProfileRequest = Schemas["UpdateProfileRequest"]
 
 // ---------------------------------------------------------------------------
 // The public auth flows (otari#650): signup, email verification, and password
@@ -170,12 +183,12 @@ export type ToolMeter = Schemas["ToolMeter"]
 // than as named schemas, so they are pinned to the operation instead of being
 // restated as literal unions that could drift.
 type SummaryQuery = NonNullable<
-  operations["usage_summary_v1_usage_summary_get"]["parameters"]["query"]
+  operations["usage-usage_summary"]["parameters"]["query"]
 >
 export type UsageBucket = NonNullable<SummaryQuery["bucket"]>
 export type SummaryDimension = NonNullable<SummaryQuery["dimensions"]>[number]
 type SeriesQuery = NonNullable<
-  operations["usage_series_v1_usage_series_get"]["parameters"]["query"]
+  operations["usage-usage_series"]["parameters"]["query"]
 >
 export type UsageGroupBy = NonNullable<SeriesQuery["group_by"]>
 
@@ -187,7 +200,7 @@ export type UsageGroupBy = NonNullable<SeriesQuery["group_by"]>
 // the operation that carries all of them, and a name the spec drops (or a typo)
 // fails to compile here rather than going quiet on the wire.
 type RequestsQuery = NonNullable<
-  operations["list_usage_v1_usage_get"]["parameters"]["query"]
+  operations["usage-list_usage"]["parameters"]["query"]
 >
 /** Fails to compile unless `T` is `true`, so a `false` below is a build error. */
 type Assert<T extends true> = T
@@ -217,19 +230,11 @@ export type CreateBudgetRequest = Schemas["CreateBudgetRequest"]
 export type UpdateBudgetRequest = Schemas["UpdateBudgetRequest"]
 export type BudgetResetLog = Schemas["BudgetResetLogResponse"]
 
-// A ceiling names a `Budget` and holds the counters for spending it. It is not a
-// variant of a budget: a budget is the only shape that maps a cap to an amount,
-// and the two differ in what they enforce against. A budget reached through
-// `User.budget_id` is checked against that person's own spend, so N people on one
-// budget each get the full amount. A budget reached through a ceiling is checked
-// against the ceiling's counters, so everyone the scope names shares one
-// allowance. `max_budget` and the cadence travel on a ceiling's wire shape but
-// are read off the budget, never stored on it.
-//
-// `provider_key_id` is the odd name here and it is the wire's, not ours: the
-// column holds a provider *instance* name (`openai`, or a configured instance),
-// which is what `scoped_budget_service` matches a request's resolved provider
-// against. Anything picking a value for it wants `ProviderInfo["instance"]`.
+// A ceiling names a `Budget` and holds the counters for spending it.
+// Everyone a ceiling's scope names shares one allowance, while each person on
+// a `User.budget_id` budget gets the full amount.
+// `provider_key_id` holds a provider instance name, so a value for it comes
+// from `ProviderInfo["instance"]`.
 export type ScopedBudget = Schemas["ScopedBudgetResponse"]
 export type CreateScopedBudgetRequest = Schemas["CreateScopedBudgetRequest"]
 export type UpdateScopedBudgetRequest = Schemas["UpdateScopedBudgetRequest"]
@@ -251,8 +256,30 @@ export type ModelMetadataResponse = Schemas["ModelMetadataResponse"]
 export type DiscoverableModel = Schemas["DiscoverableModel"]
 export type DiscoverableProvider = Schemas["DiscoverableProvider"]
 export type DiscoverableModelsResponse = Schemas["DiscoverableModelsResponse"]
+// The overview's strips, judged server-side: the page renders three integers
+// and one worst-case row, and used to download four collections to get them.
+export type OverviewSummary = Schemas["OverviewSummaryResponse"]
+export type AllocationHealth = Schemas["AllocationHealthResponse"]
+export type WorstAllocation = Schemas["WorstAllocationResponse"]
+
 export type PricingResponse = Schemas["PricingResponse"]
+export type CurrentPricingPage = Schemas["CurrentPricingPage"]
 export type PricingTier = Schemas["PricingTier"]
+
+// The catalog folded by model (`/v1/catalog`): one summary per model in the
+// list, and one detail carrying every offering of it the caller may use.
+export type CatalogResponse = Schemas["CatalogResponse"]
+export type CatalogFacets = Schemas["CatalogFacets"]
+export type CatalogVendorFacet = Schemas["CatalogVendorFacet"]
+export type CatalogQueryParams = NonNullable<
+  operations["catalog-list_catalog"]["parameters"]["query"]
+>
+export type CatalogModelSummary = Schemas["CatalogModelSummary"]
+export type CatalogModelDetail = Schemas["CatalogModelDetail"]
+export type CatalogOffering = Schemas["CatalogOffering"]
+export type CatalogCapabilities = Schemas["CatalogCapabilities"]
+export type CatalogElsewhere = Schemas["CatalogElsewhere"]
+export type CatalogOfferingUsage = Schemas["OfferingUsage"]
 /** A tier as stored, which may be a shape this client cannot read (see the spec). */
 export type StoredPricingTier = NonNullable<
   ModelPricingInfo["pricing_tiers"]
@@ -267,7 +294,9 @@ export function isPricingTier(tier: StoredPricingTier): tier is PricingTier {
     typeof (tier as PricingTier).min_input_tokens === "number"
   )
 }
-export type SetPricingRequest = Schemas["SetPricingRequest"]
+// `unit` carries a schema default, so the generator emits it as required; the
+// callers that price a model omit it and the gateway reads tokens.
+export type SetPricingRequest = Defaulted<Schemas["SetPricingRequest"], "unit">
 // Per-organization rate overrides, which sit above the deployment price list
 // above. Same DTO names as otari.ai's own endpoint, so the two clients stay
 // recognizable side by side.
@@ -275,10 +304,14 @@ export type OrganizationPricingOverride =
   Schemas["OrganizationModelPricingPublic"]
 export type OrganizationPricingOverrides =
   Schemas["OrganizationModelPricingsPublic"]
-export type CreateOrganizationPricingOverride =
-  Schemas["OrganizationModelPricingCreate"]
-export type UpdateOrganizationPricingOverride =
-  Schemas["OrganizationModelPricingUpdate"]
+export type CreateOrganizationPricingOverride = Defaulted<
+  Schemas["OrganizationModelPricingCreate"],
+  "unit"
+>
+export type UpdateOrganizationPricingOverride = Defaulted<
+  Schemas["OrganizationModelPricingUpdate"],
+  "unit"
+>
 // The organization's own budgets and the ceilings enforcing them, which are the
 // tenant-scoped counterparts to `Budget` and `ScopedBudget` above. Separate
 // types rather than the same ones: these carry an owner and, on a ceiling,
@@ -287,12 +320,16 @@ export type OrganizationBudget = Schemas["OrganizationBudgetPublic"]
 export type CreateOrganizationBudget = Schemas["OrganizationBudgetCreate"]
 export type UpdateOrganizationBudget = Schemas["OrganizationBudgetUpdate"]
 export type OrganizationSpendCeiling = Schemas["OrganizationScopedBudgetPublic"]
+export type OrganizationSpendCeilings =
+  Schemas["OrganizationScopedBudgetsPublic"]
 export type CreateOrganizationSpendCeiling =
   Schemas["OrganizationScopedBudgetCreate"]
 export type UpdateOrganizationSpendCeiling =
   Schemas["OrganizationScopedBudgetUpdate"]
 export type PricingRefreshChange = Schemas["PricingRefreshChangeResponse"]
 export type PricingRefreshPreview = Schemas["PricingRefreshPreviewResponse"]
+export type AcceptedPricingSnapshot = Schemas["AcceptedSnapshotResponse"]
+export type PricingDriftRow = Schemas["PricingDriftRow"]
 export type ProviderInfo = Schemas["ProviderInfoSchema"]
 export type ProviderCapabilities = Schemas["ProviderCapabilitiesSchema"]
 export type ProvidersResponse = Schemas["ProvidersResponse"]
@@ -317,6 +354,21 @@ export type OrgProviderKey = Schemas["OrgProviderKeyPublic"]
 // which types the envelope itself, so a name for it would have no consumer.
 export type CreateOrgProviderKeyRequest = Schemas["OrgProviderKeyCreateRequest"]
 export type UpdateOrgProviderKeyRequest = Schemas["OrgProviderKeyUpdateRequest"]
+
+// The models an organization offers on one of those keys. `price_source` names
+// the rung of the pricing ladder that answered, in the vocabulary the Models
+// page already uses, so a rate shown here and a rate shown there cannot claim
+// different provenance for the same number. A refresh reports its own failure in
+// the body rather than throwing, which is why `error` is on the result type.
+export type OrgProviderModel = Schemas["OrgProviderKeyModelPublic"]
+export type OrgProviderModels = Schemas["OrgProviderKeyModelsPublic"]
+export type OfferOrgProviderModelRequest =
+  Schemas["OrgProviderKeyModelCreateRequest"]
+export type UpdateOrgProviderModelRequest =
+  Schemas["OrgProviderKeyModelUpdateRequest"]
+export type OrgProviderModelsRefresh = Schemas["OrgProviderModelsRefreshPublic"]
+export type OrgProviderAvailableModels =
+  Schemas["OrgProviderAvailableModelsPublic"]
 
 // An organization's email-domain claims. A claim is inert until its DNS TXT
 // record is found, so `verified_at` is the field the UI branches on and
@@ -374,6 +426,30 @@ export type ToolSettingsResponse = Schemas["ToolSettingsResponse"]
 export type UpdateToolSettingsRequest = Schemas["UpdateToolSettingsRequest"]
 export type TestServiceResponse = Schemas["TestServiceResponse"]
 
+// The guardrail catalog behind the mandate form: which profiles the operator's
+// guardrails service has built, and the `validate_kwargs` each one accepts. See
+// `src/gateway/services/guardrail_catalog.py`.
+export type GuardrailCatalog = Schemas["GuardrailCatalog"]
+export type GuardrailProfileSpec = Schemas["GuardrailProfileSpec"]
+export type GuardrailParameterSpec = Schemas["GuardrailParameterSpec"]
+export type GuardrailParameterType = GuardrailParameterSpec["type"]
+
+// The guardrails this gateway can build itself, as the installed any-guardrail
+// library describes them. A property of the deployment, not of a service; see
+// `build_builtin_guardrail_catalog` in the same module.
+export type BuiltInGuardrailCatalog = Schemas["BuiltInGuardrailCatalog"]
+export type BuiltInGuardrailSpec = Schemas["BuiltInGuardrailSpec"]
+export type GuardrailCategory = Schemas["GuardrailCategory"]
+export type RequirementGroup = Schemas["RequirementGroup"]
+
+// ---------------------------------------------------------------------------
+// Rate limit rules
+// ---------------------------------------------------------------------------
+export type RateLimitRule = Schemas["RateLimitRulePublic"]
+export type RateLimitRules = Schemas["RateLimitRulesPublic"]
+export type CreateRateLimitRuleRequest = Schemas["RateLimitRuleCreate"]
+export type UpdateRateLimitRuleRequest = Schemas["RateLimitRuleUpdate"]
+
 // ---------------------------------------------------------------------------
 // Search tools
 // ---------------------------------------------------------------------------
@@ -410,6 +486,8 @@ export type SwitchOrganizationRequest =
   Schemas["SwitchActiveOrganizationRequest"]
 /** An organization plus the caller's standing in it: what every tenancy page reads first. */
 export type OrganizationContext = Schemas["OrganizationMembershipContextPublic"]
+/** Who is signed in, as against what they may do: the person the chrome draws. */
+export type CallerIdentity = Schemas["CallerIdentityPublic"]
 // The caller's own workspace memberships, carried on the context so the shell
 // can seed its switcher from the call it already makes. Not a directory of the
 // organization's workspaces: listing those is a separate authorized read.
@@ -418,6 +496,10 @@ export type CallerWorkspaceMembership =
 export type UpdateOrganizationRequest =
   Schemas["ActiveOrganizationUpdateRequest"]
 export type OrganizationMember = Schemas["ActiveOrganizationMemberPublic"]
+export type OrganizationMembers = Schemas["ActiveOrganizationMembersPublic"]
+export type MemberWorkspacePlacement = Schemas["MemberWorkspacePlacementPublic"]
+export type MemberCeiling = Schemas["MemberCeilingPublic"]
+export type MemberAttribution = Schemas["MemberAttributionPublic"]
 export type UpdateOrganizationMemberRequest =
   Schemas["ActiveOrganizationMemberUpdateRequest"]
 export type CreateOrganizationMemberRequest = Defaulted<
@@ -443,7 +525,7 @@ export type SettableMemberStatus = NonNullable<
 >
 export type WorkspaceMemberRole = NonNullable<
   NonNullable<
-    operations["add_workspace_member_v1_workspaces__workspace_id__members__user_id__post"]["parameters"]["query"]
+    operations["workspaces-add_workspace_member"]["parameters"]["query"]
   >["role"]
 >
 // ---------------------------------------------------------------------------
@@ -477,7 +559,17 @@ export type InviteOrganizationMemberRequest = Defaulted<
 >
 export type InviteOrganizationMemberResult =
   Schemas["InviteOrganizationMemberResultPublic"]
+export type BulkInviteOrganizationMembersRequest = Defaulted<
+  Schemas["BulkInviteOrganizationMembersRequest"],
+  "role"
+>
+export type BulkInviteOrganizationMembersResult =
+  Schemas["BulkInviteOrganizationMembersResultPublic"]
 export type InvitationPreview = Schemas["InvitationPreviewPublic"]
+export type AcceptInvitationRequest = Defaulted<
+  Schemas["AcceptInvitationRequest"],
+  "terms_accepted"
+>
 export type AcceptInvitationResult = Schemas["AcceptInvitationResultPublic"]
 
 // The invitee's side of the same flow: what is waiting on the signed-in
@@ -487,17 +579,27 @@ export type AcceptInvitationResult = Schemas["AcceptInvitationResultPublic"]
 export type PendingOrganizationInvitation =
   Schemas["PendingOrganizationInvitationPublic"]
 
-// A workspace-level template for a per-member `scoped_budgets` ceiling; see
-// `src/gateway/services/tenancy/workspace_budget_default_service.py`. The DTO
-// name is `WorkspaceMemberBudgetPolicy*` on the wire (kept recognizable
-// against otari-ai's own hosted equivalent); the dashboard's own name for the
-// concept is "budget default".
+// A "budget default" is a workspace-level template for a per-member
+// `scoped_budgets` ceiling.
+// Its wire name is `WorkspaceMemberBudgetPolicy*`.
 export type WorkspaceBudgetDefault =
   Schemas["WorkspaceMemberBudgetPolicyPublic"]
 export type CreateWorkspaceBudgetDefaultRequest =
   Schemas["WorkspaceMemberBudgetPolicyCreate"]
 export type UpdateWorkspaceBudgetDefaultRequest =
   Schemas["WorkspaceMemberBudgetPolicyUpdate"]
+
+// One workspace's departure from the organization key above: pinned as this
+// workspace's default, opted out of, or neither. `is_default`/`disabled` are the
+// stored flags and `is_effective_*` the resolution across the provider's keys,
+// so a row can be unpinned and still effective (it is the organization default,
+// or the only key that provider has).
+export type WorkspaceProviderKeyOverride =
+  Schemas["WorkspaceProviderKeyOverridePublic"]
+// Tri-state on the way in: an omitted flag is left unchanged, so the dashboard
+// sends one at a time and lets the gateway resolve the other.
+export type SetWorkspaceProviderKeyOverrideRequest =
+  Schemas["WorkspaceProviderKeyOverrideRequest"]
 
 // The first-request setup guide's state, and the API key it issues. The wire
 // names carry the platform's "activation" vocabulary (see
@@ -535,6 +637,33 @@ export type CreateOrganizationGuardrailRequest = Defaulted<
 >
 export type UpdateOrganizationGuardrailRequest =
   Schemas["OrganizationGuardrailUpdate"]
+// Posting some text to the service a mandate names, which stores nothing.
+export type TestOrganizationGuardrailRequest = Defaulted<
+  Schemas["OrganizationGuardrailTest"],
+  "validate_kwargs"
+>
+export type OrganizationGuardrailTestResult =
+  Schemas["OrganizationGuardrailTestResult"]
+// A guardrail the organization defined for Otari to build and run itself. A
+// mandate points at one through `definition_id`; see
+// `src/gateway/services/tenancy/organization_guardrail_definition_service.py`.
+export type OrganizationGuardrailDefinition =
+  Schemas["OrganizationGuardrailDefinitionPublic"]
+export type GuardrailBuildState = OrganizationGuardrailDefinition["build_state"]
+export type CreateOrganizationGuardrailDefinitionRequest = Defaulted<
+  Schemas["OrganizationGuardrailDefinitionCreate"],
+  "enabled"
+>
+export type UpdateOrganizationGuardrailDefinitionRequest =
+  Schemas["OrganizationGuardrailDefinitionUpdate"]
+// Running one definition's built guardrail over some text, which stores nothing.
+// `validate_kwargs` carries a schema default, so the form may leave it out.
+export type TestOrganizationGuardrailDefinitionRequest = Defaulted<
+  Schemas["OrganizationGuardrailDefinitionTest"],
+  "validate_kwargs"
+>
+export type GuardrailTestResult =
+  Schemas["OrganizationGuardrailDefinitionTestResult"]
 
 // The MCP servers a workspace has registered, which a request names by id in
 // `mcp_server_ids`; see
@@ -547,6 +676,46 @@ export type CreateWorkspaceMcpServerRequest =
 export type UpdateWorkspaceMcpServerRequest =
   Schemas["WorkspaceMcpServerUpdate"]
 
+// ---------------------------------------------------------------------------
+// Playground
+//
+// The dashboard's own chat page; see `src/gateway/api/routes/playground.py`.
+// Its completion endpoint takes the ordinary chat request body, so the shapes
+// named here are the page's memory (consent, saved transcripts, rated
+// comparisons, pinned models) and the tools menu's availability read.
+// ---------------------------------------------------------------------------
+export type PlaygroundConsent = Schemas["PlaygroundConsentPublic"]
+export type PlaygroundConsentUpdate = Schemas["PlaygroundConsentUpdate"]
+
+// Three states from two fields: a tool the deployment never configured, one a
+// workspace turned off (with the reason), and one that can be attached.
+export type PlaygroundToolStatus = Schemas["PlaygroundToolStatus"]
+export type PlaygroundTools = Schemas["PlaygroundToolsResponse"]
+export type PlaygroundMcpServer = Schemas["PlaygroundMcpServer"]
+
+// A saved transcript. The list carries a turn count and not the turns, so
+// loading one back into the page is a second request.
+export type PlaygroundConversation = Schemas["PlaygroundConversationSummary"]
+export type PlaygroundConversations = Schemas["PlaygroundConversationsPublic"]
+export type SavePlaygroundConversationRequest =
+  Schemas["PlaygroundConversationCreate"]
+export type PlaygroundMessage = Schemas["PlaygroundMessagePublic"]
+export type PlaygroundMessages = Schemas["PlaygroundMessagesPublic"]
+
+// A rated A/B exchange. The summary deliberately carries no answer bodies;
+// there is no endpoint that reads one back, because a comparison is a recorded
+// judgment rather than a transcript to resume.
+export type PlaygroundComparison = Schemas["PlaygroundComparisonSummary"]
+export type PlaygroundComparisons = Schemas["PlaygroundComparisonsPublic"]
+export type SavePlaygroundComparisonRequest =
+  Schemas["PlaygroundComparisonCreate"]
+export type PlaygroundComparisonPreference =
+  SavePlaygroundComparisonRequest["preference"]
+
+export type PlaygroundFavoriteModels = Schemas["PlaygroundFavoriteModelsPublic"]
+export type PlaygroundFavoriteModelsUpdate =
+  Schemas["PlaygroundFavoriteModelsUpdate"]
+
 // The OAuth sign-in pair; see `src/gateway/api/routes/auth_oauth.py`. Named
 // here rather than hand-written at the call site so the authorization response
 // and the callback body cannot drift from the spec without a type error.
@@ -554,3 +723,6 @@ export type OAuthAuthorizeResponse = Schemas["AuthorizeResponse"]
 export type OAuthCallbackRequest = Schemas["OAuthCallbackRequest"]
 
 export type * from "./local"
+
+export type FeedbackSubmission =
+  operations["feedback-submit_feedback"]["requestBody"]["content"]["application/json"]

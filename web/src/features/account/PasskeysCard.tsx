@@ -1,19 +1,19 @@
 import { Button, Description, Input, Label, TextField } from "@heroui/react"
 import { useState } from "react"
-import { FiKey, FiSmartphone } from "react-icons/fi"
+import { FiEdit2, FiKey, FiSmartphone, FiTrash2 } from "react-icons/fi"
 
 import type { Passkey } from "@/client"
+import { RowAction, RowActionRow } from "@/design-system/actions/RowAction"
+import { ConfirmDialog } from "@/design-system/feedback/ConfirmDialog"
+import { ErrorBanner } from "@/design-system/feedback/ErrorBanner"
+import { FieldMessages } from "@/design-system/forms/FieldMessages"
+import { Section } from "@/design-system/layout/Section"
 import {
   useDeletePasskey,
   usePasskeys,
   useRegisterPasskey,
   useRenamePasskey,
 } from "@/shared/api/auth"
-import { RowActions } from "@/shared/components/deprecated/RowActions"
-import { ConfirmDialog } from "@/shared/components/feedback/ConfirmDialog"
-import { ErrorBanner } from "@/shared/components/feedback/ErrorBanner"
-import { FieldMessages } from "@/shared/components/forms/FieldMessages"
-import { Section } from "@/shared/components/layout/Section"
 import { formatDateTime } from "@/shared/helpers/format"
 import {
   MAX_PASSKEY_NAME_LENGTH,
@@ -82,24 +82,20 @@ function PasskeyRow({
           )}
         </div>
       </div>
-      <RowActions>
-        <Button
-          variant="ghost"
-          size="sm"
+      <RowActionRow>
+        <RowAction
+          icon={FiEdit2}
+          label="Rename"
           isDisabled={isBusy}
           onPress={onRename}
-        >
-          Rename
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
+        />
+        <RowAction
+          icon={FiTrash2}
+          label="Delete"
           isDisabled={isBusy}
           onPress={onDelete}
-        >
-          Delete
-        </Button>
-      </RowActions>
+        />
+      </RowActionRow>
     </li>
   )
 }
@@ -145,9 +141,9 @@ export function PasskeysCard() {
   const offerPasskeySignIn = useOfferPasskeySignIn()
 
   const [newName, setNewName] = useState("")
-  const [renaming, setRenaming] = useState<Passkey | null>(null)
+  const [renaming, setRenaming] = useState<Passkey>()
   const [renamedTo, setRenamedTo] = useState("")
-  const [deleting, setDeleting] = useState<Passkey | null>(null)
+  const [deleting, setDeleting] = useState<Passkey>()
 
   const rows = passkeys.data?.data ?? []
   const isBusy = register.isPending || rename.isPending || remove.isPending
@@ -186,7 +182,7 @@ export function PasskeysCard() {
     }
     rename.mutate(
       { id: renaming.id, name },
-      { onSuccess: () => setRenaming(null) },
+      { onSuccess: () => setRenaming(undefined) },
     )
   }
 
@@ -216,7 +212,7 @@ export function PasskeysCard() {
         if (usableLeft === 0) {
           offerPasskeySignIn(false)
         }
-        setDeleting(null)
+        setDeleting(undefined)
       },
     })
   }
@@ -288,22 +284,35 @@ export function PasskeysCard() {
           is exactly when somebody has orphans to clear out. */}
         {passkeys_ready && canUsePasskeys && !passkeys.isError ? (
           <form
-            className="flex flex-col gap-3 sm:flex-row sm:items-end"
             onSubmit={(event) => {
               event.preventDefault()
               startRegistration()
             }}
           >
+            {/* The button is inside the field, beside the input, because this
+              field's description wraps: the width a wrapped message costs is
+              not a number `FieldAction` can reserve. See forms.md, "Control
+              rows". */}
             <TextField
               value={newName}
               onChange={setNewName}
-              className="flex max-w-md flex-1 flex-col gap-1"
+              className="flex max-w-2xl flex-col gap-1"
             >
               <Label className="text-body">Name</Label>
-              <Input
-                placeholder="Work laptop"
-                maxLength={MAX_PASSKEY_NAME_LENGTH}
-              />
+              <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center">
+                <Input
+                  className="w-full max-w-md"
+                  placeholder="Work laptop"
+                  maxLength={MAX_PASSKEY_NAME_LENGTH}
+                />
+                <Button
+                  type="submit"
+                  variant="primary"
+                  isPending={register.isPending}
+                >
+                  Add a passkey
+                </Button>
+              </div>
               <FieldMessages>
                 <Description className="text-muted">
                   Optional. It is only a label, so you can tell this passkey
@@ -311,24 +320,15 @@ export function PasskeysCard() {
                 </Description>
               </FieldMessages>
             </TextField>
-            <div className="sm:pb-6">
-              <Button
-                type="submit"
-                variant="primary"
-                isPending={register.isPending}
-              >
-                Add a passkey
-              </Button>
-            </div>
           </form>
         ) : null}
       </Section>
 
       <ConfirmDialog
-        isOpen={renaming !== null}
+        isOpen={renaming !== undefined}
         onOpenChange={(open) => {
           if (!open) {
-            setRenaming(null)
+            setRenaming(undefined)
           }
         }}
         heading="Rename this passkey"
@@ -351,10 +351,10 @@ export function PasskeysCard() {
       />
 
       <ConfirmDialog
-        isOpen={deleting !== null}
+        isOpen={deleting !== undefined}
         onOpenChange={(open) => {
           if (!open) {
-            setDeleting(null)
+            setDeleting(undefined)
           }
         }}
         heading="Delete this passkey?"

@@ -10,28 +10,14 @@
  * They exist so a control that would always be refused is disabled rather than
  * offered, never to decide who may do what.
  *
- * Two of them are deliberately **narrower** than the server, and both narrow in
- * the safe direction (a control is disabled where the server would have
- * allowed it, never the reverse). Neither is reachable while a standalone
- * deployment has one operator identity, who is a superuser and an owner of the
- * organization and of every workspace in it; both become reachable with the
- * per-user sign-in of otari-ai#1716, which is when to revisit them.
+ * `canManage` is deliberately **narrower** than the server, in the safe
+ * direction. The server also lets an active owner or admin of one workspace
+ * manage that workspace, and the organization pages have no selected workspace
+ * to ask about. Use `canManageWorkspace` on the workspace-scoped pages.
  *
- * - **`canManage` alone is organization-role-only.** `_require_workspace_
- *   management_access` also grants a caller whose *workspace* membership is an
- *   active owner or admin, so an organization member who owns one workspace may
- *   manage it. `canManage` itself stays narrower on the organization pages,
- *   which have no selected workspace to ask about: answering there would need
- *   the caller's own user id resolved through the roster, which is a second
- *   query to say what the server will say anyway. `canManageWorkspace` below is
- *   for the workspace-scoped pages, where `CallerWorkspaceMembershipPublic.role`
- *   (the switcher's own data, already fetched) already names the caller's
- *   standing in *that* workspace, with nothing more to resolve.
- * - **Superuser is not on the contract.** The server grants organization
- *   management, and deletion, to `user.is_superuser` whatever their role;
- *   `OrganizationMembershipContextPublic` carries no such field, so nothing here
- *   can see it. otari.ai's own `useIsOrgAdmin` does check it, which is the
- *   divergence to close when the context grows the field.
+ * Superuser status is deployment authority, not an organization or workspace
+ * role, and the server ignores it for tenant-scoped access.
+ * No predicate here should check it.
  */
 
 import type {
@@ -95,30 +81,6 @@ const MANAGEMENT_ROLES: readonly string[] = ["owner", "admin"]
 /** Whether the caller's standing in their organization lets them manage it. */
 export function canManage(context: OrganizationContext | undefined): boolean {
   return context !== undefined && MANAGEMENT_ROLES.includes(context.role)
-}
-
-/**
- * Whether this caller also operates the deployment, which no role above confers.
- *
- * The other authority a signed-in identity can hold, and the reason the roster's
- * role picker looked like it did more than it does (otari#838): an organization
- * role is authority over one tenant, and the deployment's own surfaces answer to
- * `is_superuser` or the bootstrap identity instead.
- *
- * Like the predicates above, this is the client half of a gate the server
- * enforces, and it exists so a control that would be refused is withheld rather
- * than offered. It reads the same field `GET /v1/admin/access` publishes, which
- * `OrganizationMembershipContextPublic` now carries so a page that already has
- * the context needs no second request to know.
- *
- * Requires an explicit `true`: an absent or still-loading context is not an
- * operator, which withholds a deployment-wide read for one paint rather than
- * firing it and rendering its refusal.
- */
-export function isDeploymentOperator(
-  context: OrganizationContext | undefined,
-): boolean {
-  return context?.deployment_operator === true
 }
 
 /**

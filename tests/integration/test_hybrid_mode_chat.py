@@ -1,29 +1,37 @@
-from collections.abc import Generator
+import json
+from collections.abc import AsyncIterator, Callable, Generator
+from pathlib import Path
 from typing import Any
 
 import httpx
+import httpx2
 import pytest
 from any_llm.types.completion import (
     ChatCompletion,
+    ChatCompletionChunk,
     ChatCompletionMessage,
     Choice,
     CompletionUsage,
     PromptTokensDetails,
 )
 from fastapi.testclient import TestClient
+from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
+from conftest import InstallControlPlane, TaskGroupMcpTransport
 from gateway.api.deps import reset_config
-from gateway.core.config import GatewayConfig
+from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.core.database import reset_db
-from gateway.main import create_app
+
+from .conftest import app_for
 
 
 @pytest.fixture
 def platform_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient]:
     monkeypatch.setenv("OTARI_AI_TOKEN", "gw_test_token")
-    app = create_app(
+    app = app_for(
         GatewayConfig(
             mode="hybrid",
+            web_fetch_enabled=True,
             platform={"base_url": "http://platform.test/api/v1"},
         )
     )
@@ -35,19 +43,62 @@ def platform_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient]:
     reset_db()
 
 
-def test_hybrid_mode_requires_authorization_header(platform_client: TestClient) -> None:
+def test_hybrid_mode_requires_credentials(platform_client: TestClient) -> None:
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "openai:gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
     )
 
     assert response.status_code == 401
-    assert response.json() == {"detail": "Missing authentication token"}
+    assert response.json() == {"detail": "Missing Otari-Key, Authorization, or x-api-key header"}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Authorization": "Bearer user_test_token"},
+        {"Otari-Key": "user_test_token"},
+        {"Otari-Key": "Bearer user_test_token"},
+        {"x-api-key": "user_test_token"},
+    ],
+)
+def test_hybrid_mode_accepts_standalone_credential_headers(
+    platform_client: TestClient,
+    headers: dict[str, str],
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """Hybrid mode reads the same headers as standalone mode, so a key keeps
+    working when a caller moves between deployments; only who verifies the
+    token differs."""
+    forwarded_tokens: list[str] = []
+
+    async def fake_post_platform(
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        timeout_seconds: float,
+    ) -> httpx.Response:
+        forwarded_tokens.append(headers["X-User-Token"])
+        return httpx.Response(401, json={"detail": "Invalid user token"})
+
+    control_plane_transport(fake_post_platform)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={"model": "openai:gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+        headers=headers,
+    )
+
+    # The 401 comes from the platform's verdict on the forwarded token, not
+    # from the gateway failing to read the header.
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid user token"}
+    assert forwarded_tokens == ["user_test_token"]
 
 
 def test_hybrid_mode_maps_resolve_unauthorized(
     platform_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     async def fake_post_platform(
         url: str,
@@ -57,10 +108,10 @@ def test_hybrid_mode_maps_resolve_unauthorized(
     ) -> httpx.Response:
         return httpx.Response(401, json={"detail": "Invalid user token"})
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "openai:gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -72,6 +123,7 @@ def test_hybrid_mode_maps_resolve_unauthorized(
 def test_hybrid_mode_sets_correlation_id_and_reports_usage(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     usage_reports: list[dict[str, Any]] = []
 
@@ -138,17 +190,17 @@ def test_hybrid_mode_sets_correlation_id_and_reports_usage(
             ),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
 
     assert response.status_code == 200
-    assert response.headers["X-Correlation-ID"] == "7af2c39d-4eb8-4b3f-8242-46a97f7d5e68"
+    assert response.headers["Otari-Attempt-ID"] == "7af2c39d-4eb8-4b3f-8242-46a97f7d5e68"
     assert response.json()["usage"]["cost_usd"] == "0.012345"
     assert response.json()["usage"]["pricing_source"] == "managed"
     assert usage_reports == [
@@ -213,6 +265,7 @@ def _fake_bedrock_chat_completion() -> ChatCompletion:
 def test_hybrid_mode_forwards_bedrock_classic_key_pair_via_client_args(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """A Bedrock attempt using the classic IAM access-key/secret-key shape
     reaches the ``acompletion()`` call under ``client_args`` (not flat), with
@@ -250,11 +303,11 @@ def test_hybrid_mode_forwards_bedrock_classic_key_pair_via_client_args(
         }
         return _fake_bedrock_chat_completion()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json=_bedrock_chat_request(),
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -265,6 +318,7 @@ def test_hybrid_mode_forwards_bedrock_classic_key_pair_via_client_args(
 def test_hybrid_mode_forwards_bedrock_bearer_token_via_client_args(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """A Bedrock attempt using the bearer-token ("Bedrock API key") shape (no
     aws_access_key_id in extra_params) gets a pre-built, unsigned boto3
@@ -296,11 +350,11 @@ def test_hybrid_mode_forwards_bedrock_bearer_token_via_client_args(
         assert client_args["client"].meta.region_name == "us-west-2"
         return _fake_bedrock_chat_completion()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json=_bedrock_chat_request(),
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -311,6 +365,7 @@ def test_hybrid_mode_forwards_bedrock_bearer_token_via_client_args(
 def test_hybrid_mode_forwards_session_label_and_strips_it_upstream(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """A request-body ``session_label`` reaches the platform usage report (for
     cost attribution) but is stripped before the provider call."""
@@ -363,11 +418,11 @@ def test_hybrid_mode_forwards_session_label_and_strips_it_upstream(
             usage=CompletionUsage(prompt_tokens=10, completion_tokens=7, total_tokens=17),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "hi"}],
@@ -391,6 +446,7 @@ def test_hybrid_mode_forwards_session_label_and_strips_it_upstream(
 def test_hybrid_mode_accepts_legacy_resolve_shape(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """An older otari (pre-fallback) returns a flat resolve payload.
 
@@ -437,19 +493,19 @@ def test_hybrid_mode_accepts_legacy_resolve_shape(
             usage=CompletionUsage(prompt_tokens=4, completion_tokens=2, total_tokens=6),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
 
     assert response.status_code == 200
-    # Gateway maps the legacy correlation_id onto attempt_id, so X-Correlation-ID
+    # Gateway maps the legacy correlation_id onto attempt_id, so Otari-Attempt-ID
     # still carries the same value as before.
-    assert response.headers["X-Correlation-ID"] == "9b2cce4a-5e91-4c19-9ad5-17a83f72b001"
+    assert response.headers["Otari-Attempt-ID"] == "9b2cce4a-5e91-4c19-9ad5-17a83f72b001"
     assert usage_reports[0]["correlation_id"] == "9b2cce4a-5e91-4c19-9ad5-17a83f72b001"
     assert usage_reports[0]["status"] == "success"
 
@@ -457,6 +513,7 @@ def test_hybrid_mode_accepts_legacy_resolve_shape(
 def test_hybrid_mode_maps_provider_timeout(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     async def fake_post_platform(
         url: str,
@@ -489,11 +546,11 @@ def test_hybrid_mode_maps_provider_timeout(
     async def fake_acompletion(**kwargs: Any) -> ChatCompletion:
         raise TimeoutError("provider timeout")
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -505,6 +562,7 @@ def test_hybrid_mode_maps_provider_timeout(
 def test_hybrid_mode_falls_through_on_sdk_wrapped_connection_error(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """The first attempt fails with the OpenAI SDK's own ``APIConnectionError``
     (how a real DNS failure / connection refused / TLS error actually reaches
@@ -575,17 +633,17 @@ def test_hybrid_mode_falls_through_on_sdk_wrapped_connection_error(
             usage=CompletionUsage(prompt_tokens=5, completion_tokens=1, total_tokens=6),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "anything", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
 
     assert response.status_code == 200
-    assert response.headers["X-Correlation-ID"] == "conn-err-att-good"
+    assert response.headers["Otari-Attempt-ID"] == "conn-err-att-good"
     assert calls == ["https://unreachable.example.com/v1", "https://api.openai.com/v1"]
 
     error_reports = [r for r in usage_reports if r.get("status") == "error"]
@@ -597,6 +655,7 @@ def test_hybrid_mode_falls_through_on_sdk_wrapped_connection_error(
 def test_hybrid_mode_falls_through_when_a_provider_account_is_out_of_credit(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """The first attempt's provider account has no credit left, which Anthropic
     reports as a 400 ``invalid_request_error`` rather than a 402. An empty wallet
@@ -683,17 +742,17 @@ def test_hybrid_mode_falls_through_when_a_provider_account_is_out_of_credit(
             usage=CompletionUsage(prompt_tokens=5, completion_tokens=1, total_tokens=6),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "anything", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
 
     assert response.status_code == 200
-    assert response.headers["X-Correlation-ID"] == "billing-att-funded"
+    assert response.headers["Otari-Attempt-ID"] == "billing-att-funded"
     assert calls == ["anthropic:claude-haiku-4-5", "openai:gpt-4o-mini"]
 
     error_reports = [r for r in usage_reports if r.get("status") == "error"]
@@ -704,7 +763,7 @@ def test_hybrid_mode_falls_through_when_a_provider_account_is_out_of_credit(
 
 def test_hybrid_mode_propagates_resolve_rate_limit_retry_after(
     platform_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     async def fake_post_platform(
         url: str,
@@ -714,10 +773,10 @@ def test_hybrid_mode_propagates_resolve_rate_limit_retry_after(
     ) -> httpx.Response:
         return httpx.Response(429, json={"detail": "Rate limited"}, headers={"Retry-After": "11"})
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "openai:gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -730,6 +789,7 @@ def test_hybrid_mode_propagates_resolve_rate_limit_retry_after(
 def test_hybrid_mode_usage_retries_only_transient_failures(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     usage_calls: list[dict[str, Any]] = []
 
@@ -780,11 +840,11 @@ def test_hybrid_mode_usage_retries_only_transient_failures(
             usage=CompletionUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -794,7 +854,7 @@ def test_hybrid_mode_usage_retries_only_transient_failures(
 
 def test_hybrid_mode_maps_resolve_validation_error_to_bad_gateway(
     platform_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     async def fake_post_platform(
         url: str,
@@ -804,10 +864,10 @@ def test_hybrid_mode_maps_resolve_validation_error_to_bad_gateway(
     ) -> httpx.Response:
         return httpx.Response(422, json={"detail": "missing headers"})
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -818,7 +878,7 @@ def test_hybrid_mode_maps_resolve_validation_error_to_bad_gateway(
 
 def test_hybrid_mode_forwards_resolve_400_detail(
     platform_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """A 400 from the platform resolve endpoint (a deliberate, caller-safe
     rejection such as a Bedrock BYO key using an auth shape that can't be
@@ -836,10 +896,10 @@ def test_hybrid_mode_forwards_resolve_400_detail(
             json={"detail": "This Bedrock provider key uses a bearer-token credential."},
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "bedrock:anthropic.claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -856,6 +916,7 @@ def test_hybrid_mode_forwards_resolve_400_detail(
 def test_hybrid_mode_streaming_returns_inline_cost_and_forces_usage(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     from collections.abc import AsyncIterator
 
@@ -915,12 +976,12 @@ def test_hybrid_mode_streaming_returns_inline_cost_and_forces_usage(
 
         return stream()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     with platform_client.stream(
         "POST",
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "hi"}],
@@ -939,6 +1000,7 @@ def test_hybrid_mode_streaming_returns_inline_cost_and_forces_usage(
 def test_hybrid_mode_streaming_falls_through_on_first_attempt_failure(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """Streaming request whose first attempt errors before any chunk → falls
     through to the second attempt; client sees a clean 200 SSE stream from
@@ -1027,11 +1089,11 @@ def test_hybrid_mode_streaming_falls_through_on_first_attempt_failure(
 
         return _success_stream()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1041,11 +1103,11 @@ def test_hybrid_mode_streaming_falls_through_on_first_attempt_failure(
     )
 
     assert response.status_code == 200
-    assert response.headers["X-Correlation-ID"] == "stream-att-openai"
-    # StreamingResponse builds its own response object, so X-Otari-Request-ID
+    assert response.headers["Otari-Attempt-ID"] == "stream-att-openai"
+    # StreamingResponse builds its own response object, so Otari-Request-ID
     # has to be set in the StreamingResponse headers directly — assigning to
     # the dependency-injected Response object doesn't propagate.
-    assert response.headers["X-Otari-Request-ID"] == "stream-req-1"
+    assert response.headers["Otari-Request-ID"] == "stream-req-1"
     # Both attempts were tried in order — anthropic first, then openai succeeded.
     assert [m for m in calls if "anthropic" in m or "openai" in m] == [
         "anthropic:claude-haiku-4-5",
@@ -1061,10 +1123,19 @@ def test_hybrid_mode_streaming_falls_through_on_first_attempt_failure(
     assert len(error_reports) == 1
     assert error_reports[0]["correlation_id"] == "stream-att-anthropic"
 
+    # The winning openai attempt reports ttft_ms on the wire, not just through
+    # the payload builder in isolation.
+    success_reports = [r for r in usage_reports if r.get("status") == "success"]
+    assert len(success_reports) == 1
+    assert success_reports[0]["correlation_id"] == "stream-att-openai"
+    assert isinstance(success_reports[0]["ttft_ms"], int)
+    assert success_reports[0]["ttft_ms"] >= 0
+
 
 def test_hybrid_mode_streaming_returns_502_when_all_attempts_fail(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """If every attempt fails before yielding, the gateway returns 502 with
     the multi-attempt error wording instead of starting an SSE stream."""
@@ -1108,11 +1179,11 @@ def test_hybrid_mode_streaming_returns_502_when_all_attempts_fail(
     async def fake_acompletion(**kwargs: Any) -> Any:
         raise RuntimeError("simulated upstream failure")
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1123,11 +1194,13 @@ def test_hybrid_mode_streaming_returns_502_when_all_attempts_fail(
 
     assert response.status_code == 502
     assert response.json() == {"detail": "All upstream providers failed"}
+    assert response.headers["Otari-Attempt-ID"] == "att-b"
 
 
 def test_hybrid_mode_streaming_returns_504_when_all_attempts_time_out(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """If every attempt fails with the OpenAI SDK's own ``APITimeoutError``
     (not a raw ``httpx`` exception; see the non-streaming
@@ -1176,11 +1249,11 @@ def test_hybrid_mode_streaming_returns_504_when_all_attempts_time_out(
     async def fake_acompletion(**kwargs: Any) -> Any:
         raise openai.APITimeoutError(request=httpx.Request("POST", "http://upstream"))
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1191,11 +1264,96 @@ def test_hybrid_mode_streaming_returns_504_when_all_attempts_time_out(
 
     assert response.status_code == 504
     assert response.json() == {"detail": "All upstream providers timed out"}
+    assert response.headers["Otari-Attempt-ID"] == "att-b"
+
+
+def test_hybrid_mode_streaming_returns_429_when_all_attempts_are_rate_limited(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """A route exhausted by rate limits keeps the 429. Flattening it into the
+    generic 502 would tell a client that has just been asked to back off that it
+    hit an outage and may retry now, which is the opposite instruction. Covers
+    ``raise_all_streaming_attempts_failed``'s rate-limit branch."""
+
+    upstream_calls: list[str] = []
+
+    class _RateLimited(Exception):
+        def __init__(self, retry_after: str) -> None:
+            super().__init__("Quota exceeded. Please retry in 34.6s.")
+            self.status_code = 429
+            self.response = httpx.Response(429, headers={"Retry-After": retry_after})
+
+    async def fake_post_platform(
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        timeout_seconds: float,
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "stream-req-429",
+                    "fallback_enabled": True,
+                    "attempts": [
+                        {
+                            "attempt_id": "att-a",
+                            "position": 0,
+                            "provider": "gemini",
+                            "model": "gemini-2.5-pro",
+                            "api_key": "gemini-key",
+                            "api_base": None,
+                            "managed": False,
+                        },
+                        {
+                            "attempt_id": "att-b",
+                            "position": 1,
+                            "provider": "openai",
+                            "model": "gpt-4o-mini",
+                            "api_key": "sk-openai-busy",
+                            "api_base": None,
+                            "managed": False,
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(204)
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        upstream_calls.append(str(kwargs.get("model", "")))
+        # A different window per attempt, so the header assertion pins which
+        # failure's window an exhausted route forwards.
+        raise _RateLimited("12" if len(upstream_calls) == 1 else "34")
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 429
+    assert response.json() == {"detail": "All upstream providers rate-limited this request"}
+    assert response.headers["Otari-Attempt-ID"] == "att-b"
+    # A 429 advances the plan, so both attempts really ran: the aggregate is
+    # reached by exhausting the route, not by one attempt failing outright.
+    assert len(upstream_calls) == 2
+    # The final failure's window, not the first attempt's.
+    assert response.headers["Retry-After"] == "34"
 
 
 def test_hybrid_mode_streaming_reports_every_attempt_when_all_fail(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """When every streaming attempt fails before its first chunk, each attempt's
     error outcome is still reported back to the platform. The terminal 502 drops
@@ -1248,11 +1406,11 @@ def test_hybrid_mode_streaming_reports_every_attempt_when_all_fail(
             response=httpx.Response(500, request=httpx.Request("POST", "http://upstream")),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1355,6 +1513,7 @@ def _two_attempt_resolve_response(*, request_id: str) -> httpx.Response:
 def test_hybrid_mode_tool_loop_falls_through_pre_lock_in(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """Non-streaming MCP request: first attempt errors before any tool round
     completes → the gateway falls through to the second attempt and returns
@@ -1395,12 +1554,12 @@ def test_hybrid_mode_tool_loop_falls_through_pre_lock_in(
             usage=CompletionUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.MCPClientPool", _FakeMcpPool)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1410,7 +1569,7 @@ def test_hybrid_mode_tool_loop_falls_through_pre_lock_in(
     )
 
     assert response.status_code == 200
-    assert response.headers["X-Correlation-ID"] == "tool-att-openai"
+    assert response.headers["Otari-Attempt-ID"] == "tool-att-openai"
     body = response.json()
     assert body["choices"][0]["message"]["content"] == "hello from openai"
     # Both attempts were tried in order — confirms the [:1] collapse is gone.
@@ -1424,6 +1583,7 @@ def test_hybrid_mode_tool_loop_falls_through_pre_lock_in(
 def test_hybrid_mode_tool_loop_no_fallback_after_lock_in(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """Non-streaming MCP request: first attempt returns a tool_call (lock-in
     fires), then upstream dies on round 2. The gateway must NOT try the
@@ -1471,12 +1631,12 @@ def test_hybrid_mode_tool_loop_no_fallback_after_lock_in(
         # Round 2 (still on attempt 1 — lock-in is in effect) — upstream dies.
         raise RuntimeError("simulated upstream 5xx on round 2")
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.MCPClientPool", _FakeMcpPool)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1491,9 +1651,152 @@ def test_hybrid_mode_tool_loop_no_fallback_after_lock_in(
     assert calls == ["anthropic:claude-haiku-4-5", "anthropic:claude-haiku-4-5"]
 
 
+class _CappedSearchBackend:
+    """WebSearchBackend duck-type that counts searches and looks gateway-owned.
+
+    ``take_last_results`` is what marks a pool as the gateway's own search backend
+    rather than an MCP server exposing a tool of the same name.
+    """
+
+    calls = 0
+
+    def __init__(self, **_kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> "_CappedSearchBackend":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    @property
+    def openai_tools(self) -> list[dict[str, Any]]:
+        return [{"type": "function", "function": {"name": "web_search", "description": "", "parameters": {}}}]
+
+    def owns_tool(self, name: str) -> bool:
+        return name == "web_search"
+
+    def purpose_hints(self) -> list[tuple[str, str]]:
+        return []
+
+    def take_last_results(self) -> list[dict[str, Any]]:
+        return [{"url": "https://a", "title": "A"}]
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        type(self).calls += 1
+        return "results"
+
+
+def test_hybrid_mode_web_search_cap_is_not_refilled_by_a_streaming_fallover(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """``max_uses`` bounds the request, not each attempt of it.
+
+    A tool-loop stream whose swallowed first round runs a search and whose second
+    round dies is still pre-first-chunk, so the plan falls over. Both runs are
+    billed (``ToolUsageTally`` accumulates across attempts), so a cap the next
+    attempt started over on would bill up to ``max_uses`` per candidate.
+    """
+    monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://searxng:8080")
+    _CappedSearchBackend.calls = 0
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return _two_attempt_resolve_response(request_id="ws-cap-req")
+        if url.endswith("/gateway/web-search/resolve"):
+            return httpx.Response(200, json={"enabled": True, "authorized_tools": ["web_search"]})
+        return httpx.Response(204)
+
+    calls: list[str] = []
+
+    class _FakeAuthError(Exception):
+        status_code = 401
+
+    def _chunk(payload: dict[str, Any]) -> Any:
+        return ChatCompletionChunk.model_validate(
+            {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m", **payload}
+        )
+
+    async def fake_loop_acompletion(**kwargs: Any) -> Any:
+        calls.append(kwargs.get("model", ""))
+        # Round 2 of attempt 1 dies. The round-1 tool-call chunks were swallowed,
+        # so nothing has reached the client and the plan may still fall over.
+        if len(calls) == 2:
+            raise _FakeAuthError("simulated upstream 401 on round 2")
+        wants_search = len(calls) in (1, 3)
+
+        async def _stream() -> AsyncIterator[Any]:
+            if wants_search:
+                yield _chunk(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "web_search",
+                                                "arguments": '{"query": "otari"}',
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                )
+                yield _chunk({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+            else:
+                yield _chunk({"choices": [{"index": 0, "delta": {"content": "answered"}, "finish_reason": None}]})
+                yield _chunk(
+                    {
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+                    }
+                )
+
+        return _stream()
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_retrieval_backend", _CappedSearchBackend)
+    monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "tools": [{"type": "otari_web_search", "max_uses": 1}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 200
+    # The fallover happened, and the served attempt found the cap already spent.
+    assert calls == [
+        "anthropic:claude-haiku-4-5",
+        "anthropic:claude-haiku-4-5",
+        "openai:gpt-4o-mini",
+        "openai:gpt-4o-mini",
+    ]
+    assert _CappedSearchBackend.calls == 1
+
+
 def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """Streaming MCP request: first attempt errors before yielding any
     chunk → gateway falls through to the second attempt and streams its
@@ -1543,12 +1846,12 @@ def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
 
         return _stream()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.MCPClientPool", _FakeMcpPool)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1559,9 +1862,151 @@ def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
     )
 
     assert response.status_code == 200
-    assert response.headers["X-Correlation-ID"] == "tool-att-openai"
+    assert response.headers["Otari-Attempt-ID"] == "tool-att-openai"
     assert calls == ["anthropic:claude-haiku-4-5", "openai:gpt-4o-mini"]
     assert "hello" in response.text
+
+
+class _FakeMcpSession:
+    """Enough of an MCP ``ClientSession`` to list one tool and run it."""
+
+    def __init__(self, *args: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> "_FakeMcpSession":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def initialize(self) -> None:
+        return None
+
+    async def list_tools(self) -> ListToolsResult:
+        return ListToolsResult(tools=[Tool(name="remote_search", inputSchema={"type": "object"})])
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        return CallToolResult(content=[TextContent(type="text", text="tool ran")])
+
+
+@pytest.mark.parametrize("close_error", [None, RuntimeError("the MCP server hung up")], ids=["closes", "close-fails"])
+def test_hybrid_mode_tool_loop_streaming_ends_the_stream_and_reports_usage(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+    mcp_task_group_transport: TaskGroupMcpTransport,
+    close_error: Exception | None,
+) -> None:
+    """A streamed MCP tool loop ends with its usage and ``[DONE]``, and bills every round.
+
+    Each round ends as OpenAI streams it: a finish chunk, then a usage chunk with no choices.
+    A pool that fails to close must not change what the caller receives.
+    """
+    usage_reports: list[dict[str, Any]] = []
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "tool-stream-usage-req",
+                    "fallback_enabled": False,
+                    "attempts": [
+                        {
+                            "attempt_id": "tool-stream-usage-att",
+                            "position": 0,
+                            "provider": "openai",
+                            "model": "gpt-4o-mini",
+                            "api_key": "sk-openai-real",
+                            "managed": False,
+                        }
+                    ],
+                },
+            )
+        usage_reports.append(body)
+        return httpx.Response(204)
+
+    def _chunk(payload: dict[str, Any]) -> ChatCompletionChunk:
+        return ChatCompletionChunk.model_validate(
+            {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": "gpt-4o-mini", **payload}
+        )
+
+    def _delta(delta: dict[str, Any], finish: str | None = None) -> ChatCompletionChunk:
+        return _chunk({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+
+    def _usage(prompt: int, completion: int) -> ChatCompletionChunk:
+        usage = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+        return _chunk({"choices": [], "usage": usage})
+
+    rounds = 0
+
+    async def fake_loop_acompletion(**kwargs: Any) -> AsyncIterator[ChatCompletionChunk]:
+        nonlocal rounds
+        rounds += 1
+        first_round = rounds == 1
+
+        async def _stream() -> AsyncIterator[ChatCompletionChunk]:
+            yield _delta({"role": "assistant"})
+            if first_round:
+                yield _delta(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "remote_search", "arguments": ""},
+                            }
+                        ]
+                    }
+                )
+                yield _delta({"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]})
+                yield _delta({}, "tool_calls")
+                yield _usage(10, 2)
+            else:
+                yield _delta({"content": "hybrid-"})
+                yield _delta({"content": "smoke-ok"})
+                yield _delta({}, "stop")
+                yield _usage(20, 3)
+
+        return _stream()
+
+    transport = mcp_task_group_transport
+    transport.close_error = close_error
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.services.mcp_client.ClientSession", _FakeMcpSession)
+    monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "mcp_servers": [{"name": "test", "url": "https://93.184.216.34/mcp"}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 200
+    payloads = [line.removeprefix("data: ") for line in response.text.splitlines() if line.startswith("data: ")]
+    assert payloads[-1] == "[DONE]", response.text
+    frames = [json.loads(payload) for payload in payloads[:-1]]
+    assert not [frame for frame in frames if "error" in frame], response.text
+    choices = [choice for frame in frames for choice in frame["choices"]]
+    assert "".join(choice["delta"].get("content") or "" for choice in choices) == "hybrid-smoke-ok"
+    assert [choice["finish_reason"] for choice in choices if choice["finish_reason"]] == ["stop"]
+    assert not [choice for choice in choices if choice["delta"].get("tool_calls")]
+    usage_frames = [frame["usage"] for frame in frames if not frame["choices"]]
+    assert [(usage["prompt_tokens"], usage["completion_tokens"]) for usage in usage_frames] == [(30, 5)]
+    assert transport.exited_in == [transport.entered_in]
+    successes = [report for report in usage_reports if report.get("status") == "success"]
+    assert len(successes) == 1, usage_reports
+    assert successes[0]["correlation_id"] == "tool-stream-usage-att"
+    assert successes[0]["usage"]["prompt_tokens"] == 30
+    assert successes[0]["usage"]["completion_tokens"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -1584,13 +2029,14 @@ class _FakeWebSearchBackend:
     def __init__(
         self,
         *,
-        base_url: str,
-        tool_entry: dict[str, Any],
+        base_url: str | None,
+        search_tool_entry: dict[str, Any] | None,
         auth_token: str | None = None,
         config: Any = None,
         tally: Any = None,
+        **_kwargs: Any,
     ) -> None:
-        type(self).last_tool_entry = dict(tool_entry)
+        type(self).last_tool_entry = dict(search_tool_entry or {})
         type(self).last_auth_token = auth_token
         # The real backend records each call on the request's tally; accept it so
         # the constructor contract matches, even though this double runs no search.
@@ -1637,9 +2083,75 @@ def _single_attempt_resolve_response(*, request_id: str) -> httpx.Response:
     )
 
 
+_WEB_ACCESS_CONTRACT_CASES = json.loads(
+    (Path(__file__).parents[1] / "fixtures" / "web_access_resolution_contract.json").read_text()
+)["cases"]
+
+
+@pytest.mark.parametrize("case", _WEB_ACCESS_CONTRACT_CASES, ids=lambda case: str(case["name"]))
+def test_hybrid_mode_web_access_contract_matrix(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    case: dict[str, Any],
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """Mirror the control-plane request and response contract through the HTTP route."""
+    requested_tools = case["expected_requested_tools"]
+    if "web_search" in requested_tools:
+        monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://searxng:8080")
+    else:
+        monkeypatch.delenv("OTARI_WEB_SEARCH_URL", raising=False)
+
+    web_resolve_bodies: list[dict[str, Any]] = []
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return _single_attempt_resolve_response(request_id=f"contract-{case['name']}")
+        if url.endswith("/gateway/web-search/resolve"):
+            web_resolve_bodies.append(body)
+            return httpx.Response(200, json=case["platform_response"])
+        return httpx.Response(204)
+
+    async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
+        return ChatCompletion(
+            id="cmpl-web-access-contract",
+            object="chat.completion",
+            created=0,
+            model="openai:gpt-4o-mini",
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    index=0,
+                    message=ChatCompletionMessage(role="assistant", content="answer"),
+                )
+            ],
+            usage=CompletionUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
+        )
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_retrieval_backend", _FakeWebSearchBackend)
+    monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": case["tools"],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == case["expected_status"]
+    assert web_resolve_bodies == [{"requested_tools": requested_tools}]
+
+
 def test_hybrid_mode_web_search_403_when_disabled(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """An `otari_web_search` request whose workspace has web search disabled
     is rejected with 403 before any provider call."""
@@ -1651,13 +2163,13 @@ def test_hybrid_mode_web_search_403_when_disabled(
         if url.endswith("/gateway/provider-keys/resolve"):
             return _single_attempt_resolve_response(request_id="ws-req-disabled")
         if url.endswith("/gateway/web-search/resolve"):
-            return httpx.Response(200, json={"enabled": False})
+            return httpx.Response(200, json={"enabled": False, "authorized_tools": []})
         return httpx.Response(204)
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1673,9 +2185,9 @@ def test_hybrid_mode_web_search_403_when_disabled(
 def test_hybrid_mode_web_search_merges_workspace_config(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
-    """When enabled, the resolved workspace config is merged into the tool
-    entry with per-request values winning over workspace defaults."""
+    """A request value that narrows a workspace limit survives, and the workspace fills what the request left blank."""
     monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://searxng:8080")
     _FakeWebSearchBackend.last_tool_entry = None
     _FakeWebSearchBackend.last_auth_token = None
@@ -1690,6 +2202,7 @@ def test_hybrid_mode_web_search_merges_workspace_config(
                 200,
                 json={
                     "enabled": True,
+                    "authorized_tools": ["web_search"],
                     "max_results": 9,
                     "allowed_domains": ["docs.python.org"],
                     "purpose_hint": "workspace hint",
@@ -1714,16 +2227,16 @@ def test_hybrid_mode_web_search_merges_workspace_config(
             usage=CompletionUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
-    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_search_backend", _FakeWebSearchBackend)
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_retrieval_backend", _FakeWebSearchBackend)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
-            # Per-request max_results=3 must win over the workspace default 9.
+            # 3 is below the workspace's ceiling of 9, so it survives.
             "tools": [{"type": "otari_web_search", "max_results": 3}],
         },
         headers={"Authorization": "Bearer user_test_token"},
@@ -1732,9 +2245,8 @@ def test_hybrid_mode_web_search_merges_workspace_config(
     assert response.status_code == 200
     merged = _FakeWebSearchBackend.last_tool_entry
     assert merged is not None
-    # Per-request value wins.
     assert merged["max_results"] == 3
-    # Workspace defaults fill in the unset keys.
+    # The workspace fills what the request left blank.
     assert merged["allowed_domains"] == ["docs.python.org"]
     assert merged["purpose_hint"] == "workspace hint"
     assert merged["provider_options"] == {"search_depth": "advanced"}
@@ -1743,9 +2255,137 @@ def test_hybrid_mode_web_search_merges_workspace_config(
     assert _FakeWebSearchBackend.last_auth_token is None
 
 
+WebSearchCall = Callable[[dict[str, Any], dict[str, Any]], httpx2.Response]
+
+
+@pytest.fixture
+def post_web_search(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> WebSearchCall:
+    """Return a function that sends one hybrid completion declaring web search.
+
+    The control plane answers with the policy the call passes.
+    """
+    monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://searxng:8080")
+    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_retrieval_backend", _FakeWebSearchBackend)
+    _FakeWebSearchBackend.last_tool_entry = None
+
+    async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
+        return ChatCompletion(
+            id="cmpl-ws-ceiling",
+            object="chat.completion",
+            created=0,
+            model="openai:gpt-4o-mini",
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    index=0,
+                    message=ChatCompletionMessage(role="assistant", content="answer"),
+                )
+            ],
+            usage=CompletionUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
+        )
+
+    monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
+
+    def post(workspace: dict[str, Any], request_entry: dict[str, Any]) -> httpx2.Response:
+        async def fake_post_platform(
+            url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+        ) -> httpx.Response:
+            if url.endswith("/gateway/provider-keys/resolve"):
+                return _single_attempt_resolve_response(request_id="ws-req-ceiling")
+            if url.endswith("/gateway/web-search/resolve"):
+                return httpx.Response(200, json={"enabled": True, "authorized_tools": ["web_search"], **workspace})
+            return httpx.Response(204)
+
+        control_plane_transport(fake_post_platform)
+        return platform_client.post(
+            f"{API_ROOT}/chat/completions",
+            json={
+                "model": "anything",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "otari_web_search", **request_entry}],
+            },
+            headers={"Authorization": "Bearer user_test_token"},
+        )
+
+    return post
+
+
+@pytest.mark.parametrize(
+    ("workspace", "request_entry", "expected"),
+    [
+        pytest.param(
+            {"max_results": 9},
+            {"max_results": 50},
+            {"max_results": 9},
+            id="max-results",
+        ),
+        pytest.param(
+            {"blocked_domains": ["spam.example"]},
+            {"blocked_domains": ["other.example"]},
+            {"blocked_domains": ["other.example", "spam.example"]},
+            id="blocked-domains",
+        ),
+        pytest.param(
+            {"allowed_domains": ["example.com"]},
+            {"allowed_domains": ["docs.example.com"]},
+            {"allowed_domains": ["docs.example.com"]},
+            id="allowed-domains",
+        ),
+    ],
+)
+def test_hybrid_mode_web_search_workspace_limits_are_a_ceiling(
+    post_web_search: WebSearchCall,
+    workspace: dict[str, Any],
+    request_entry: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    """A request narrows the workspace's web search limits and never widens them."""
+    response = post_web_search(workspace, request_entry)
+
+    assert response.status_code == 200, response.text
+    merged = _FakeWebSearchBackend.last_tool_entry
+    assert merged is not None
+    for key, value in expected.items():
+        assert merged[key] == value
+
+
+@pytest.mark.parametrize(
+    ("workspace_max", "expected"),
+    [pytest.param(9, 5, id="above-the-deployment"), pytest.param(3, 3, id="below-the-deployment")],
+)
+def test_hybrid_mode_web_search_workspace_max_results_never_raises_the_deployment_default(
+    post_web_search: WebSearchCall,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_max: int,
+    expected: int,
+) -> None:
+    """With no request value, the lower of the workspace's ceiling and the deployment's default applies."""
+    monkeypatch.setenv("OTARI_WEB_SEARCH_MAX_RESULTS", "5")
+
+    response = post_web_search({"max_results": workspace_max}, {})
+
+    assert response.status_code == 200, response.text
+    merged = _FakeWebSearchBackend.last_tool_entry
+    assert merged is not None
+    assert merged["max_results"] == expected
+
+
+def test_hybrid_mode_web_search_refuses_an_allow_list_outside_the_workspace(post_web_search: WebSearchCall) -> None:
+    """A request allow-list that shares nothing with the workspace's is refused, not substituted."""
+    response = post_web_search({"allowed_domains": ["docs.python.org"]}, {"allowed_domains": ["evil.example"]})
+
+    assert response.status_code == 403, response.text
+    assert _FakeWebSearchBackend.last_tool_entry is None
+
+
 def test_hybrid_mode_web_search_forwards_token_to_platform_backend(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """When OTARI_WEB_SEARCH_URL points at the platform itself, the gateway
     forwards its platform token as X-Gateway-Token so the platform-hosted
@@ -1760,7 +2400,7 @@ def test_hybrid_mode_web_search_forwards_token_to_platform_backend(
         if url.endswith("/gateway/provider-keys/resolve"):
             return _single_attempt_resolve_response(request_id="ws-req-platform")
         if url.endswith("/gateway/web-search/resolve"):
-            return httpx.Response(200, json={"enabled": True})
+            return httpx.Response(200, json={"enabled": True, "authorized_tools": ["web_search"]})
         return httpx.Response(204)
 
     async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
@@ -1779,12 +2419,12 @@ def test_hybrid_mode_web_search_forwards_token_to_platform_backend(
             usage=CompletionUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
-    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_search_backend", _FakeWebSearchBackend)
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_retrieval_backend", _FakeWebSearchBackend)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1800,6 +2440,7 @@ def test_hybrid_mode_web_search_forwards_token_to_platform_backend(
 def test_hybrid_mode_web_search_empty_request_list_keeps_workspace_policy(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """A request `allowed_domains: []` reads as "no preference" and must NOT clear
     the workspace allow-list — empty/falsy per-request values fall back to the
@@ -1813,7 +2454,14 @@ def test_hybrid_mode_web_search_empty_request_list_keeps_workspace_policy(
         if url.endswith("/gateway/provider-keys/resolve"):
             return _single_attempt_resolve_response(request_id="ws-req-empty")
         if url.endswith("/gateway/web-search/resolve"):
-            return httpx.Response(200, json={"enabled": True, "allowed_domains": ["docs.python.org"]})
+            return httpx.Response(
+                200,
+                json={
+                    "enabled": True,
+                    "authorized_tools": ["web_search"],
+                    "allowed_domains": ["docs.python.org"],
+                },
+            )
         return httpx.Response(204)
 
     async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
@@ -1832,12 +2480,12 @@ def test_hybrid_mode_web_search_empty_request_list_keeps_workspace_policy(
             usage=CompletionUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
-    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_search_backend", _FakeWebSearchBackend)
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_retrieval_backend", _FakeWebSearchBackend)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1856,6 +2504,7 @@ def test_hybrid_mode_web_search_empty_request_list_keeps_workspace_policy(
 def test_hybrid_mode_streaming_single_attempt_classifies_provider_error(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """A single-attempt streaming request that fails before its first chunk
     surfaces the classified status (404), not a generic 502."""
@@ -1894,11 +2543,11 @@ def test_hybrid_mode_streaming_single_attempt_classifies_provider_error(
             response=httpx.Response(404, request=httpx.Request("POST", "http://upstream")),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1909,11 +2558,13 @@ def test_hybrid_mode_streaming_single_attempt_classifies_provider_error(
 
     assert response.status_code == 404
     assert response.json() == {"detail": "The requested model was not found on the provider"}
+    assert response.headers["Otari-Attempt-ID"] == "att-a"
 
 
 def test_hybrid_mode_streaming_falls_through_on_provider_400(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """A provider 400 advances through every streaming candidate before aggregate failure."""
     usage_reports: list[dict[str, Any]] = []
@@ -1965,11 +2616,11 @@ def test_hybrid_mode_streaming_falls_through_on_provider_400(
             response=httpx.Response(400, request=httpx.Request("POST", "http://upstream")),
         )
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": "anything", "messages": [{"role": "user", "content": "hi"}], "stream": True},
         headers={"Authorization": "Bearer user_test_token"},
     )
@@ -1996,21 +2647,29 @@ class _FakeSandboxBackend:
     last_purpose_hint: str | None = None
     last_image: str | None = None
     last_allowed_tools: frozenset[str] | None = None
+    last_timeout_s: float | None = None
 
     def __init__(
         self,
         *,
-        sandbox_url: str,
+        port: Any,
         purpose_hint: str | None = None,
         timeout_s: float = 0.0,
+        max_executions: int = 1,
         auth_token: str | None = None,
         image: str | None = None,
         allowed_tools: frozenset[str] | None = None,
         tally: Any = None,
+        files: Any = None,
+        files_base_url: str | None = None,
+        container: Any = None,
+        containers: Any = None,
+        on_lease: Any = None,
     ) -> None:
         type(self).last_purpose_hint = purpose_hint
         type(self).last_image = image
         type(self).last_allowed_tools = allowed_tools
+        type(self).last_timeout_s = timeout_s
         self._tally = tally
 
     async def __aenter__(self) -> "_FakeSandboxBackend":
@@ -2049,6 +2708,7 @@ def _sandbox_loop_completion() -> ChatCompletion:
 def test_platform_mode_sandbox_403_when_disabled(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """An otari_code_execution request whose workspace has code execution disabled
     is rejected with 403 before any provider call."""
@@ -2063,10 +2723,10 @@ def test_platform_mode_sandbox_403_when_disabled(
             return httpx.Response(200, json={"enabled": False})
         return httpx.Response(204)
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2079,9 +2739,62 @@ def test_platform_mode_sandbox_403_when_disabled(
     assert response.json() == {"detail": "code execution is not enabled for this workspace"}
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"enabled": "yes"},
+        {"enabled": True, "max_iterations": "4"},
+        {"enabled": True, "exec_timeout_s": 0},
+        {"enabled": True, "tools": "code_execution"},
+        {"enabled": True, "executor": "sometimes"},
+    ],
+)
+def test_platform_mode_sandbox_502_when_the_policy_is_malformed(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+    answer: dict[str, Any],
+) -> None:
+    """A malformed field is a contract break, so no code runs and nothing reaches the provider."""
+    monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
+    provider_called = False
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return _single_attempt_resolve_response(request_id="sbx-malformed")
+        if url.endswith("/gateway/code-execution/resolve"):
+            return httpx.Response(200, json=answer)
+        return httpx.Response(204)
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        nonlocal provider_called
+        provider_called = True
+        raise AssertionError("a request with a malformed policy reached the provider")
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "otari_code_execution"}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Authorization service returned a malformed code-execution policy"}
+    assert provider_called is False
+
+
 def test_platform_mode_sandbox_applies_workspace_default_purpose_hint(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """When enabled and the request omits a purpose_hint, the workspace
     default_purpose_hint is applied to the sandbox tool surface."""
@@ -2100,12 +2813,12 @@ def test_platform_mode_sandbox_applies_workspace_default_purpose_hint(
     async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
         return _sandbox_loop_completion()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.SandboxBackend", _FakeSandboxBackend)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2118,22 +2831,20 @@ def test_platform_mode_sandbox_applies_workspace_default_purpose_hint(
     assert _FakeSandboxBackend.last_purpose_hint == "workspace hint"
 
 
-def test_platform_mode_sandbox_uses_the_deployments_own_image_and_no_tool_allow_list(
+def test_platform_mode_sandbox_applies_the_workspace_tools_and_timeout(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
-    """Hybrid keeps its own arrangement for the two columns #740 added.
+    """The tool list and timeout are ceilings, as on a data plane with its own rows.
 
-    ``image`` still comes from this gateway's config, because a hybrid gateway
-    may be pointed at a sandbox of its own and the platform's resolve carries no
-    image. ``tools`` comes back on that resolve but is deliberately *not*
-    enforced here: the /v1/sandbox proxy re-enforces the allow-list, and
-    enforcing it twice would let this gateway refuse a tool the platform admits.
+    The image stays the deployment's, because the resolve carries no image.
     """
     monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
     monkeypatch.setenv("OTARI_SANDBOX_SESSION_IMAGE", "mzdotai/otari-sandbox-container:latest")
     _FakeSandboxBackend.last_image = None
-    _FakeSandboxBackend.last_allowed_tools = frozenset()
+    _FakeSandboxBackend.last_allowed_tools = None
+    _FakeSandboxBackend.last_timeout_s = None
 
     async def fake_post_platform(
         url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
@@ -2141,18 +2852,18 @@ def test_platform_mode_sandbox_uses_the_deployments_own_image_and_no_tool_allow_
         if url.endswith("/gateway/provider-keys/resolve"):
             return _single_attempt_resolve_response(request_id="sbx-image")
         if url.endswith("/gateway/code-execution/resolve"):
-            return httpx.Response(200, json={"enabled": True, "tools": ["code_execution"]})
+            return httpx.Response(200, json={"enabled": True, "tools": ["code_execution"], "exec_timeout_s": 7})
         return httpx.Response(204)
 
     async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
         return _sandbox_loop_completion()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.SandboxBackend", _FakeSandboxBackend)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2163,12 +2874,46 @@ def test_platform_mode_sandbox_uses_the_deployments_own_image_and_no_tool_allow_
 
     assert response.status_code == 200
     assert _FakeSandboxBackend.last_image == "mzdotai/otari-sandbox-container:latest"
-    assert _FakeSandboxBackend.last_allowed_tools is None
+    assert _FakeSandboxBackend.last_allowed_tools == frozenset({"code_execution"})
+    assert _FakeSandboxBackend.last_timeout_s == 7
+
+
+def test_platform_mode_sandbox_403_when_the_workspace_tools_leave_nothing_to_run(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return _single_attempt_resolve_response(request_id="sbx-no-tools")
+        if url.endswith("/gateway/code-execution/resolve"):
+            return httpx.Response(200, json={"enabled": True, "tools": ["bash_code_execution"]})
+        return httpx.Response(204)
+
+    control_plane_transport(fake_post_platform)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "otari_code_execution"}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 403
+    assert "excludes every tool kind" in response.json()["detail"]
 
 
 def test_platform_mode_streaming_sandbox_gets_the_same_image(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """The fallback-walking stream builds a backend of its own, so it needs its own case.
 
@@ -2192,7 +2937,7 @@ def test_platform_mode_streaming_sandbox_gets_the_same_image(
         if url.endswith("/gateway/provider-keys/resolve"):
             return _single_attempt_resolve_response(request_id="sbx-stream-image")
         if url.endswith("/gateway/code-execution/resolve"):
-            return httpx.Response(200, json={"enabled": True})
+            return httpx.Response(200, json={"enabled": True, "authorized_tools": ["web_search"]})
         return httpx.Response(204)
 
     async def fake_loop_acompletion(**kwargs: Any) -> Any:
@@ -2219,12 +2964,12 @@ def test_platform_mode_streaming_sandbox_gets_the_same_image(
 
         return _stream()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.SandboxBackend", _FakeSandboxBackend)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2241,6 +2986,7 @@ def test_platform_mode_streaming_sandbox_gets_the_same_image(
 def test_platform_mode_sandbox_per_request_hint_wins(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """A per-request purpose_hint overrides the workspace default."""
     monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
@@ -2258,12 +3004,12 @@ def test_platform_mode_sandbox_per_request_hint_wins(
     async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
         return _sandbox_loop_completion()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.SandboxBackend", _FakeSandboxBackend)
     monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2279,6 +3025,7 @@ def test_platform_mode_sandbox_per_request_hint_wins(
 def test_platform_mode_sandbox_applies_workspace_max_iterations_cap(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """The workspace's resolved code-exec max_iterations caps the tool loop.
     The request omits max_tool_iterations, so the workspace cap (2) binds over
@@ -2300,12 +3047,12 @@ def test_platform_mode_sandbox_applies_workspace_max_iterations_cap(
         captured["max_iterations"] = kwargs["max_iterations"]
         return _sandbox_loop_completion()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.SandboxBackend", _FakeSandboxBackend)
     monkeypatch.setattr("gateway.api.routes.chat.mcp_tool_loop", fake_mcp_tool_loop)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2318,19 +3065,22 @@ def test_platform_mode_sandbox_applies_workspace_max_iterations_cap(
     assert captured["max_iterations"] == 2
 
 
+@pytest.mark.parametrize("unavailable", [False, True])
 def test_platform_mode_sandbox_unreachable_returns_502(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    unavailable: bool,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """Hybrid non-streaming chat with the sandbox backend down surfaces the
     backend-specific 502, not a generic provider error or a 500. Regression
     for the drift where only messages/responses translated this failure: the
-    translation now lives in run_platform_non_stream, so /v1/chat/completions
+    translation now lives in run_platform_non_stream, so /api/v1/chat/completions
     inherits it."""
     monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
 
-    from gateway.api.routes._pipeline import SANDBOX_UNREACHABLE_DETAIL
-    from gateway.services.sandbox_backend import SandboxNotReachableError
+    from gateway.api.routes._pipeline import SANDBOX_UNAVAILABLE_DETAIL, SANDBOX_UNREACHABLE_DETAIL
+    from gateway.services.sandbox_backend import SandboxNotReachableError, SandboxUnavailableError
 
     usage_reports: list[dict[str, Any]] = []
 
@@ -2349,16 +3099,18 @@ def test_platform_mode_sandbox_unreachable_returns_502(
             pass
 
         async def __aenter__(self) -> "_DownSandboxBackend":
+            if unavailable:
+                raise SandboxUnavailableError("15")
             raise SandboxNotReachableError("failed to create sandbox session at http://sandbox:8080")
 
         async def __aexit__(self, *exc: object) -> None:
             return None
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
+    control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.SandboxBackend", _DownSandboxBackend)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2367,8 +3119,9 @@ def test_platform_mode_sandbox_unreachable_returns_502(
         headers={"Authorization": "Bearer user_test_token"},
     )
 
-    assert response.status_code == 502
-    assert response.json() == {"detail": SANDBOX_UNREACHABLE_DETAIL}
+    assert response.status_code == (503 if unavailable else 502)
+    assert response.headers.get("Retry-After") == ("15" if unavailable else None)
+    assert response.json() == {"detail": SANDBOX_UNAVAILABLE_DETAIL if unavailable else SANDBOX_UNREACHABLE_DETAIL}
     assert usage_reports == [
         {
             "correlation_id": "sbx-down",
@@ -2381,6 +3134,7 @@ def test_platform_mode_sandbox_unreachable_returns_502(
 def test_platform_mode_web_search_unreachable_returns_502(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
 ) -> None:
     """Hybrid non-streaming chat with the web-search backend down surfaces the
     backend-specific 502 (same regression as the sandbox variant)."""
@@ -2397,7 +3151,7 @@ def test_platform_mode_web_search_unreachable_returns_502(
         if url.endswith("/gateway/provider-keys/resolve"):
             return _single_attempt_resolve_response(request_id="ws-down")
         if url.endswith("/gateway/web-search/resolve"):
-            return httpx.Response(200, json={"enabled": True})
+            return httpx.Response(200, json={"enabled": True, "authorized_tools": ["web_search"]})
         usage_reports.append(body)
         return httpx.Response(204)
 
@@ -2411,11 +3165,11 @@ def test_platform_mode_web_search_unreachable_returns_502(
     def fake_build_web_search_backend(**kwargs: Any) -> _DownWebSearchBackend:
         return _DownWebSearchBackend()
 
-    monkeypatch.setattr("gateway.api.routes._platform._post_platform", fake_post_platform)
-    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_search_backend", fake_build_web_search_backend)
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_retrieval_backend", fake_build_web_search_backend)
 
     response = platform_client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={
             "model": "anything",
             "messages": [{"role": "user", "content": "hi"}],

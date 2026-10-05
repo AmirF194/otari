@@ -1,11 +1,11 @@
 import { Button } from "@heroui/react"
 import { useState } from "react"
+import { ErrorBanner } from "@/design-system/feedback/ErrorBanner"
+import { Dot } from "@/design-system/indicators/Dot"
+import { Meter } from "@/design-system/metrics/Meter"
 import { UserComboBox } from "@/features/users/UserComboBox"
 import { useRouterStatus } from "@/shared/api/routing"
 import { useUsers } from "@/shared/api/users"
-import { ErrorBanner } from "@/shared/components/feedback/ErrorBanner"
-import { Dot } from "@/shared/components/indicators/Dot"
-import { Meter } from "@/shared/components/metrics/Meter"
 
 /** Records against the seed count, as a bar plus the plain numbers.
  *
@@ -15,11 +15,11 @@ import { Meter } from "@/shared/components/metrics/Meter"
 function Warmth({
   records,
   seed,
-  warm,
+  isWarm,
 }: {
   records: number
   seed: number
-  warm: boolean
+  isWarm: boolean
 }) {
   const pct =
     seed === 0 ? 100 : Math.min(100, Math.round((records / seed) * 100))
@@ -39,11 +39,11 @@ function Warmth({
       </span>
       <span
         className={`flex items-center gap-2 text-mono-caption ${
-          warm ? "text-foreground" : "text-subtle"
+          isWarm ? "text-foreground" : "text-subtle"
         }`}
       >
-        <Dot className={warm ? "bg-accent" : "bg-text-subtle"} />
-        {warm ? "ROUTING" : "WARMING UP"}
+        <Dot className={isWarm ? "bg-accent" : "bg-text-subtle"} />
+        {isWarm ? "ROUTING" : "WARMING UP"}
       </span>
     </div>
   )
@@ -79,9 +79,11 @@ export function RouterReadiness({
   onClose: () => void
 }) {
   const users = useUsers()
-  const [userId, setUserId] = useState<string | null>(scopedUserId)
+  // Empty rather than absent: the picker reports an empty string when it is
+  // cleared, so "nobody chosen" already has a value of its own here.
+  const [userId, setUserId] = useState(scopedUserId ?? "")
   const status = useRouterStatus(userId)
-  const chosen = userId !== null && userId !== ""
+  const isChosen = userId !== ""
 
   return (
     <div>
@@ -113,7 +115,7 @@ export function RouterReadiness({
           {scopedUserId === null ? (
             <UserComboBox
               label="Whose memory"
-              value={userId ?? ""}
+              value={userId}
               onChange={setUserId}
               users={users.data ?? []}
               placeholder="Pick a user…"
@@ -133,7 +135,7 @@ export function RouterReadiness({
 
           <ErrorBanner error={status.error} />
 
-          {!chosen ? (
+          {!isChosen ? (
             <span className="text-sm text-muted">
               Pick a user to see how warm this policy&apos;s memory is.
             </span>
@@ -146,7 +148,7 @@ export function RouterReadiness({
                 <Warmth
                   records={status.data.default_pool.records}
                   seed={status.data.seed_count}
-                  warm={status.data.default_pool.warm}
+                  isWarm={status.data.default_pool.warm}
                 />
               </div>
               {status.data.tasks.map((pool) => (
@@ -158,7 +160,7 @@ export function RouterReadiness({
                   <Warmth
                     records={pool.records}
                     seed={status.data.seed_count}
-                    warm={pool.warm}
+                    isWarm={pool.warm}
                   />
                 </div>
               ))}
@@ -187,7 +189,7 @@ export function RouterReadiness({
           <span className="text-caption">Adding examples</span>
           <span className="text-caption">
             Examples are recorded over the API, with{" "}
-            <code>POST /v1/routing/preferences/rank</code>. Score a batch of
+            <code>POST /api/v1/routing/preferences/rank</code>. Score a batch of
             prompts from 0 (bad) to 1 (great) per candidate; two good answers is
             the case that lets the cheaper model win. See{" "}
             <a

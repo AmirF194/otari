@@ -3,21 +3,21 @@
 A policy that names ``router: knn`` decides nothing until someone has told the
 gateway which candidate is good enough for which kind of prompt. Two routes:
 
-* ``POST /v1/routing/preferences/rank`` records the quality each candidate earned
+* ``POST /api/v1/routing/preferences/rank`` records the quality each candidate earned
   on a prompt, writing the routing-memory records the router later votes over. It
   takes a batch, because a pool needs ``router_seed_count`` examples (20 by
   default) before it routes at all, and twenty round trips is not a workflow.
-* ``GET /v1/routing/status`` reports how warm each pool is, so an operator can see
+* ``GET /api/v1/routing/status`` reports how warm each pool is, so an operator can see
   when the router will start routing and which policies depend on it.
 
 There is deliberately no endpoint that fans a prompt out to the candidates for
-you. Seeing what each candidate answers is what ``POST /v1/chat/completions``
+you. Seeing what each candidate answers is what ``POST /api/v1/chat/completions``
 already does, one call per candidate, and going through that path means the calls
 are budget-checked and land in the usage log like all other provider spend. A
 convenience endpoint that skipped both would be the only unmetered way to spend
 money through this gateway.
 
-Operator-gated, like ``/v1/routing/policies``, with ``user_id`` naming whose
+Operator-gated, like ``/api/v1/routing/policies``, with ``user_id`` naming whose
 memory is being taught rather than taking it from the calling key: which model
 serves a caller is an operator decision, exactly as a policy's targets are.
 
@@ -52,7 +52,7 @@ from gateway.api.deps import get_config, get_db, require_deployment_operator
 from gateway.api.routes._helpers import resolve_managed_workspace_id
 from gateway.core.config import GatewayConfig
 from gateway.log_config import logger
-from gateway.models.entities import RouterPreference, RoutingMemory
+from gateway.models.routing import RouterPreference, RoutingMemory
 from gateway.repositories.users_repository import get_active_user
 from gateway.services.policy_store import effective_policies
 from gateway.services.provider_kwargs import resolve_provider_selector
@@ -60,7 +60,7 @@ from gateway.services.routing import KNN_BACKEND, backend_pool_is_teachable, get
 from gateway.services.routing.knn import KnnRoutingMemory
 
 router = APIRouter(
-    prefix="/v1/routing",
+    prefix="/routing",
     tags=["routing"],
     dependencies=[Depends(require_deployment_operator)],
 )
@@ -102,6 +102,7 @@ class ScoredExample(BaseModel):
             return None
         trimmed = value.strip()
         return trimmed or None
+
     scores: dict[str, Annotated[float, Field(ge=0.0, le=1.0)]] = Field(
         min_length=1,
         description=(
@@ -300,9 +301,7 @@ def _validated_scores(
             normalized[selector] = canonical
     if rejected:
         expected = (
-            f" Candidates this user's learned policies can use: {', '.join(sorted(known.values()))}."
-            if known
-            else ""
+            f" Candidates this user's learned policies can use: {', '.join(sorted(known.values()))}." if known else ""
         )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -332,9 +331,7 @@ def _validated_scores(
     return normalized
 
 
-def _learned_policies(
-    config: GatewayConfig, user_id: str | None, workspace_id: uuid.UUID
-) -> list[LearnedPolicy]:
+def _learned_policies(config: GatewayConfig, user_id: str | None, workspace_id: uuid.UUID) -> list[LearnedPolicy]:
     policies: list[LearnedPolicy] = []
     for name, spec in effective_policies(config, user_id, workspace_id=workspace_id).items():
         backend = spec.router_backend
@@ -415,9 +412,7 @@ async def rank_candidates(
         await db.commit()
     except SQLAlchemyError:
         await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error"
-        ) from None
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error") from None
     normalized = _validated_scores(config, request.user_id, request.examples, workspace_id)
 
     recorded = 0
@@ -435,9 +430,7 @@ async def rank_candidates(
             )
         except SQLAlchemyError as exc:
             logger.warning("Router example write failed after %d example(s)", recorded)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error"
-            ) from exc
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error") from exc
         except Exception as exc:
             # Broad on purpose, and matching the read path: `knn.rank` catches bare
             # `Exception` around the same call because an embedding provider can fail
@@ -445,9 +438,7 @@ async def rank_candidates(
             # default target; the write path has nothing safe to do, so it says what
             # broke. Earlier examples in the batch are already committed, which the
             # message states rather than pretending the call was atomic.
-            logger.warning(
-                "Router example embedding failed after %d example(s): %s", recorded, type(exc).__name__
-            )
+            logger.warning("Router example embedding failed after %d example(s): %s", recorded, type(exc).__name__)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=(
@@ -474,9 +465,7 @@ async def rank_candidates(
             await db.commit()
         except SQLAlchemyError:
             await db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error"
-            ) from None
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error") from None
 
     # Warmth of every pool this batch wrote into: each named partition, plus the
     # default pool when any example carried no task label.
@@ -527,9 +516,7 @@ async def routing_memory_status(
         k=backend.k,
         confidence_floor=backend.confidence_floor,
         default_pool=PoolStatus(records=total, warm=total >= seed),
-        tasks=[
-            TaskPool(task_id=task_id, records=count, warm=count >= seed) for task_id, count in per_task
-        ],
+        tasks=[TaskPool(task_id=task_id, records=count, warm=count >= seed) for task_id, count in per_task],
         policies=_learned_policies(config, user_id, target_workspace_id),
     )
 

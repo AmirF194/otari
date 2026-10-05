@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import type {
+  CallerIdentity,
+  OrganizationContext,
   Passkey,
   PasskeysResponse,
   PasswordResponse,
@@ -11,12 +13,14 @@ import type {
   SetPasswordRequest,
   SignupRequest,
   SignupResponse,
+  UpdateProfileRequest,
   VerifyEmailResponse,
 } from "@/client"
 import { apiFetch } from "@/shared/api/client"
 import {
   NO_RETRY,
   ORGANIZATION_MEMBERS,
+  ORGANIZATIONS,
   PASSKEYS,
 } from "@/shared/api/queryKeys"
 import { createPasskey } from "@/shared/helpers/webauthn"
@@ -24,7 +28,7 @@ import { createPasskey } from "@/shared/helpers/webauthn"
 export function useRotateMasterKey() {
   return useMutation({
     mutationFn: () =>
-      apiFetch<RotateMasterKeyResponse>("/v1/settings/master-key/rotate", {
+      apiFetch<RotateMasterKeyResponse>("/settings/master-key/rotate", {
         method: "POST",
       }),
   })
@@ -39,13 +43,20 @@ export function useRotateMasterKey() {
  * first call on a deployment supplies an address as well, which is the act that
  * claims it and retires master-key sign-in (otari-ai#1716).
  *
- * Two things this changes are cached elsewhere, and they are cached
+ * Three things this changes are cached elsewhere, and they are cached
  * differently. The bootstrap's `sign_in_methods` is a context read once per
  * load rather than a query, so no invalidation could reach it: the caller
  * reports the claim through `useRetireMasterKeySignIn` instead. The roster is
  * an ordinary query, and a claim writes `user.email` from null to the address,
  * so the Members page would otherwise show the row it fetched before the claim
  * for the rest of its `staleTime`. That one is invalidated here.
+ *
+ * The third is the membership context's `caller`, which carries the two facts
+ * the account page builds its form from: the address, and `has_password`. Both
+ * move on this call and the account page has to see them move, or the card that
+ * just set a first password goes on offering to set one. Seeded from the
+ * response before being invalidated, for the reason `useUpdateProfile` does the
+ * same: the page settles on the same tick rather than a round trip later.
  *
  * Every *other* session this identity holds is revoked server-side; this one is
  * kept, so no 401 follows.
@@ -54,11 +65,65 @@ export function useSetPassword() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (body: SetPasswordRequest) =>
-      apiFetch<PasswordResponse>("/v1/auth/password", {
+      apiFetch<PasswordResponse>("/auth/password", {
         method: "PUT",
         body: JSON.stringify(body),
       }),
-    onSuccess: () => {
+    onSuccess: (result) => {
+      queryClient.setQueryData<OrganizationContext>(
+        [ORGANIZATIONS, "context"],
+        (previous) =>
+          previous?.caller
+            ? {
+                ...previous,
+                caller: {
+                  ...previous.caller,
+                  email: result.email,
+                  has_password: true,
+                  claims_deployment: false,
+                },
+              }
+            : previous,
+      )
+      void queryClient.invalidateQueries({
+        queryKey: [ORGANIZATIONS, "context"],
+      })
+      void queryClient.invalidateQueries({ queryKey: [ORGANIZATION_MEMBERS] })
+    },
+  })
+}
+
+/**
+ * Change the name the signed-in identity goes by (`PATCH /v1/auth/profile`).
+ *
+ * Always the caller's own identity: the endpoint takes no id. `null` clears the
+ * name, which is the state a roster entry added by address starts in, and every
+ * surface that draws a person falls back to the address from there.
+ *
+ * Two caches carry that name. The membership context is where the sidebar reads
+ * it, and the response is exactly the `caller` it holds, so that one is seeded
+ * from the answer before being invalidated: the account control renames itself
+ * on the same tick rather than a round trip later. The roster is the other, where
+ * `userDisplay` resolves a user id for Usage, Activity and Budgets. The context
+ * is touched at its own key rather than at `[ORGANIZATIONS]`, which would re-read
+ * the memberships list as well and nothing here moves it.
+ */
+export function useUpdateProfile() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (body: UpdateProfileRequest) =>
+      apiFetch<CallerIdentity>("/auth/profile", {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (caller) => {
+      queryClient.setQueryData<OrganizationContext>(
+        [ORGANIZATIONS, "context"],
+        (previous) => (previous ? { ...previous, caller } : previous),
+      )
+      void queryClient.invalidateQueries({
+        queryKey: [ORGANIZATIONS, "context"],
+      })
       void queryClient.invalidateQueries({ queryKey: [ORGANIZATION_MEMBERS] })
     },
   })
@@ -77,7 +142,7 @@ export function useSetPassword() {
 export function usePasskeys() {
   return useQuery({
     queryKey: [PASSKEYS],
-    queryFn: () => apiFetch<PasskeysResponse>("/v1/auth/webauthn/credentials"),
+    queryFn: () => apiFetch<PasskeysResponse>("/auth/webauthn/credentials"),
     staleTime: 60_000,
     ...NO_RETRY,
   })
@@ -107,13 +172,13 @@ export function useRegisterPasskey() {
   return useMutation({
     mutationFn: async (name: string | undefined) => {
       const options = await apiFetch<Record<string, unknown>>(
-        "/v1/auth/webauthn/register/options",
+        "/auth/webauthn/register/options",
         { method: "POST" },
       )
       const credential = await createPasskey(
         options as Parameters<typeof createPasskey>[0],
       )
-      return apiFetch<Passkey>("/v1/auth/webauthn/register", {
+      return apiFetch<Passkey>("/auth/webauthn/register", {
         method: "POST",
         body: JSON.stringify({ credential, name }),
       })
@@ -129,7 +194,7 @@ export function useRenamePasskey() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ id, name }: { id: string; name: string }) =>
-      apiFetch<Passkey>(`/v1/auth/webauthn/credentials/${id}`, {
+      apiFetch<Passkey>(`/auth/webauthn/credentials/${id}`, {
         method: "PATCH",
         body: JSON.stringify({ name } satisfies RenamePasskeyRequest),
       }),
@@ -144,7 +209,7 @@ export function useDeletePasskey() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) =>
-      apiFetch<void>(`/v1/auth/webauthn/credentials/${id}`, {
+      apiFetch<void>(`/auth/webauthn/credentials/${id}`, {
         method: "DELETE",
       }),
     onSuccess: () => {
@@ -165,7 +230,7 @@ export function useDeletePasskey() {
 export function useSignup() {
   return useMutation({
     mutationFn: (body: SignupRequest) =>
-      apiFetch<SignupResponse>("/v1/auth/signup", {
+      apiFetch<SignupResponse>("/auth/signup", {
         method: "POST",
         body: JSON.stringify(body),
       }),
@@ -199,7 +264,7 @@ export function useVerifyEmail(token: string) {
   return useQuery({
     queryKey: ["verify-email", token],
     queryFn: () =>
-      apiFetch<VerifyEmailResponse>("/v1/auth/verify-email", {
+      apiFetch<VerifyEmailResponse>("/auth/verify-email", {
         method: "POST",
         body: JSON.stringify({ token }),
       }),
@@ -218,7 +283,7 @@ export function useVerifyEmail(token: string) {
 export function useResendVerification() {
   return useMutation({
     mutationFn: (email: string) =>
-      apiFetch<ResendVerificationResponse>("/v1/auth/resend-verification", {
+      apiFetch<ResendVerificationResponse>("/auth/resend-verification", {
         method: "POST",
         body: JSON.stringify({ email }),
       }),
@@ -228,7 +293,7 @@ export function useResendVerification() {
 export function useRequestPasswordReset() {
   return useMutation({
     mutationFn: (email: string) =>
-      apiFetch<RequestPasswordResetResponse>("/v1/auth/password/reset", {
+      apiFetch<RequestPasswordResetResponse>("/auth/password/reset", {
         method: "POST",
         body: JSON.stringify({ email }),
       }),
@@ -240,7 +305,7 @@ export function useRequestPasswordReset() {
 export function useResetPassword() {
   return useMutation({
     mutationFn: (body: ResetPasswordRequest) =>
-      apiFetch<void>("/v1/auth/password/reset/confirm", {
+      apiFetch<void>("/auth/password/reset/confirm", {
         method: "POST",
         body: JSON.stringify(body),
       }),

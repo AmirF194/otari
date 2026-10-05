@@ -7,12 +7,14 @@ import {
 import type {
   CreateWorkspaceBudgetDefaultRequest,
   CreateWorkspaceRequest,
+  SetWorkspaceProviderKeyOverrideRequest,
   UpdateWorkspaceBudgetDefaultRequest,
   UpdateWorkspaceRequest,
   Workspace,
   WorkspaceBudgetDefault,
   WorkspaceMember,
   WorkspaceMemberRole,
+  WorkspaceProviderKeyOverride,
 } from "@/client"
 import { apiFetch } from "@/shared/api/client"
 import { fetchAllPaged } from "@/shared/api/paging"
@@ -21,7 +23,7 @@ import { ORGANIZATIONS, WORKSPACES } from "@/shared/api/queryKeys"
 export function useWorkspaces(enabled = true) {
   return useQuery({
     queryKey: [WORKSPACES],
-    queryFn: () => fetchAllPaged<Workspace>("/v1/workspaces"),
+    queryFn: () => fetchAllPaged<Workspace>("/workspaces"),
     staleTime: 60_000,
     enabled,
   })
@@ -34,7 +36,7 @@ export function useWorkspaceMembers(workspaceId: string | null) {
     queryKey: [WORKSPACES, workspaceId, "members"],
     queryFn: () =>
       fetchAllPaged<WorkspaceMember>(
-        `/v1/workspaces/${encodeURIComponent(workspaceId as string)}/members`,
+        `/workspaces/${encodeURIComponent(workspaceId as string)}/members`,
       ),
     enabled: workspaceId !== null,
     staleTime: 60_000,
@@ -45,7 +47,7 @@ export function useCreateWorkspace() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (body: CreateWorkspaceRequest) =>
-      apiFetch<Workspace>("/v1/workspaces", {
+      apiFetch<Workspace>("/workspaces", {
         method: "POST",
         body: JSON.stringify(body),
       }),
@@ -63,7 +65,7 @@ export function useUpdateWorkspace() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ id, body }: { id: string; body: UpdateWorkspaceRequest }) =>
-      apiFetch<Workspace>(`/v1/workspaces/${encodeURIComponent(id)}`, {
+      apiFetch<Workspace>(`/workspaces/${encodeURIComponent(id)}`, {
         method: "PATCH",
         body: JSON.stringify(body),
       }),
@@ -81,7 +83,7 @@ export function useDeleteWorkspace() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) =>
-      apiFetch<void>(`/v1/workspaces/${encodeURIComponent(id)}`, {
+      apiFetch<void>(`/workspaces/${encodeURIComponent(id)}`, {
         method: "DELETE",
       }),
     onSuccess: () => {
@@ -109,7 +111,7 @@ export function useAddWorkspaceMember() {
       // The role travels as a query parameter, not a body: that is the wire
       // contract these endpoints were rehomed with.
       apiFetch<WorkspaceMember>(
-        `/v1/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}?role=${encodeURIComponent(role)}`,
+        `/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}?role=${encodeURIComponent(role)}`,
         { method: "POST" },
       ),
     onSuccess: () => {
@@ -135,7 +137,7 @@ export function useUpdateWorkspaceMemberRole() {
       role: WorkspaceMemberRole
     }) =>
       apiFetch<WorkspaceMember>(
-        `/v1/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}?role=${encodeURIComponent(role)}`,
+        `/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}?role=${encodeURIComponent(role)}`,
         { method: "PATCH" },
       ),
     onSuccess: () => {
@@ -155,7 +157,7 @@ export function useWorkspaceBudgetDefaults(workspaceId: string | null) {
     queryKey: [WORKSPACES, workspaceId, "budget-defaults"],
     queryFn: () =>
       fetchAllPaged<WorkspaceBudgetDefault>(
-        `/v1/workspaces/${encodeURIComponent(workspaceId as string)}/member-budget-policies`,
+        `/workspaces/${encodeURIComponent(workspaceId as string)}/member-budget-policies`,
       ),
     enabled: workspaceId !== null,
     staleTime: 60_000,
@@ -163,46 +165,10 @@ export function useWorkspaceBudgetDefaults(workspaceId: string | null) {
 }
 
 /**
- * Every workspace's roster, as one list, each row paired with its workspace.
- *
- * Same fan-out as `useAllWorkspaceBudgetDefaults` and for the same reason: a
- * roster is only served per workspace, and a standalone deployment has few. It
- * is what lets the organization roster answer "which workspaces is this person
- * in", which is otherwise only answerable one workspace at a time.
- */
-export function useAllWorkspaceMembers(workspaceIds: string[]) {
-  return useQueries({
-    queries: workspaceIds.map((workspaceId) => ({
-      queryKey: [WORKSPACES, workspaceId, "members"],
-      queryFn: () =>
-        fetchAllPaged<WorkspaceMember>(
-          `/v1/workspaces/${encodeURIComponent(workspaceId)}/members`,
-        ),
-      staleTime: 60_000,
-    })),
-    combine: (results) => ({
-      data: results.flatMap((result, index) =>
-        (result.data ?? []).map((row) => ({
-          workspaceId: workspaceIds[index],
-          member: row,
-        })),
-      ),
-      isLoading: results.some((result) => result.isLoading),
-      // The first failure, surfaced rather than swallowed: a rejected read
-      // contributes nothing to `data`, so without this the caller cannot tell a
-      // workspace with no rows from one whose read failed, and a lost membership
-      // or a lost ceiling looks exactly like a deliberate absence.
-      error: results.find((result) => result.error)?.error ?? null,
-      isSuccess: results.every((result) => result.isSuccess),
-    }),
-  })
-}
-
-/**
  * Every workspace's budget defaults, as one list.
  *
  * A fan-out rather than one call: defaults are only served per workspace
- * (`/v1/workspaces/{id}/member-budget-policies`), and a standalone deployment
+ * (`/workspaces/{id}/member-budget-policies`), and a standalone deployment
  * has few workspaces, so N small cached reads beat adding a route. Each shares
  * the cache entry `useWorkspaceBudgetDefaults` uses, so opening a workspace
  * afterwards costs nothing.
@@ -216,7 +182,7 @@ export function useAllWorkspaceBudgetDefaults(workspaceIds: string[]) {
       queryKey: [WORKSPACES, workspaceId, "budget-defaults"],
       queryFn: () =>
         fetchAllPaged<WorkspaceBudgetDefault>(
-          `/v1/workspaces/${encodeURIComponent(workspaceId)}/member-budget-policies`,
+          `/workspaces/${encodeURIComponent(workspaceId)}/member-budget-policies`,
         ),
       staleTime: 60_000,
     })),
@@ -251,7 +217,7 @@ export function useCreateWorkspaceBudgetDefault() {
       body: CreateWorkspaceBudgetDefaultRequest
     }) =>
       apiFetch<WorkspaceBudgetDefault>(
-        `/v1/workspaces/${encodeURIComponent(workspaceId)}/member-budget-policies`,
+        `/workspaces/${encodeURIComponent(workspaceId)}/member-budget-policies`,
         { method: "POST", body: JSON.stringify(body) },
       ),
     onSuccess: (_data, { workspaceId }) => {
@@ -275,7 +241,7 @@ export function useUpdateWorkspaceBudgetDefault() {
       body: UpdateWorkspaceBudgetDefaultRequest
     }) =>
       apiFetch<WorkspaceBudgetDefault>(
-        `/v1/workspaces/${encodeURIComponent(workspaceId)}/member-budget-policies/${encodeURIComponent(defaultId)}`,
+        `/workspaces/${encodeURIComponent(workspaceId)}/member-budget-policies/${encodeURIComponent(defaultId)}`,
         { method: "PATCH", body: JSON.stringify(body) },
       ),
     onSuccess: (_data, { workspaceId }) => {
@@ -297,7 +263,7 @@ export function useDeleteWorkspaceBudgetDefault() {
       defaultId: string
     }) =>
       apiFetch<void>(
-        `/v1/workspaces/${encodeURIComponent(workspaceId)}/member-budget-policies/${encodeURIComponent(defaultId)}`,
+        `/workspaces/${encodeURIComponent(workspaceId)}/member-budget-policies/${encodeURIComponent(defaultId)}`,
         { method: "DELETE" },
       ),
     onSuccess: (_data, { workspaceId }) => {
@@ -305,6 +271,176 @@ export function useDeleteWorkspaceBudgetDefault() {
         queryKey: [WORKSPACES, workspaceId, "budget-defaults"],
       })
     },
+  })
+}
+
+/**
+ * One workspace's view of its organization's provider keys.
+ *
+ * Every non-archived organization key, each carrying this workspace's departure
+ * from it: `is_default`/`disabled` are the stored flags, `is_effective_*` the
+ * resolution once the provider's other keys are taken into account, and
+ * `allowed_models` the narrowing, where empty means every model the key serves
+ * rather than none of them. The response names keys by id only, so the caller
+ * pairs it with `useOrgProviderKeys` for the provider and the name.
+ *
+ * Not paged: the route serves the whole set in one body, because it is bounded by
+ * the organization's key count rather than by anything a workspace accumulates.
+ */
+export function useWorkspaceProviderKeys(workspaceId: string | null) {
+  return useQuery({
+    queryKey: [WORKSPACES, workspaceId, "provider-keys"],
+    queryFn: async () =>
+      (
+        await apiFetch<{ data: WorkspaceProviderKeyOverride[] }>(
+          `/workspaces/${encodeURIComponent(workspaceId as string)}/provider-keys`,
+        )
+      ).data,
+    enabled: workspaceId !== null,
+    staleTime: 60_000,
+  })
+}
+
+/**
+ * Every workspace's view of its organization's provider keys, as one map.
+ *
+ * A fan-out for the reason `useAllWorkspaceBudgetDefaults` is: the view is only
+ * served per workspace, and a deployment has few of them, so N small cached
+ * reads beat adding a route. Each shares the cache entry
+ * `useWorkspaceProviderKeys` uses, so opening a workspace afterwards costs
+ * nothing.
+ *
+ * This is what lets the workspaces list say a workspace departs from what its
+ * organization holds without the operator opening each one in turn (#2106).
+ */
+export function useAllWorkspaceProviderKeys(workspaceIds: string[]) {
+  return useQueries({
+    queries: workspaceIds.map((workspaceId) => ({
+      queryKey: [WORKSPACES, workspaceId, "provider-keys"],
+      queryFn: async () =>
+        (
+          await apiFetch<{ data: WorkspaceProviderKeyOverride[] }>(
+            `/workspaces/${encodeURIComponent(workspaceId)}/provider-keys`,
+          )
+        ).data,
+      staleTime: 60_000,
+    })),
+    combine: (results) => ({
+      // Keyed by workspace, and only for a read that answered: a workspace whose
+      // read failed is absent rather than empty, because an empty list is the
+      // answer "this organization holds no keys" and a caller must not show a
+      // refusal as one.
+      data: new Map(
+        results.flatMap((result, index) =>
+          result.data === undefined
+            ? []
+            : [[workspaceIds[index], result.data] as const],
+        ),
+      ),
+      isLoading: results.some((result) => result.isLoading),
+      // The first failure, surfaced rather than swallowed, as the fan-outs
+      // above do.
+      error: results.find((result) => result.error)?.error ?? null,
+    }),
+  })
+}
+
+// Pinning a key clears whichever of the provider's other keys this workspace had
+// pinned, and disabling one deletes its model allow-list server-side, so every
+// write here re-reads the workspace's whole provider-key subtree rather than
+// patching the row it acted on.
+function invalidateWorkspaceProviderKeys(
+  queryClient: ReturnType<typeof useQueryClient>,
+  workspaceId: string,
+): void {
+  void queryClient.invalidateQueries({
+    queryKey: [WORKSPACES, workspaceId, "provider-keys"],
+  })
+}
+
+export function useSetWorkspaceProviderKeyOverride() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      workspaceId,
+      keyId,
+      body,
+    }: {
+      workspaceId: string
+      keyId: string
+      body: SetWorkspaceProviderKeyOverrideRequest
+    }) =>
+      apiFetch<WorkspaceProviderKeyOverride>(
+        `/workspaces/${encodeURIComponent(workspaceId)}/provider-keys/${encodeURIComponent(keyId)}`,
+        { method: "PATCH", body: JSON.stringify(body) },
+      ),
+    onSuccess: (_data, { workspaceId }) =>
+      invalidateWorkspaceProviderKeys(queryClient, workspaceId),
+  })
+}
+
+/** Drop the override entirely, so the workspace inherits the organization again. */
+export function useResetWorkspaceProviderKeyOverride() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      workspaceId,
+      keyId,
+    }: {
+      workspaceId: string
+      keyId: string
+    }) =>
+      apiFetch<{ message: string }>(
+        `/workspaces/${encodeURIComponent(workspaceId)}/provider-keys/${encodeURIComponent(keyId)}`,
+        { method: "DELETE" },
+      ),
+    onSuccess: (_data, { workspaceId }) =>
+      invalidateWorkspaceProviderKeys(queryClient, workspaceId),
+  })
+}
+
+export function useAddWorkspaceProviderKeyModel() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      workspaceId,
+      keyId,
+      model,
+    }: {
+      workspaceId: string
+      keyId: string
+      model: string
+    }) =>
+      apiFetch<{ message: string }>(
+        `/workspaces/${encodeURIComponent(workspaceId)}/provider-keys/${encodeURIComponent(keyId)}/models`,
+        { method: "POST", body: JSON.stringify({ model }) },
+      ),
+    onSuccess: (_data, { workspaceId }) =>
+      invalidateWorkspaceProviderKeys(queryClient, workspaceId),
+  })
+}
+
+export function useRemoveWorkspaceProviderKeyModel() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      workspaceId,
+      keyId,
+      model,
+    }: {
+      workspaceId: string
+      keyId: string
+      model: string
+    }) =>
+      apiFetch<{ message: string }>(
+        // The model id is the last path segment and the route declares it
+        // `:path`, so a provider that spells one with a slash still addresses
+        // its own row: the escape survives the match and the gateway unquotes it.
+        `/workspaces/${encodeURIComponent(workspaceId)}/provider-keys/${encodeURIComponent(keyId)}/models/${encodeURIComponent(model)}`,
+        { method: "DELETE" },
+      ),
+    onSuccess: (_data, { workspaceId }) =>
+      invalidateWorkspaceProviderKeys(queryClient, workspaceId),
   })
 }
 
@@ -324,7 +460,7 @@ export function useRemoveWorkspaceMember() {
       userId: string
     }) =>
       apiFetch<void>(
-        `/v1/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`,
+        `/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`,
         { method: "DELETE" },
       ),
     onSuccess: () => {

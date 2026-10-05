@@ -1,9 +1,11 @@
+import json
 import math
 import uuid
 from collections.abc import AsyncIterator, Callable
+from functools import partial
 from typing import Annotated, Any, Literal
 
-from any_llm import LLMProvider, amessages
+from any_llm import AnyLLM, amessages
 from any_llm.types.completion import CompletionUsage
 from any_llm.types.messages import (
     MessageDeltaEvent,
@@ -13,27 +15,42 @@ from any_llm.types.messages import (
     MessageStreamEvent,
 )
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.api.deps import (
     ModelProviderPortDep,
+    OptionalFileServiceDep,
+    ToolPortsDep,
+    build_sandbox_container_registry,
+    build_sandbox_file_bridge,
+    extract_credential_token,
     get_config,
     get_db_if_needed,
     get_log_writer,
+    get_unit_of_work_if_needed,
     verify_api_key_or_master_key,
 )
 from gateway.api.routes._helpers import latest_user_text, routing_signal_from_messages
-from gateway.api.routes._normalize import normalize_request_messages
+from gateway.api.routes._idempotency import IdempotencyGuardDep, IdempotentReplay
+from gateway.api.routes._normalize import (
+    container_copies_step,
+    normalize_request_messages,
+    provider_container_requested,
+    sandbox_requested,
+)
 from gateway.api.routes._pipeline import (
     DB_UNAVAILABLE_DETAIL,
     NO_RESOLVABLE_PROVIDER_DETAIL,
+    DeclaredTools,
     ErrorKind,
-    RequestContext,
+    ToolBackends,
     classify_provider_error,
     default_attempt_kwargs,
+    domain_error,
+    error_kind_for_status,
     prepare_gateway_tools,
+    provider_error_headers,
     raise_all_streaming_attempts_failed,
     release_reservation,
     resolve_dispatch_provider,
@@ -47,16 +64,22 @@ from gateway.api.routes._pipeline import (
 from gateway.api.routes._platform import (
     ResolvedAttempt,
     SettledCost,
-    _extract_platform_user_token,
     _resolve_platform_credentials,
+    upstream_exception_chain,
+    upstream_exception_shape,
 )
 from gateway.api.routes._schema_derive import SESSION_LABEL_DESC, SESSION_LABEL_MAX_LENGTH, derive_request_base
-from gateway.api.routes._tools import _strip_gateway_fields
+from gateway.api.routes._tools import CODE_EXECUTION_HEADER, WEB_SEARCH_HEADER, _strip_gateway_fields
 from gateway.core.config import GatewayConfig
+from gateway.core.unit_of_work import UnitOfWork
 from gateway.core.usage import GatewayUsage
+from gateway.exceptions.files_exceptions import ProviderUploadFailedError
+from gateway.exceptions.tools_exceptions import ContainerOnManagedCredentialError
 from gateway.log_config import logger
 from gateway.models.guardrails import GuardrailConfig
 from gateway.models.mcp import MAX_MCP_SERVER_IDS, McpServerConfig
+from gateway.services.code_execution import ContainerLease, check_container_on_credential
+from gateway.services.files import StagedFile
 from gateway.services.log_writer import LogWriter
 from gateway.services.mcp_loop import ToolBackend
 from gateway.services.mcp_loop_messages import (
@@ -66,11 +89,18 @@ from gateway.services.mcp_loop_messages import (
     anthropic_tool_loop,
     anthropic_tool_loop_stream,
 )
+from gateway.services.provider_kwargs import ProviderAccounts
+from gateway.services.sandbox_backend import CODE_EXECUTION_TOOL_NAME
 from gateway.services.tool_format import inject_purpose_hints_anthropic, openai_to_anthropic_tools
+from gateway.services.tools import SERVER_TOOL_USE_ID_PREFIX, Dialect, ToolUseBudget
 from gateway.streaming import ANTHROPIC_STREAM_FORMAT, StreamFormat
 from gateway.types.attempt import Attempt
+from gateway.types.normalization_target import NormalizationTarget
 
-router = APIRouter(prefix="/v1", tags=["messages"])
+router = APIRouter(tags=["messages"])
+
+# See chat.USAGE_ENDPOINT.
+USAGE_ENDPOINT = "/v1/messages"
 
 
 def _merge_anthropic_betas(body_betas: list[str] | None, raw_request: Request) -> list[str] | None:
@@ -81,19 +111,64 @@ def _merge_anthropic_betas(body_betas: list[str] | None, raw_request: Request) -
     return list(dict.fromkeys(betas)) or None
 
 
-def _split_mcp_client_beta(kwargs: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    """Consume the client capability without forwarding it to the model provider."""
+def _serves_messages_natively(dispatch_model: Any) -> bool:
+    """Whether the dispatched provider has an Anthropic Messages API of its own.
+
+    The same question any-llm asks before refusing ``betas``, asked the same
+    way: a provider that serves Messages natively overrides ``_amessages``,
+    while a bridged one inherits the base implementation that converts
+    Messages to Completions (and refuses what cannot survive the conversion).
+    ``SUPPORTS_MESSAGES`` does not answer it, being true for every provider the
+    bridge covers.
+
+    An unknown or unparseable selector answers yes, so nothing is stripped on a
+    guess; any-llm then refuses the beta itself, as it did before.
+
+    This reads a private any-llm attribute, which nothing public answers today
+    (``SUPPORTS_MESSAGES`` is true for every bridged provider). It is a shim in
+    the sense of CONTRIBUTING's "when the fix is upstream": the durable answer
+    is a public capability flag on the any-llm provider class, asked for in
+    https://github.com/mozilla-ai/any-llm/issues/1418, and this goes when that
+    lands. ``getattr`` keeps a renamed attribute from breaking a request; it
+    degrades to forwarding the betas, the pre-shim behavior.
+    """
+    if not isinstance(dispatch_model, str) or not dispatch_model:
+        return True
+    try:
+        provider, _ = AnyLLM.split_model_provider(dispatch_model)
+        native = getattr(AnyLLM.get_provider_class(provider), "_amessages", None)
+        return native is not getattr(AnyLLM, "_amessages", None)
+    except Exception:  # noqa: BLE001 - any-llm raises its own types for an unknown provider
+        return True
+
+
+def _split_client_betas(kwargs: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Take out the betas no provider should see, and say whether MCP's was among them.
+
+    Two never travel. The MCP client capability is the gateway's own, consumed
+    here. And every beta is dropped for a provider with no Messages API of its
+    own, where any-llm refuses the request outright: a beta names an Anthropic
+    feature that provider was never going to serve, so forwarding it would make
+    a request stop working purely because its model changed, which is the swap
+    `auto` exists to keep invisible.
+    """
     betas = kwargs.get("betas")
-    if not isinstance(betas, list) or MCP_CLIENT_BETA not in betas:
+    if not isinstance(betas, list) or not betas:
+        return kwargs, False
+
+    saw_mcp_beta = MCP_CLIENT_BETA in betas
+    provider_betas = (
+        [beta for beta in betas if beta != MCP_CLIENT_BETA] if _serves_messages_natively(kwargs.get("model")) else []
+    )
+    if provider_betas == betas:
         return kwargs, False
 
     provider_kwargs = {**kwargs}
-    provider_betas = [beta for beta in betas if beta != MCP_CLIENT_BETA]
     if provider_betas:
         provider_kwargs["betas"] = provider_betas
     else:
         provider_kwargs.pop("betas")
-    return provider_kwargs, True
+    return provider_kwargs, saw_mcp_beta
 
 
 class MessagesRequest(derive_request_base(MessagesParams)):  # type: ignore[misc]
@@ -157,24 +232,68 @@ class CountTokensResponse(BaseModel):
 def _is_gateway_minted_result(block: Any) -> bool:
     """Whether a ``web_search_tool_result`` block was minted by this gateway.
 
-    Provenance is the empty ``encrypted_content``: Anthropic always populates that
-    field with a signed blob, and the gateway cannot, so it sends the field empty
-    (see ``mcp_loop_messages._native_web_search_blocks``). A result block whose hits
-    all carry an empty value is therefore ours; one carrying real signed content came
-    from a provider that ran the search itself and must survive untouched.
+    Provenance is the reserved id prefix the gateway mints its ``server_tool_use``
+    with (:data:`~gateway.services.tools.SERVER_TOOL_USE_ID_PREFIX`), matched here on the
+    ``tool_use_id`` the result carries back. Anthropic issues ``srvtoolu_`` ids of its
+    own and cannot produce that prefix, so a provider's blocks survive untouched
+    whatever they contain, including a ``max_uses_exceeded`` error from its own capped
+    search. Same rule as :func:`_is_gateway_minted_mcp_block`.
 
-    An empty ``content`` list counts as ours: that is what a gateway search with no
-    usable hits produces, and a provider reporting no results uses the error shape
-    instead.
+    The empty ``encrypted_content`` below is the older signal, kept for transcripts
+    minted before the prefix existed: Anthropic always populates that field with a
+    signed blob and the gateway cannot, so hits that all carry an empty value are
+    ours. It only recognizes the success shape, which is why the prefix replaced it.
+    An empty ``content`` list counts as ours too: that is what a gateway search with
+    no usable hits produces, and a provider reporting no results uses the error shape.
     """
     if not isinstance(block, dict) or block.get("type") != "web_search_tool_result":
         return False
+    if str(block.get("tool_use_id") or "").startswith(SERVER_TOOL_USE_ID_PREFIX):
+        return True
     hits = block.get("content")
     if not isinstance(hits, list):
-        # The error shape (``web_search_tool_result_error``) is a dict, and only a
-        # provider produces it. Never ours.
         return False
     return all(isinstance(hit, dict) and not hit.get("encrypted_content") for hit in hits)
+
+
+def _is_gateway_minted_code_execution_result(block: Any) -> bool:
+    """Whether a ``code_execution_tool_result`` block was minted by this gateway.
+
+    Provenance is the reserved ``server_tool_use`` id prefix, as for web search.
+    Anthropic's own results, which a caller echoes when the provider ran the
+    code, carry ``srvtoolu_`` ids and survive untouched.
+    """
+    if not isinstance(block, dict) or block.get("type") != "code_execution_tool_result":
+        return False
+    return str(block.get("tool_use_id") or "").startswith(SERVER_TOOL_USE_ID_PREFIX)
+
+
+def _code_execution_pair_as_text(use: dict[str, Any] | None, result: dict[str, Any]) -> dict[str, Any]:
+    """Fold a gateway-minted code-execution pair into one assistant ``text`` block.
+
+    Unlike a web-search pair, whose hits are already in the transcript, an
+    execution's output exists nowhere else, so dropping the pair would make the
+    model forget what its code printed on the previous turn. A ``tool_use`` /
+    ``tool_result`` rewrite is not available either: ``tool_result`` must open a
+    user turn, which would mean splitting the echoed assistant message. A text
+    block keeps the code and its output in the model's view in a shape every
+    provider accepts.
+    """
+    code = str(((use or {}).get("input") or {}).get("code") or "")
+    raw_content = result.get("content")
+    content: dict[str, Any] = raw_content if isinstance(raw_content, dict) else {}
+    parts = [f"[code executed]\n```\n{code}\n```"] if code else ["[code executed]"]
+    if content.get("type") == "code_execution_tool_result_error":
+        parts.append(f"error: {content.get('error_code') or 'unavailable'}")
+    else:
+        for label in ("stdout", "stderr"):
+            value = content.get(label)
+            if isinstance(value, str) and value:
+                parts.append(f"{label}:\n{value}")
+        return_code = content.get("return_code")
+        if isinstance(return_code, int) and return_code != 0:
+            parts.append(f"return_code: {return_code}")
+    return {"type": "text", "text": "\n".join(parts)}
 
 
 def _is_gateway_minted_mcp_block(block: Any) -> bool:
@@ -200,10 +319,14 @@ def _strip_gateway_minted_blocks(messages: Any) -> Any:
     internal loop already consumed. Neither should be shipped to a provider on the
     next request. Mirrors ``responses._strip_gateway_minted_items``, but where
     Responses has no way to tell its own minted items from a provider's, here it can:
-    web search uses the empty signed-content field and MCP uses an Otari-prefixed call
-    id. Genuine provider-run pairs therefore round-trip untouched. Each use is removed
+    both web search and MCP mint an Otari-prefixed call id a provider cannot produce.
+    Genuine provider-run pairs therefore round-trip untouched. Each use is removed
     only alongside the result that answers it, matched by ``tool_use_id``, so a
     provider's pair is never split.
+
+    A gateway-minted code-execution pair is not dropped but folded into a text
+    block (:func:`_code_execution_pair_as_text`), because its output lives nowhere
+    else in the transcript.
 
     A message left with no content is dropped: an empty ``content`` array is rejected
     by the API, and a turn that held nothing but our pair has nothing left to say.
@@ -219,16 +342,31 @@ def _strip_gateway_minted_blocks(messages: Any) -> Any:
             continue
         # Two passes: identify our web-search results and our provenance-prefixed
         # MCP uses, then drop each complete pair. A provider's pair matches neither.
-        minted_web_ids = {
-            block.get("tool_use_id") for block in content if _is_gateway_minted_result(block)
-        }
+        minted_web_ids = {block.get("tool_use_id") for block in content if _is_gateway_minted_result(block)}
         minted_mcp_ids = {
             block.get("id") if block.get("type") == "mcp_tool_use" else block.get("tool_use_id")
             for block in content
             if _is_gateway_minted_mcp_block(block)
         }
-        kept_blocks = [block for block in content if not _is_minted_pair_member(block, minted_web_ids, minted_mcp_ids)]
-        if len(kept_blocks) == len(content):
+        minted_code_uses = {
+            block.get("id"): block
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "server_tool_use"
+            and block.get("name") == CODE_EXECUTION_TOOL_NAME
+            and str(block.get("id") or "").startswith(SERVER_TOOL_USE_ID_PREFIX)
+        }
+        kept_blocks: list[Any] = []
+        for block in content:
+            if _is_minted_pair_member(block, minted_web_ids, minted_mcp_ids):
+                continue
+            if _is_gateway_minted_code_execution_result(block):
+                kept_blocks.append(_code_execution_pair_as_text(minted_code_uses.get(block.get("tool_use_id")), block))
+                continue
+            if isinstance(block, dict) and block.get("id") in minted_code_uses:
+                continue
+            kept_blocks.append(block)
+        if kept_blocks == content:
             kept_messages.append(message)
             continue
         dropped += len(content) - len(kept_blocks)
@@ -257,11 +395,17 @@ def _is_minted_pair_member(
     return block_type == "mcp_tool_result" and block.get("tool_use_id") in minted_mcp_ids
 
 
-def _anthropic_error(error_type: str, message: str, status_code: int) -> HTTPException:
+def _anthropic_error(
+    error_type: str,
+    message: str,
+    status_code: int,
+    headers: dict[str, str] | None = None,
+) -> HTTPException:
     """Create an HTTPException with Anthropic-style error body."""
     return HTTPException(
         status_code=status_code,
         detail={"type": "error", "error": {"type": error_type, "message": message}},
+        headers=headers,
     )
 
 
@@ -272,16 +416,15 @@ _ERR_AUTHENTICATION = "authentication_error"
 _ERR_NOT_FOUND = "not_found_error"
 _ERR_RATE_LIMIT = "rate_limit_error"
 
-# Anthropic error.type keyed by HTTP status, used when re-wrapping a plain-string
-# HTTPException into the Anthropic envelope: classified provider failures plus
-# preamble auth/permission/resolve rejections. Unlisted statuses (e.g. the 502
-# used for a credentials fault, or a 500) fall back to api_error.
-_STATUS_TO_ANTHROPIC_TYPE = {
-    400: _ERR_INVALID_REQUEST,
-    401: _ERR_AUTHENTICATION,
-    403: _ERR_PERMISSION,
-    404: _ERR_NOT_FOUND,
-    429: _ERR_RATE_LIMIT,
+# Every Anthropic ``error.type`` comes from this table. A bare status reaches it
+# through ``error_kind_for_status``, so one status cannot be classified two ways.
+_ERROR_KIND_TO_ANTHROPIC_TYPE = {
+    ErrorKind.API: _ERR_API,
+    ErrorKind.AUTHENTICATION: _ERR_AUTHENTICATION,
+    ErrorKind.INVALID_REQUEST: _ERR_INVALID_REQUEST,
+    ErrorKind.NOT_FOUND: _ERR_NOT_FOUND,
+    ErrorKind.PERMISSION: _ERR_PERMISSION,
+    ErrorKind.RATE_LIMIT: _ERR_RATE_LIMIT,
 }
 
 
@@ -291,13 +434,13 @@ def _ensure_anthropic_error(exc: HTTPException) -> HTTPException:
 
     HTTPExceptions already carrying the Anthropic ``detail`` dict (raised via
     ``_anthropic_error``) pass through unchanged, so this is safe to apply to any
-    HTTPException on the ``/v1/messages`` path, including format-agnostic ones
+    HTTPException on the ``/api/v1/messages`` path, including format-agnostic ones
     raised by the hybrid preamble (platform resolve/auth) and the shared
     execution runners.
     """
     if not isinstance(exc.detail, str):
         return exc
-    error_type = _STATUS_TO_ANTHROPIC_TYPE.get(exc.status_code, _ERR_API)
+    error_type = _ERROR_KIND_TO_ANTHROPIC_TYPE[error_kind_for_status(exc.status_code)]
     return HTTPException(
         status_code=exc.status_code,
         detail={"type": "error", "error": {"type": error_type, "message": exc.detail}},
@@ -305,15 +448,44 @@ def _ensure_anthropic_error(exc: HTTPException) -> HTTPException:
     )
 
 
+_ERR_OVERLOADED = "overloaded_error"
+
+# A failure after the stream committed can only be reported in the SSE error
+# event, so its type is what tells a client whether retrying makes sense. Only
+# transient upstream conditions are named; every other failure stays the generic
+# ``api_error``, and the message is always the gateway's own text, never the
+# provider's.
+_STREAM_ERROR_MESSAGES = {
+    _ERR_OVERLOADED: "The upstream provider is overloaded. Retry the request.",
+    _ERR_RATE_LIMIT: "The upstream provider rate limited the request. Retry the request later.",
+}
+_STREAM_ERROR_STATUS_TYPES = {
+    status.HTTP_429_TOO_MANY_REQUESTS: _ERR_RATE_LIMIT,
+    529: _ERR_OVERLOADED,
+}
+
+
+def _upstream_stream_error_type(exc: BaseException) -> str | None:
+    """The transient Anthropic ``error.type`` behind a mid-stream failure, if any.
+
+    Anthropic reports a failure after the stream began as an SSE ``error`` event,
+    which its SDK raises as an ``APIStatusError`` whose status is the stream's
+    original 200 and whose ``body`` holds the event. The body's type is the
+    signal; the status is read only for a provider that failed with a real one.
+    """
+    for candidate in upstream_exception_chain(exc):
+        body = getattr(candidate, "body", None)
+        error = body.get("error") if isinstance(body, dict) else None
+        error_type = error.get("type") if isinstance(error, dict) else None
+        if error_type in _STREAM_ERROR_MESSAGES:
+            return str(error_type)
+    _kind, status_code = upstream_exception_shape(exc)
+    return _STREAM_ERROR_STATUS_TYPES.get(status_code) if status_code is not None else None
+
+
 _MASTER_KEY_USER_REQUIRED = "When using master key, 'metadata.user_id' is required in request body"
 _USER_FORBIDDEN = "'metadata.user_id' does not match the authenticated API key's user"
 _PROVIDER_ERROR = "The request could not be completed by the provider"
-
-_ERROR_KIND_TO_ANTHROPIC_TYPE = {
-    ErrorKind.INVALID_REQUEST: _ERR_INVALID_REQUEST,
-    ErrorKind.API: _ERR_API,
-    ErrorKind.PERMISSION: _ERR_PERMISSION,
-}
 
 
 def _billable_messages_usage(usage: Any) -> GatewayUsage:
@@ -325,14 +497,11 @@ def _billable_messages_usage(usage: Any) -> GatewayUsage:
         prompt_tokens=input_tokens,
         completion_tokens=output_tokens,
         total_tokens=input_tokens + output_tokens,
-        cache_read_tokens=sum(
-            (getattr(part, "cache_read_input_tokens", None) or 0) for part in billable_parts
-        ),
-        cache_write_tokens=sum(
-            (getattr(part, "cache_creation_input_tokens", None) or 0) for part in billable_parts
-        ),
+        cache_read_tokens=sum((getattr(part, "cache_read_input_tokens", None) or 0) for part in billable_parts),
+        cache_write_tokens=sum((getattr(part, "cache_creation_input_tokens", None) or 0) for part in billable_parts),
         cache_write_1h_tokens=sum(_cache_write_1h_tokens(part) for part in billable_parts),
         cache_tokens_in_prompt=False,
+        reasoning_tokens=getattr(getattr(usage, "output_tokens_details", None), "thinking_tokens", None) or 0,
     )
 
 
@@ -397,23 +566,41 @@ class _MessagesAdapter:
     and friends.
     """
 
-    name = "messages"
-    endpoint = "/v1/messages"
+    name = Dialect.MESSAGES
+    endpoint = USAGE_ENDPOINT
     stream_format: StreamFormat = ANTHROPIC_STREAM_FORMAT
     # A successful non-streaming call without provider usage data skips the
     # usage-log row (only the reservation is settled), matching the wire
     # behavior this endpoint has always had.
     log_success_without_usage = False
 
-    def error(self, status_code: int, message: str, kind: ErrorKind = ErrorKind.API) -> HTTPException:
-        return _anthropic_error(_ERROR_KIND_TO_ANTHROPIC_TYPE[kind], message, status_code)
+    def error(
+        self,
+        status_code: int,
+        message: str,
+        kind: ErrorKind = ErrorKind.API,
+        headers: dict[str, str] | None = None,
+    ) -> HTTPException:
+        return _anthropic_error(_ERROR_KIND_TO_ANTHROPIC_TYPE[kind], message, status_code, headers)
 
     def provider_error(self, exc: BaseException) -> HTTPException:
         mapping = classify_provider_error(exc)
         if mapping is not None:
-            error_type = _STATUS_TO_ANTHROPIC_TYPE.get(mapping.status_code, _ERR_API)
-            return _anthropic_error(error_type, mapping.detail, mapping.status_code)
+            error_type = _ERROR_KIND_TO_ANTHROPIC_TYPE[error_kind_for_status(mapping.status_code)]
+            return _anthropic_error(
+                error_type,
+                mapping.detail,
+                mapping.status_code,
+                provider_error_headers(exc, mapping.status_code),
+            )
         return _anthropic_error(_ERR_API, _PROVIDER_ERROR, status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def stream_error_payload(self, exc: BaseException) -> str:
+        error_type = _upstream_stream_error_type(exc)
+        if error_type is None:
+            return self.stream_format.error_payload
+        event = {"type": "error", "error": {"type": error_type, "message": _STREAM_ERROR_MESSAGES[error_type]}}
+        return f"event: error\ndata: {json.dumps(event)}\n\n"
 
     def format_chunk(self, chunk: MessageStreamEvent) -> str:
         return f"event: {chunk.type}\ndata: {chunk.model_dump_json(exclude_none=True)}\n\n"
@@ -453,11 +640,11 @@ class _MessagesAdapter:
         return isinstance(chunk, MessageDeltaEvent)
 
     async def call_provider(self, kwargs: dict[str, Any]) -> MessageResponse:
-        provider_kwargs, _ = _split_mcp_client_beta(kwargs)
+        provider_kwargs, _ = _split_client_betas(kwargs)
         return await amessages(**provider_kwargs)  # type: ignore[return-value]
 
     async def open_provider_stream(self, kwargs: dict[str, Any]) -> AsyncIterator[MessageStreamEvent]:
-        provider_kwargs, _ = _split_mcp_client_beta(kwargs)
+        provider_kwargs, _ = _split_client_betas(kwargs)
         return await amessages(**provider_kwargs)  # type: ignore[return-value]
 
     def prepare_stream_kwargs(
@@ -477,19 +664,26 @@ class _MessagesAdapter:
         max_iterations: int,
         on_first_response: Callable[[], None] | None = None,
         *,
-        emit_native_web_search: bool = False,
+        native_tools: frozenset[str] = frozenset(),
+        use_budget: ToolUseBudget | None = None,
+        container: ContainerLease | None = None,
     ) -> MessageResponse:
         # Standalone dispatch has no lock-in callback; only pass the kwarg on
         # the platform-attempt path so test fakes can mirror each call shape.
         extra: dict[str, Any] = {}
         if on_first_response is not None:
             extra["on_first_response"] = on_first_response
-        provider_kwargs, _ = _split_mcp_client_beta(kwargs)
+        if use_budget is not None:
+            extra["use_budget"] = use_budget
+        if native_tools:
+            extra["native_tools"] = native_tools
+        if container is not None:
+            extra["container"] = container
+        provider_kwargs, _ = _split_client_betas(kwargs)
         return await anthropic_tool_loop(
             completion_kwargs=provider_kwargs,
             pool=pool,
             max_iterations=max_iterations,
-            emit_native_web_search=emit_native_web_search,
             **extra,
         )
 
@@ -499,17 +693,24 @@ class _MessagesAdapter:
         pool: ToolBackend,
         max_iterations: int,
         *,
-        emit_native_web_search: bool = False,
+        native_tools: frozenset[str] = frozenset(),
+        use_budget: ToolUseBudget | None = None,
+        container: ContainerLease | None = None,
     ) -> AsyncIterator[MessageStreamEvent]:
-        provider_kwargs, emit_native_mcp = _split_mcp_client_beta(kwargs)
+        provider_kwargs, emit_native_mcp = _split_client_betas(kwargs)
         extra: dict[str, Any] = {}
         if emit_native_mcp:
             extra["emit_native_mcp"] = True
+        if use_budget is not None:
+            extra["use_budget"] = use_budget
+        if native_tools:
+            extra["native_tools"] = native_tools
+        if container is not None:
+            extra["container"] = container
         return anthropic_tool_loop_stream(
             completion_kwargs=provider_kwargs,
             pool=pool,
             max_iterations=max_iterations,
-            emit_native_web_search=emit_native_web_search,
             **extra,
         )
 
@@ -540,46 +741,6 @@ class _MessagesAdapter:
         return kwargs
 
 
-CONTAINER_ON_MANAGED_CREDENTIAL_DETAIL = (
-    "container cannot be used on this route: it resolves to a provider account this gateway "
-    "manages on behalf of many workspaces, and a container id addresses state on that account "
-    "rather than on your workspace. Use a model served by your own provider key."
-)
-
-
-def _reject_container_on_managed_credential(ctx: RequestContext) -> None:
-    """Refuse a caller-chosen container id when the upstream account is not the caller's.
-
-    A container id names an execution environment and the files uploaded into it,
-    scoped to the *provider account* that minted it, not to an otari tenant. A
-    managed attempt runs on a credential the platform owns and many workspaces
-    share, so forwarding an id the caller picked would let anyone holding one
-    resume another tenant's container and read its workspace.
-
-    This is the container-shaped case of what :func:`scope_prompt_cache_key`
-    solves two calls later by namespacing the key. A container id is minted by
-    the provider and carries the caller's claim on it, so it cannot be
-    namespaced: forward or refuse are the only answers, and on a shared account
-    the answer is refuse.
-
-    Refused when *any* attempt on the route is managed, not only the first: which
-    attempt serves the request is decided during fallback, past this point. A
-    BYO-only route keeps the field, because there the account, and so the
-    container, is already the caller's own. Standalone never reaches this: its
-    credentials are the deployment operator's own, and the managed rung
-    (``_serve_from_hosted_credential``) answers ``None`` in every build that
-    mounts this route.
-    """
-    route = ctx.route
-    if route is None or not any(attempt.managed for attempt in route.attempts):
-        return
-    raise _anthropic_error(
-        _ERR_INVALID_REQUEST,
-        CONTAINER_ON_MANAGED_CREDENTIAL_DETAIL,
-        status.HTTP_400_BAD_REQUEST,
-    )
-
-
 _ADAPTER = _MessagesAdapter()
 
 
@@ -590,10 +751,14 @@ async def create_message(
     background_tasks: BackgroundTasks,
     request: MessagesRequest,
     db: Annotated[AsyncSession | None, Depends(get_db_if_needed)],
+    uow: Annotated[UnitOfWork | None, Depends(get_unit_of_work_if_needed)],
+    files: OptionalFileServiceDep,
     config: Annotated[GatewayConfig, Depends(get_config)],
     log_writer: Annotated[LogWriter, Depends(get_log_writer)],
     model_provider: ModelProviderPortDep,
-) -> dict[str, Any] | StreamingResponse:
+    tool_ports: ToolPortsDep,
+    idempotency: IdempotencyGuardDep,
+) -> dict[str, Any] | Response:
     """Anthropic Messages API-compatible endpoint.
 
     Supports MCP tool-use loops, sandboxed code execution, and SearXNG
@@ -614,28 +779,47 @@ async def create_message(
     # independent of whether the current request enables the same tool again.
     request.messages = _strip_gateway_minted_blocks(request.messages)
 
-    async def _normalize(
-        user_id: str,
-        provider: LLMProvider | None,
-        model: str,
-        instance: str | None,
-        workspace_id: uuid.UUID | None,
-    ) -> tuple[int, CompletionUsage | None]:
+    # Uploads the normalizer found for the code-execution sandbox, handed to the
+    # sandbox session once the billed user and workspace are resolved.
+    sandbox_inputs: list[StagedFile] = []
+    # Uploads a container_upload block names for the provider's own container.
+    # Each candidate is sent copies in its own account, made as it is dispatched.
+    container_inputs: list[StagedFile] = []
+
+    async def _normalize(target: NormalizationTarget) -> tuple[int, CompletionUsage | None]:
         # Resolve uploaded file/image blocks into the Anthropic wire payload
         # before the cost estimate. Standalone only; no-op when the files
         # feature is off or the request has no attachments.
+        code_execution_header = raw_request.headers.get(CODE_EXECUTION_HEADER)
         request.messages, stats = await normalize_request_messages(
             request.messages,
             fmt="anthropic",
             config=config,
-            provider=provider,
-            model=model,
-            db=db,
-            raw_request=raw_request,
-            user_id=user_id,
-            instance=instance,
-            workspace_id=workspace_id,
+            provider=target.provider,
+            model=target.model,
+            files=files,
+            user_id=target.user_id,
+            instance=target.instance,
+            workspace_id=target.file_workspace_id,
+            sandbox_requested=sandbox_requested(
+                request.tools,
+                config=config,
+                provider=target.provider,
+                dialect=_ADAPTER.name,
+                code_execution_header=code_execution_header,
+                workspace_executor=target.workspace_executor,
+            ),
+            provider_container=provider_container_requested(
+                request.tools,
+                config=config,
+                provider=target.provider,
+                dialect=_ADAPTER.name,
+                code_execution_header=code_execution_header,
+                workspace_executor=target.workspace_executor,
+            ),
         )
+        container_inputs.extend(stats.container_inputs)
+        sandbox_inputs.extend(stats.sandbox_inputs)
         return len(str(request.messages)) + len(str(request.system or "")), stats.vision_usage()
 
     try:
@@ -644,6 +828,7 @@ async def create_message(
             raw_request=raw_request,
             response=response,
             db=db,
+            uow=uow,
             config=config,
             log_writer=log_writer,
             model=request.model,
@@ -662,34 +847,69 @@ async def create_message(
                 request.messages, raw_request, has_tools=bool(request.tools)
             ),
             normalize_messages=_normalize,
+            tools=request.tools,
+            idempotency=None if request.stream else idempotency,
         )
+    except IdempotentReplay as replay:
+        return replay.response()
     except HTTPException as exc:
         # The hybrid preamble (platform resolve / auth) raises format-agnostic
         # plain-string HTTPExceptions (some with a Retry-After header); re-wrap
-        # them in the Anthropic envelope so /v1/messages errors stay structured.
+        # them in the Anthropic envelope so /api/v1/messages errors stay structured.
         raise _ensure_anthropic_error(exc) from exc
 
+    # Standalone credentials are the operator's own, so only hybrid can route to a managed one.
+    # Any managed attempt counts, not only the first: fallback decides which serves, past this point.
     if request.container is not None and ctx.hybrid_mode:
+        route = ctx.route
         try:
-            _reject_container_on_managed_credential(ctx)
-        except HTTPException:
-            # A no-op in hybrid, the only mode that reaches this gate, since
-            # hybrid reserves nothing locally. Kept so this exit already settles
+            check_container_on_credential(
+                request.container,
+                managed_credential=route is not None and any(attempt.managed for attempt in route.attempts),
+            )
+        except ContainerOnManagedCredentialError as exc:
+            # A no-op in hybrid, which reserves nothing locally. Kept so this exit already settles
             # if the gate ever covers a mode that does pre-debit the estimate.
             await release_reservation(ctx)
-            raise
+            raise domain_error(_ADAPTER, exc) from exc
 
     tool_ctx = await prepare_gateway_tools(
         adapter=_ADAPTER,
         ctx=ctx,
         response=response,
-        guardrails=request.guardrails,
-        guardrail_text=latest_user_text(request.messages),
-        tools=request.tools,
-        mcp_servers=request.mcp_servers,
-        mcp_server_ids=request.mcp_server_ids,
-        max_tool_iterations=request.max_tool_iterations,
-        tools_header=request.tools_header,
+        declared=DeclaredTools(
+            guardrails=request.guardrails,
+            guardrail_text=latest_user_text(request.messages),
+            tools=request.tools,
+            mcp_servers=request.mcp_servers,
+            mcp_server_ids=request.mcp_server_ids,
+            max_tool_iterations=request.max_tool_iterations,
+            tools_header=request.tools_header,
+            code_execution_header=raw_request.headers.get(CODE_EXECUTION_HEADER),
+            web_search_header=raw_request.headers.get(WEB_SEARCH_HEADER),
+            # Anthropic's own field, which is where an Anthropic SDK puts the id it
+            # read off the last response. Resolved at admission against this caller's
+            # leases; the provider never sees it when the sandbox runs the code.
+            container_id=request.container,
+        ),
+        backends=ToolBackends(
+            ports=tool_ports,
+            sandbox_containers=build_sandbox_container_registry(
+                config=config,
+                uow=ctx.uow,
+                user_id=ctx.user_id,
+                workspace_id=ctx.workspace_id,
+                port=tool_ports.code_execution,
+            ),
+            sandbox_files=build_sandbox_file_bridge(
+                raw_request=raw_request,
+                config=config,
+                uow=ctx.uow,
+                user_id=ctx.user_id,
+                workspace_id=ctx.workspace_id,
+                inputs=sandbox_inputs,
+            ),
+        ),
     )
 
     # Strip gateway-internal fields, convert any caller-supplied OpenAI-shaped
@@ -704,13 +924,28 @@ async def create_message(
     if request_fields.get("tools"):
         request_fields["tools"] = openai_to_anthropic_tools(request_fields["tools"])
     if tool_ctx.use_sandbox:
-        # ``container`` addresses Anthropic's own code-execution container, and
-        # the gateway sandbox owns execution for this request, so the provider
-        # would be asked to attach a container no tool call will reach.
-        # ``prepare_gateway_tools`` has already refused the one shape where a
-        # provider-native code-execution tool survives alongside the sandbox, so
-        # dropping it here cannot strand a container the provider would have used.
+        # ``container`` is the gateway's to honor when the sandbox runs the code:
+        # admission has already resolved it against this caller's leases, or
+        # refused the request. Forwarding it would ask the provider to attach a
+        # container no tool call will reach. ``prepare_gateway_tools`` either
+        # claimed the provider-native declaration or refused the request, so no
+        # provider tool survives alongside the sandbox and dropping it here cannot
+        # strand a container the provider would have used.
         request_fields.pop("container", None)
+
+    prepare_kwargs = None
+    if container_inputs:
+        pepper = config.provider_account_pepper
+        if files is None or ctx.workspace_id is None or pepper is None:
+            # The blocks still name Otari's files, which no provider account holds.
+            await release_reservation(ctx)
+            raise domain_error(_ADAPTER, ProviderUploadFailedError())
+        prepare_kwargs = container_copies_step(
+            files=files,
+            inputs=container_inputs,
+            accounts=ProviderAccounts(pepper=pepper, workspace_id=ctx.workspace_id),
+            render=partial(domain_error, _ADAPTER),
+        )
 
     # ------------------------------------------------------------------
     # Streaming path
@@ -736,6 +971,7 @@ async def create_message(
                     rate_limit_info=ctx.rate_limit_info,
                     tool_ctx=tool_ctx,
                     session_label=request.session_label,
+                    started_at=ctx.started_at,
                 )
             except HTTPException as exc:
                 # Hybrid terminal failures arrive as format-agnostic plain-string
@@ -763,6 +999,7 @@ async def create_message(
             session_label=request.session_label,
             display_model=resolved.alias,
             base_request_fields=request_fields,
+            prepare_kwargs=prepare_kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -809,17 +1046,16 @@ async def create_message(
         model=resolved.model,
         display_model=resolved.alias,
         base_request_fields=request_fields,
+        prepare_kwargs=prepare_kwargs,
     )
 
-    return result.model_dump(exclude_none=True)
+    body = result.model_dump(exclude_none=True)
+    await idempotency.complete(body, response)
+    return body
 
 
-# The gateway has no tokenizer (see budget_service.estimate_cost), so input
-# tokens are approximated as ``chars / 4`` — the same heuristic used for budget
-# pre-debit. count_tokens callers (e.g. Claude Code) use the result only to
-# gauge headroom against the context window, so an approximate count is fine.
-# Round up: an over-count keeps callers safely inside the context window, while
-# an under-count could let a prompt slip over the limit.
+# Input tokens are approximated as ``chars / 4``, because the gateway has no tokenizer.
+# The count rounds up, so a caller that gauges context-window headroom stays inside the limit.
 _CHARS_PER_TOKEN = 4
 
 
@@ -853,7 +1089,7 @@ async def count_message_tokens(
             # Resolve against the platform purely to authenticate the caller (same
             # as create_message); the routing plan is discarded since counting is
             # local. Without this, any non-empty bearer string would be accepted.
-            user_token = _extract_platform_user_token(raw_request)
+            user_token = extract_credential_token(raw_request)
             await _resolve_platform_credentials(
                 config=config,
                 user_token=user_token,
@@ -867,7 +1103,7 @@ async def count_message_tokens(
             # the plane a cookie may not reach, so it must not report on one.
             await verify_api_key_or_master_key(raw_request, db, config)
     except HTTPException as exc:
-        # Keep /v1/messages/count_tokens auth errors in the Anthropic envelope too.
+        # Keep count_tokens auth errors in the Anthropic envelope too.
         raise _ensure_anthropic_error(exc) from exc
 
     return CountTokensResponse(input_tokens=_estimate_input_tokens(request))

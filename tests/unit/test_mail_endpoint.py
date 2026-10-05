@@ -4,11 +4,15 @@ Unit rather than integration: the route reads configuration and sends through a
 transport, with no database behind it beyond the one the app needs to boot.
 """
 
+import logging
+from collections.abc import Generator
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
-from gateway.core.config import GatewayConfig
+from gateway.core.config import API_ROOT, GatewayConfig
+from gateway.log_config import logger as gateway_logger
 from gateway.main import create_app
 
 AUTH = {"Authorization": "Bearer sk-test-master"}
@@ -26,13 +30,13 @@ def _client(tmp_path: Path, **mail: object) -> TestClient:
 
 def test_mail_settings_require_the_master_key(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
-        assert client.get("/v1/settings/mail").status_code == 401
-        assert client.post("/v1/settings/mail/test", json={"to": "ada@example.com"}).status_code == 401
+        assert client.get(f"{API_ROOT}/settings/mail").status_code == 401
+        assert client.post(f"{API_ROOT}/settings/mail/test", json={"to": "ada@example.com"}).status_code == 401
 
 
 def test_an_unconfigured_deployment_reports_itself_unavailable_and_says_what_is_missing(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
-        body = client.get("/v1/settings/mail", headers=AUTH).json()
+        body = client.get(f"{API_ROOT}/settings/mail", headers=AUTH).json()
 
     assert body["transport"] == "none"
     assert body["enabled"] is False
@@ -43,7 +47,7 @@ def test_an_unconfigured_deployment_reports_itself_unavailable_and_says_what_is_
 def test_a_test_send_is_refused_up_front_rather_than_failing_at_send_time(tmp_path: Path) -> None:
     """503 naming the missing settings, not a 200 for a message nobody will receive."""
     with _client(tmp_path) as client:
-        response = client.post("/v1/settings/mail/test", json={"to": "ada@example.com"}, headers=AUTH)
+        response = client.post(f"{API_ROOT}/settings/mail/test", json={"to": "ada@example.com"}, headers=AUTH)
 
     assert response.status_code == 503
     assert "smtp_host" in response.json()["detail"]
@@ -52,8 +56,8 @@ def test_a_test_send_is_refused_up_front_rather_than_failing_at_send_time(tmp_pa
 def test_a_transport_without_a_public_url_is_still_not_ready(tmp_path: Path) -> None:
     """A link in an inbox has to be absolute, so the address of this deployment is part of readiness."""
     with _client(tmp_path, smtp_host="smtp.example.com", mail_from_email="otari@example.com") as client:
-        body = client.get("/v1/settings/mail", headers=AUTH).json()
-        refused = client.post("/v1/settings/mail/test", json={"to": "ada@example.com"}, headers=AUTH)
+        body = client.get(f"{API_ROOT}/settings/mail", headers=AUTH).json()
+        refused = client.post(f"{API_ROOT}/settings/mail/test", json={"to": "ada@example.com"}, headers=AUTH)
 
     assert body["transport"] == "smtp"
     assert body["enabled"] is True
@@ -64,13 +68,41 @@ def test_a_transport_without_a_public_url_is_still_not_ready(tmp_path: Path) -> 
 
 def test_a_configured_deployment_sends_a_templated_test_message(tmp_path: Path) -> None:
     with _client(tmp_path, mail_transport="console", public_base_url="https://otari.example.com") as client:
-        body = client.get("/v1/settings/mail", headers=AUTH).json()
-        sent = client.post("/v1/settings/mail/test", json={"to": "ada@example.com"}, headers=AUTH)
+        body = client.get(f"{API_ROOT}/settings/mail", headers=AUTH).json()
+        sent = client.post(f"{API_ROOT}/settings/mail/test", json={"to": "ada@example.com"}, headers=AUTH)
 
     assert body["ready"] is True
     assert body["missing"] == []
     assert sent.status_code == 200
     assert sent.json() == {"ok": True, "transport": "console", "reason": None}
+
+
+@pytest.fixture
+def console_mail(caplog: pytest.LogCaptureFixture) -> Generator[pytest.LogCaptureFixture]:
+    """Read what the console transport logged; the gateway logger does not propagate."""
+    gateway_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger="gateway"):
+            yield caplog
+    finally:
+        gateway_logger.removeHandler(caplog.handler)
+
+
+def test_the_test_message_names_the_interface_rather_than_this_process(
+    tmp_path: Path, console_mail: pytest.LogCaptureFixture
+) -> None:
+    # The one message whose whole job is proving the mail setup has to name the
+    # address an operator would actually open.
+    with _client(
+        tmp_path,
+        mail_transport="console",
+        public_base_url="https://api.example.com",
+        ui_base_url="https://app.example.com/ui",
+    ) as client:
+        client.post(f"{API_ROOT}/settings/mail/test", json={"to": "ada@example.com"}, headers=AUTH)
+
+    assert "https://app.example.com/ui" in console_mail.text
+    assert "https://api.example.com" not in console_mail.text
 
 
 def test_a_send_that_fails_reports_why_instead_of_erroring(tmp_path: Path) -> None:
@@ -82,7 +114,7 @@ def test_a_send_that_fails_reports_why_instead_of_erroring(tmp_path: Path) -> No
         mail_from_email="otari@example.com",
         public_base_url="https://otari.example.com",
     ) as client:
-        response = client.post("/v1/settings/mail/test", json={"to": "ada@example.com"}, headers=AUTH)
+        response = client.post(f"{API_ROOT}/settings/mail/test", json={"to": "ada@example.com"}, headers=AUTH)
 
     assert response.status_code == 200
     body = response.json()
@@ -93,7 +125,7 @@ def test_a_send_that_fails_reports_why_instead_of_erroring(tmp_path: Path) -> No
 
 def test_a_malformed_recipient_is_refused_before_any_transport_is_touched(tmp_path: Path) -> None:
     with _client(tmp_path, mail_transport="console", public_base_url="https://otari.example.com") as client:
-        response = client.post("/v1/settings/mail/test", json={"to": "not-an-address"}, headers=AUTH)
+        response = client.post(f"{API_ROOT}/settings/mail/test", json={"to": "not-an-address"}, headers=AUTH)
 
     assert response.status_code == 422
 
@@ -107,8 +139,8 @@ def test_the_mail_surface_never_echoes_the_smtp_password(tmp_path: Path) -> None
         mail_from_email="otari@example.com",
         public_base_url="https://otari.example.com",
     ) as client:
-        mail = client.get("/v1/settings/mail", headers=AUTH).text
-        settings = client.get("/v1/settings", headers=AUTH).text
+        mail = client.get(f"{API_ROOT}/settings/mail", headers=AUTH).text
+        settings = client.get(f"{API_ROOT}/settings", headers=AUTH).text
 
     assert "hunter2" not in mail
     assert "hunter2" not in settings

@@ -1,4 +1,4 @@
-"""Integration tests for POST /v1/usage/external-events.
+"""Integration tests for POST /api/v1/usage/external-events.
 
 Covers auth, content-free validation, idempotency, historical + cache pricing,
 organization-scoped rates, budget isolation, and the read-surface (source filter,
@@ -14,8 +14,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from gateway.models.entities import OrganizationModelPricing, RuntimeSetting, UsageLog, User
+from gateway.core.config import API_ROOT
+from gateway.models.platform import RuntimeSetting
+from gateway.models.pricing import OrganizationModelPricing
 from gateway.models.tenancy import Organization, OrganizationMember, Workspace
+from gateway.models.usage import UsageLog
+from gateway.models.users import User
 from gateway.services.tenancy.provisioning_service import BOOTSTRAP_IDENTITY_KEY
 
 _SRC = "claude_code"
@@ -23,7 +27,7 @@ _MODEL_KEY = "anthropic:claude-sonnet-4-6"
 
 
 def _seed_user(client: TestClient, master_key_header: dict[str, str], user_id: str = "cc-user") -> str:
-    resp = client.post("/v1/users", json={"user_id": user_id}, headers=master_key_header)
+    resp = client.post(f"{API_ROOT}/users", json={"user_id": user_id}, headers=master_key_header)
     assert resp.status_code == 200
     return user_id
 
@@ -50,11 +54,11 @@ def _seed_pricing(
     }
     if effective_at is not None:
         body["effective_at"] = effective_at
-    resp = client.post("/v1/pricing", json=body, headers=master_key_header)
+    resp = client.post(f"{API_ROOT}/pricing", json=body, headers=master_key_header)
     assert resp.status_code == 200, resp.text
 
 
-# An hour ago, not a fixed date. `GET /v1/usage/summary` bounds itself to the
+# An hour ago, not a fixed date. `GET /api/v1/usage/summary` bounds itself to the
 # last 30 days when the caller names no window (`_DEFAULT_SUMMARY_LOOKBACK`), so
 # a literal timestamp puts every summary assertion in this file on a fuse: it
 # passes until the day the clock is 30 days past it, then fails everywhere at
@@ -98,7 +102,7 @@ def _post(
     body: dict[str, Any] = {"source": source, "events": events}
     if user_id is not None:
         body["user_id"] = user_id
-    return client.post("/v1/usage/external-events", json=body, headers=headers)
+    return client.post(f"{API_ROOT}/usage/external-events", json=body, headers=headers)
 
 
 def _act_in(client: TestClient, master_key_header: dict[str, str], db_session: Session, organization_id: Any) -> None:
@@ -112,12 +116,10 @@ def _act_in(client: TestClient, master_key_header: dict[str, str], db_session: S
     """
     marker = db_session.get(RuntimeSetting, BOOTSTRAP_IDENTITY_KEY)
     assert marker is not None, "the tenancy root is provisioned by the first master-key request"
-    db_session.add(
-        OrganizationMember(organization_id=organization_id, user_id=uuid.UUID(marker.value), role="owner")
-    )
+    db_session.add(OrganizationMember(organization_id=organization_id, user_id=uuid.UUID(marker.value), role="owner"))
     db_session.commit()
     switched = client.post(
-        "/v1/organizations/me/switch",
+        f"{API_ROOT}/organizations/me/switch",
         json={"organization_id": str(organization_id)},
         headers=master_key_header,
     )
@@ -147,7 +149,7 @@ def _make_key(
     }
     if workspace_id is not None:
         body["workspace_id"] = workspace_id
-    resp = client.post("/v1/keys", json=body, headers=master_key_header)
+    resp = client.post(f"{API_ROOT}/keys", json=body, headers=master_key_header)
     assert resp.status_code == 200, resp.text
     return {"Otari-Key": f"Bearer {resp.json()['key']}"}
 
@@ -155,7 +157,7 @@ def _make_key(
 def test_requires_auth(client: TestClient) -> None:
     """No credential -> rejected, nothing ingested."""
     resp = client.post(
-        "/v1/usage/external-events",
+        f"{API_ROOT}/usage/external-events",
         json={"source": _SRC, "user_id": "cc-user", "events": [_event()]},
     )
     assert resp.status_code in (401, 403)
@@ -270,7 +272,7 @@ def test_no_pricing_lands_with_null_cost(
     assert row.counts_toward_budget is False
 
     # The summary reports the unpriced row so a $0 cost is not read as free.
-    summary = client.get("/v1/usage/summary", headers=master_key_header).json()
+    summary = client.get(f"{API_ROOT}/usage/summary", headers=master_key_header).json()
     assert summary["totals"]["unpriced_requests"] == 1
 
 
@@ -312,7 +314,7 @@ def test_unpriced_inclusive_import_reprices_under_the_convention_it_arrived_with
     assert row.cache_tokens_in_prompt is True
 
     priced = client.post(
-        "/v1/usage/set-price",
+        f"{API_ROOT}/usage/set-price",
         json={
             "ids": [row.id],
             "input_price_per_million": 3.0,
@@ -346,9 +348,7 @@ def test_ingest_records_the_additive_default(
     assert row.cache_tokens_in_prompt is False
 
 
-def test_idempotent_resubmit(
-    client: TestClient, master_key_header: dict[str, str], db_session: Session
-) -> None:
+def test_idempotent_resubmit(client: TestClient, master_key_header: dict[str, str], db_session: Session) -> None:
     """Re-posting the same (source, source_event_id) is a duplicate, not a new row."""
     _seed_user(client, master_key_header)
     _seed_pricing(client, master_key_header)
@@ -361,9 +361,7 @@ def test_idempotent_resubmit(
     assert db_session.query(UsageLog).filter(UsageLog.source_event_id == "req_dup").count() == 1
 
 
-def test_dedupes_within_batch(
-    client: TestClient, master_key_header: dict[str, str], db_session: Session
-) -> None:
+def test_dedupes_within_batch(client: TestClient, master_key_header: dict[str, str], db_session: Session) -> None:
     """Two events with the same id in one batch collapse to a single row."""
     _seed_user(client, master_key_header)
     _seed_pricing(client, master_key_header)
@@ -408,7 +406,7 @@ def test_rejects_content_fields_at_batch_level(client: TestClient, master_key_he
     """The batch envelope forbids extra fields too, not just the per-event schema."""
     _seed_user(client, master_key_header)
     resp = client.post(
-        "/v1/usage/external-events",
+        f"{API_ROOT}/usage/external-events",
         json={"source": _SRC, "user_id": "cc-user", "events": [_event()], "prompt": "secret user text"},
         headers=master_key_header,
     )
@@ -423,9 +421,7 @@ def test_oversized_batch_rejected(client: TestClient, master_key_header: dict[st
     assert resp.status_code == 422
 
 
-def test_budget_isolation(
-    client: TestClient, master_key_header: dict[str, str], db_session: Session
-) -> None:
+def test_budget_isolation(client: TestClient, master_key_header: dict[str, str], db_session: Session) -> None:
     """Imported cost never touches users.spend or users.reserved."""
     _seed_user(client, master_key_header)
     _seed_pricing(client, master_key_header)
@@ -438,9 +434,7 @@ def test_budget_isolation(
     assert float(user.reserved) == pytest.approx(0.0)
 
 
-def test_historical_pricing(
-    client: TestClient, master_key_header: dict[str, str], db_session: Session
-) -> None:
+def test_historical_pricing(client: TestClient, master_key_header: dict[str, str], db_session: Session) -> None:
     """An event is priced at the rate effective at its own timestamp."""
     _seed_user(client, master_key_header)
     # Old cheap rate effective a year before the event; new expensive rate after.
@@ -506,7 +500,7 @@ def test_organization_override_prices_imported_usage_at_the_event_timestamp(
     )
     override_from = now - timedelta(minutes=30)
     created = client.post(
-        "/v1/organizations/me/pricing",
+        f"{API_ROOT}/organizations/me/pricing",
         json={
             "model_key": _MODEL_KEY,
             "input_price_per_million": 5.0,
@@ -650,7 +644,7 @@ def test_a_keys_import_prices_at_its_own_organizations_rate(
     # The trap: an override on the default organization, which is where a
     # master-key import lands and where a regression would wrongly resolve to.
     default_override = client.post(
-        "/v1/organizations/me/pricing",
+        f"{API_ROOT}/organizations/me/pricing",
         json={
             "model_key": _MODEL_KEY,
             "input_price_per_million": 5.0,
@@ -700,15 +694,13 @@ def test_a_keys_import_prices_at_its_own_organizations_rate(
     assert str(row.workspace_id) == workspace_id
 
 
-def test_read_surface_source_filter_and_summary(
-    client: TestClient, master_key_header: dict[str, str]
-) -> None:
+def test_read_surface_source_filter_and_summary(client: TestClient, master_key_header: dict[str, str]) -> None:
     """Imported rows are exposed + labeled via the list and the summary."""
     _seed_user(client, master_key_header)
     _seed_pricing(client, master_key_header)
     assert _post(client, master_key_header, [_event("read_1")]).json()["accepted"] == 1
 
-    listed = client.get("/v1/usage", params={"source": _SRC}, headers=master_key_header)
+    listed = client.get(f"{API_ROOT}/usage", params={"source": _SRC}, headers=master_key_header)
     assert listed.status_code == 200
     rows = listed.json()
     assert len(rows) == 1
@@ -716,15 +708,12 @@ def test_read_surface_source_filter_and_summary(
     assert rows[0]["source_label"] == "project:otari"
     assert rows[0]["counts_toward_budget"] is False
 
-    summary = client.get("/v1/usage/summary", headers=master_key_header).json()
+    summary = client.get(f"{API_ROOT}/usage/summary", headers=master_key_header).json()
     sources = {r["key"]: r for r in summary["by_source"]}
     assert _SRC in sources and sources[_SRC]["requests"] == 1
 
 
-
-def test_per_event_user_override(
-    client: TestClient, master_key_header: dict[str, str], db_session: Session
-) -> None:
+def test_per_event_user_override(client: TestClient, master_key_header: dict[str, str], db_session: Session) -> None:
     """A per-event user_id overrides the batch default so one feed serves a team."""
     _seed_user(client, master_key_header, "dev-a")
     _seed_user(client, master_key_header, "dev-b")
@@ -751,20 +740,8 @@ def test_rejects_reserved_gateway_source(client: TestClient, master_key_header: 
     assert "reserved" in resp.text
 
 
-def test_rejects_reserved_otari_ai_source_prefix(client: TestClient, master_key_header: dict[str, str]) -> None:
-    """otari.ai stamps the rows its backfill writes `otari-ai:<slug>`; an import under
-    that prefix is a lookalike in every reconciliation total."""
-    _seed_user(client, master_key_header)
-    for source in ("otari-ai:gateway", "otari-ai:claude_code", "OTARI-AI:gateway"):
-        resp = _post(client, master_key_header, [_event()], source=source)
-        assert resp.status_code == 422, f"{source}: {resp.text}"
-        assert "reserved" in resp.text
-
-
-def test_accepts_source_with_colon_outside_the_reserved_prefix(
-    client: TestClient, master_key_header: dict[str, str], db_session: Session
-) -> None:
-    """The guard is a prefix check, not a ban on colons in a slug."""
+def test_accepts_source_with_colon(client: TestClient, master_key_header: dict[str, str], db_session: Session) -> None:
+    """A colon is an ordinary slug character."""
     _seed_user(client, master_key_header)
     _seed_pricing(client, master_key_header)
 

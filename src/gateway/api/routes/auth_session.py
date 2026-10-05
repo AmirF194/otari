@@ -1,6 +1,6 @@
 """Dashboard sign-in sessions (standalone mode only).
 
-``POST /v1/auth/session`` exchanges a credential for a server-issued session
+``POST /api/v1/auth/session`` exchanges a credential for a server-issued session
 held in an HttpOnly cookie, so the dashboard never persists that credential in
 the browser and a sign-in survives tab closes and restarts. ``DELETE`` is
 sign-out. The cookie is honored by the master-key auth dependencies in
@@ -16,15 +16,15 @@ API credential. So:
   provisioning the default organization and its workspace and binding the
   session to that operator. This is first boot, and it is unchanged.
 - Once that identity has a password (an operator claimed the deployment through
-  ``PUT /v1/auth/password``), the master key is refused *for sign-in*, and email
+  ``PUT /api/v1/auth/password``), the master key is refused *for sign-in*, and email
   and password is the login. It is the operator's own password that decides
   this and no other identity's (#702): a member who signs up or resets theirs
   claims their account, not the deployment. The master key still authenticates
-  ``/v1/keys``, ``/v1/users`` and the rest of the management surface through the
+  ``/api/v1/keys``, ``/api/v1/users`` and the rest of the management surface through the
   header, which is what every self-hoster's automation and the OSS smoke gate
   use.
 
-``GET /v1/bootstrap`` publishes which of the two a deployment is currently
+``GET /api/v1/bootstrap`` publishes which of the two a deployment is currently
 accepting, so the login page asks for the credential that will work rather than
 discovering it from a 403.
 
@@ -48,12 +48,13 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gateway.api.deps import get_config, get_db, is_valid_master_key
+from gateway.api.deps import get_config, get_db, is_valid_master_key, record_auth_failure
 from gateway.core.config import GatewayConfig
+from gateway.exceptions.identity_exceptions import EmailNotVerifiedError, InvalidCredentialsError
 from gateway.log_config import logger
-from gateway.metrics import record_auth_failure
 from gateway.models.tenancy import User as TenancyUser
 from gateway.rate_limit import RateLimiter
+from gateway.services.budgets import WorkspaceBudgetDefaultService
 from gateway.services.dashboard_session_service import (
     SESSION_COOKIE_NAME,
     apply_session_cookie,
@@ -65,12 +66,11 @@ from gateway.services.dashboard_session_service import (
 from gateway.services.maintenance_mode_service import is_maintenance_mode
 from gateway.services.password_service import MAX_PASSWORD_BYTES
 from gateway.services.tenancy.email_address import MAX_EMAIL_LENGTH
-from gateway.services.tenancy.errors import EmailNotVerifiedError, InvalidCredentialsError
 from gateway.services.tenancy.organization_domain_service import OrganizationDomainService
 from gateway.services.tenancy.provisioning_service import ensure_bootstrap_identity
 from gateway.services.tenancy.user_service import authenticate, operator_has_password
 
-router = APIRouter(prefix="/v1/auth/session", tags=["auth"])
+router = APIRouter(prefix="/auth/session", tags=["auth"])
 
 MASTER_KEY_SIGN_IN_RETIRED = (
     "Master-key sign-in is retired on this deployment: it has been claimed with a password. "
@@ -96,11 +96,7 @@ class CreateSessionRequest(BaseModel):
     which is the one shape the validator below refuses.
     """
 
-    model_config = {
-        "json_schema_extra": {
-            "example": {"email": "operator@example.com", "password": "a-real-password"}
-        }
-    }
+    model_config = {"json_schema_extra": {"example": {"email": "operator@example.com", "password": "a-real-password"}}}
 
     # Every field is bounded, because this endpoint is unauthenticated and the
     # validator below settles which credential arrived rather than how large it
@@ -120,7 +116,7 @@ class CreateSessionRequest(BaseModel):
         description=(
             "The gateway master key; verified once and never stored by the browser. Accepted only "
             "while the operator identity has no password, which is to say while nobody has claimed "
-            "this deployment (see GET /v1/bootstrap)."
+            "this deployment (see GET /api/v1/bootstrap)."
         ),
     )
     email: str | None = Field(
@@ -216,7 +212,7 @@ async def _sign_in_with_master_key(
     The refusal is a 403 and not a 401, and it comes after verification:
     the key is a valid credential, it is this *use* of it that is over, and
     saying so is what lets a stale client show the right message instead of
-    prompting for the key again. It leaks nothing that ``GET /v1/bootstrap``
+    prompting for the key again. It leaks nothing that ``GET /api/v1/bootstrap``
     does not already publish unauthenticated, by design, so that the login page
     can render the right form.
     """
@@ -230,7 +226,7 @@ async def _sign_in_with_master_key(
     # Provisions the tenancy root on a first-ever sign-in, and resolves the same
     # operator every time after that. It commits its own work, which is why it
     # runs before the session row is staged rather than beside it.
-    return await ensure_bootstrap_identity(db)
+    return await ensure_bootstrap_identity(db, membership_listener=WorkspaceBudgetDefaultService(db))
 
 
 async def _sign_in_with_password(email: str, password: str, request: Request, db: AsyncSession) -> TenancyUser:
@@ -288,12 +284,12 @@ async def create_session(
     refuses both. Before, because a frozen deployment should not spend a bcrypt
     verification per attempt and the refusal is not about the credential
     anyway; both, because the way back out is the master key against
-    ``PATCH /v1/settings/maintenance-mode`` through the header, which never
+    ``PATCH /api/v1/settings/maintenance-mode`` through the header, which never
     passes through this door. That is what keeps the way back out off the frozen
     path, and it is why no identity needs an exemption here; an operator who no
     longer holds the master key recovers by setting ``OTARI_MASTER_KEY`` and
     restarting, which is a restart rather than a click. It leaks nothing
-    either: ``GET /v1/bootstrap`` already publishes the same flag
+    either: ``GET /api/v1/bootstrap`` already publishes the same flag
     unauthenticated, so the sign-in screen can render the right page.
     """
     if await is_maintenance_mode(db):
@@ -318,9 +314,7 @@ async def create_session(
         # racing, which the service settles on its own, and a database that
         # cannot stage this cannot stage the session row either.
         await OrganizationDomainService(db).auto_join_for_user(identity)
-        token, expires_at = await create_dashboard_session(
-            db, config.dashboard_session_ttl_hours, user_id=identity.id
-        )
+        token, expires_at = await create_dashboard_session(db, config.dashboard_session_ttl_hours, user_id=identity.id)
         await db.commit()
     except SQLAlchemyError:
         await db.rollback()

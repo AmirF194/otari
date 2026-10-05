@@ -20,10 +20,15 @@ description: Review a pull request or diff for this repository against otari's p
      [frontend-standards](../frontend-standards/SKILL.md).
    - Glob-match every `applyTo` pattern in [.github/instructions/](../../instructions/)
      against the changed files and apply each file that matches:
+     [backend-architecture](../../instructions/backend-architecture.instructions.md),
      [security-review](../../instructions/security-review.instructions.md),
      [performance-review](../../instructions/performance-review.instructions.md),
      [frontend-standards](../../instructions/frontend-standards.instructions.md).
-     These auto-apply for Copilot; nothing loads them for you, so read them explicitly.
+     CodeRabbit loads all four as review guidance, through the directory glob in
+     `.coderabbit.yaml` rather than through their `applyTo` frontmatter (its
+     `path_instructions` is empty). No bot reviewing here reads that frontmatter now
+     that Copilot is gone, so it is a note to a human reader and to you: glob it
+     yourself and read the files that match.
 4. Check the repo-specific gates below.
 5. Draft the review, then re-read the draft and drop anything that is not actionable.
 6. Ask whether to post. Never post without a go-ahead for that specific PR.
@@ -63,7 +68,8 @@ Check these on every review; each has broken a PR here before.
   doc comments, commit messages, or PR descriptions. CLI flags and numeric ranges are fine.
 - **PR title.** Squash-merge means the PR title is what git-cliff parses, so it must be a
   conventional commit. `CHANGELOG.md` is generated at release time and must not be
-  hand-edited.
+  hand-edited. A breaking change without `!` in the title reads like any other entry in the
+  release notes, so flag it; see [Breaking changes](../../../RELEASE.md#breaking-changes).
 
 ## Review expression
 

@@ -7,8 +7,16 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { UsageSummary } from "@/client"
 import { UsagePage } from "@/features/usage/UsagePage"
+import { API_ROOT } from "@/shared/api/client"
 import { SelectedWorkspaceProvider } from "@/shared/hooks/SelectedWorkspace"
-import { organizationContext, seriesPoint, usageTotals } from "@/tests/fixtures"
+import { DeploymentProvider } from "@/shared/hooks/useDeployment"
+import {
+  bootstrap,
+  organizationContext,
+  organizationMember,
+  seriesPoint,
+  usageTotals,
+} from "@/tests/fixtures"
 import { withRouter } from "@/tests/router"
 import { pickOption, selectTrigger } from "@/tests/select"
 
@@ -196,9 +204,9 @@ function mockApi(
   return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const url = String(input)
     for (const [path, answer] of Object.entries(extra)) {
-      // Matched at a path boundary rather than anywhere in the URL. `/v1/usage`
-      // and `/v1/organizations/me` are both prefixes of routes this page reads
-      // (`/v1/organizations/me/usage/summary` is the tenant's own), so a bare
+      // Matched at a path boundary rather than anywhere in the URL. /api/v1/usage
+      // and /api/v1/organizations/me are both prefixes of routes this page reads
+      // (/api/v1/organizations/me/usage/summary is the tenant's own), so a bare
       // `includes` would answer a summary request with an organization context.
       if (url === path || url.endsWith(path) || url.includes(`${path}?`)) {
         return jsonResponse(answer)
@@ -209,7 +217,13 @@ function mockApi(
     // the organization-scoped ones (otari#837). After `extra`, so a test that
     // supplies its own context still wins, and on an exact match so it cannot
     // shadow /v1/organizations/me/usage.
-    if (url.endsWith("/v1/organizations/me")) {
+    // The roster the breakdowns name people from. Answered by default and
+    // empty, which is the deployment nobody has invited anyone to: the rows
+    // then read the alias the summary already carries.
+    if (url.includes(`${API_ROOT}/organizations/me/members`)) {
+      return jsonResponse({ data: [], total: 0 })
+    }
+    if (url.endsWith(`${API_ROOT}/organizations/me`)) {
       return jsonResponse(organizationContext())
     }
     if (url.includes("/usage/summary")) {
@@ -263,13 +277,13 @@ function mockApi(
         ],
       })
     }
-    if (url.includes("/v1/users")) {
+    if (url.includes(`${API_ROOT}/users`)) {
       return jsonResponse([
         { user_id: "alice", alias: "Alice" },
         { user_id: "bob", alias: "Bob" },
       ])
     }
-    if (url.includes("/v1/keys")) {
+    if (url.includes(`${API_ROOT}/keys`)) {
       return jsonResponse([
         {
           id: "key-1",
@@ -309,8 +323,13 @@ function renderPage(ui: ReactElement, options: { scoped?: boolean } = {}) {
   ) : (
     ui
   )
+  // The breakdowns and the chart legend ask the organization roster what to call
+  // each person, and that read is gated on the `organizations` surface, so the
+  // page needs the deployment context the shell always gives it.
   return render(
-    <QueryClientProvider client={client}>{body}</QueryClientProvider>,
+    <DeploymentProvider value={bootstrap()}>
+      <QueryClientProvider client={client}>{body}</QueryClientProvider>
+    </DeploymentProvider>,
     {
       wrapper: withRouter({
         url: "/usage",
@@ -327,7 +346,7 @@ describe("UsagePage", () => {
 
   it("scopes the workspace view to the switcher's selection", async () => {
     const fetchMock = mockApi(summary(), {
-      "/v1/organizations/me": organizationContext({
+      [`${API_ROOT}/organizations/me`]: organizationContext({
         workspace_memberships: [
           {
             workspace_id: "ws-1",
@@ -343,7 +362,7 @@ describe("UsagePage", () => {
     expect(
       fetchMock.mock.calls.some(
         ([url]) =>
-          String(url).includes("/v1/usage/summary") &&
+          String(url).includes(`${API_ROOT}/usage/summary`) &&
           String(url).includes("workspace_id=ws-1"),
       ),
     ).toBe(true)
@@ -351,7 +370,7 @@ describe("UsagePage", () => {
     // workspace picker, so the roster this page never shows is not fetched.
     expect(
       fetchMock.mock.calls.some(([url]) =>
-        String(url).includes("/v1/workspaces"),
+        String(url).includes(`${API_ROOT}/workspaces`),
       ),
     ).toBe(false)
   })
@@ -360,9 +379,9 @@ describe("UsagePage", () => {
     // The switcher holds a selection and the fixture's caller even operates the
     // deployment; the organization page must let neither leak in. Narrowed by
     // the switcher it would repeat the workspace page, and widened to
-    // `/v1/usage` it would title every tenant's traffic as this organization's.
+    // /api/v1/usage it would title every tenant's traffic as this organization's.
     const fetchMock = mockApi(summary(), {
-      "/v1/organizations/me": organizationContext({
+      [`${API_ROOT}/organizations/me`]: organizationContext({
         workspace_memberships: [
           {
             workspace_id: "ws-1",
@@ -380,7 +399,7 @@ describe("UsagePage", () => {
       .filter((url) => url.includes("/usage/"))
     expect(reads).not.toHaveLength(0)
     for (const url of reads) {
-      expect(url).toContain("/v1/organizations/me/usage/")
+      expect(url).toContain(`${API_ROOT}/organizations/me/usage/`)
       expect(url).not.toContain("workspace_id=")
     }
   })
@@ -388,7 +407,7 @@ describe("UsagePage", () => {
   it("narrows the organization page through its own workspace filter", async () => {
     const user = userEvent.setup()
     const fetchMock = mockApi(summary(), {
-      "/v1/workspaces": {
+      [`${API_ROOT}/workspaces`]: {
         data: [
           {
             id: "ws-2",
@@ -412,7 +431,7 @@ describe("UsagePage", () => {
 
     const summaryCalls = fetchMock.mock.calls
       .map(([u]) => String(u))
-      .filter((u) => u.includes("/v1/organizations/me/usage/summary"))
+      .filter((u) => u.includes(`${API_ROOT}/organizations/me/usage/summary`))
     expect(summaryCalls.some((u) => u.includes("workspace_id=ws-2"))).toBe(true)
     // The narrowing is visible and revocable where every other filter is.
     expect(
@@ -445,7 +464,7 @@ describe("UsagePage", () => {
 
     const summaryCalls = fetchMock.mock.calls
       .map(([u]) => String(u))
-      .filter((u) => u.includes("/v1/usage/summary"))
+      .filter((u) => u.includes(`${API_ROOT}/usage/summary`))
     expect(summaryCalls.some((u) => u.includes("api_key_id=key-1"))).toBe(true)
   })
 
@@ -494,7 +513,9 @@ describe("UsagePage", () => {
     await user.click(
       screen.getByRole("button", { name: "Share usage as an image" }),
     )
-    await screen.findByText("Share this view as an image")
+    // By role: a `Dialog` fills HeroUI's trigger slot with its own title and
+    // hides it, so the string is in the document twice.
+    await screen.findByRole("dialog", { name: "Share this view as an image" })
 
     // The panel reads the page's own summary. If it ever grows a query of its
     // own, opening it would add a /v1/usage/summary call with a different
@@ -517,7 +538,7 @@ describe("UsagePage", () => {
     await vi.waitFor(() => {
       const summaryCalls = fetchMock.mock.calls
         .map(([u]) => String(u))
-        .filter((u) => u.includes("/v1/usage/summary"))
+        .filter((u) => u.includes(`${API_ROOT}/usage/summary`))
       // The sub-day extent buckets hourly (both the context histogram and the tiles).
       expect(summaryCalls.some((u) => u.includes("bucket=hour"))).toBe(true)
     })
@@ -610,7 +631,9 @@ describe("UsagePage", () => {
     const calls = fetchMock.mock.calls.map(([u]) => String(u))
     expect(
       calls.some(
-        (u) => u.includes("/v1/usage/series") && u.includes("group_by=model"),
+        (u) =>
+          u.includes(`${API_ROOT}/usage/series`) &&
+          u.includes("group_by=model"),
       ),
     ).toBe(true)
   })
@@ -627,12 +650,13 @@ describe("UsagePage", () => {
       // it is what tells them whether this caller reads the deployment-wide
       // routes or the organization-scoped ones (otari#837). Answered first, and
       // on an exact match, so it cannot shadow /v1/organizations/me/usage.
-      if (url.endsWith("/v1/organizations/me")) {
+      if (url.endsWith(`${API_ROOT}/organizations/me`)) {
         return jsonResponse(organizationContext())
       }
-      if (url.includes("/v1/usage/series"))
+      if (url.includes(`${API_ROOT}/usage/series`))
         return jsonResponse({ detail: "Not Found" }, 404)
-      if (url.includes("/v1/usage/summary")) return jsonResponse(summary())
+      if (url.includes(`${API_ROOT}/usage/summary`))
+        return jsonResponse(summary())
       return jsonResponse([])
     })
     renderPage(<UsagePage />)
@@ -817,7 +841,9 @@ describe("UsagePage", () => {
     await user.keyboard("{Escape}")
 
     await user.click(screen.getByRole("button", { name: "User" }))
-    const row = (await screen.findByText("alice")).closest("tr")!
+    // The row reads as the name, not the billing id; the id is still what the
+    // drill-down filters on.
+    const row = (await screen.findByText("Alice")).closest("tr")!
     await user.click(row)
 
     const loc =
@@ -825,6 +851,68 @@ describe("UsagePage", () => {
     expect(loc.startsWith("/activity")).toBe(true)
     expect(loc).toContain("user_id=alice")
     expect(loc).toContain("model=gpt-5.6")
+  })
+
+  it("names the person in the user breakdown instead of their billing id", async () => {
+    const user = userEvent.setup()
+    mockApi(
+      summary({
+        by_user: [
+          {
+            key: "81e24d08-7d1e-4287-a074-54aa57d9debc",
+            label: "Alice Example",
+            cost: 900.5,
+            tokens: 8_000_000,
+            requests: 50_000,
+            is_other: false,
+          },
+        ],
+      }),
+    )
+    renderPage(<UsagePage />)
+    await screen.findByText("gpt-5.6")
+
+    await user.click(screen.getByRole("button", { name: "User" }))
+    const cell = await screen.findByText("Alice Example")
+    // The id is still there to hover, because two people can share a name.
+    expect(cell).toHaveAttribute(
+      "title",
+      "81e24d08-7d1e-4287-a074-54aa57d9debc",
+    )
+    expect(
+      screen.queryByText("81e24d08-7d1e-4287-a074-54aa57d9debc"),
+    ).not.toBeInTheDocument()
+  })
+
+  it("prefers the organization roster's name to the alias the log carries", async () => {
+    const user = userEvent.setup()
+    mockApi(summary(), {
+      "/organizations/me/members": {
+        data: [
+          organizationMember({
+            attribution_user_id: "alice",
+            full_name: "Alice Example",
+          }),
+        ],
+        total: 1,
+      },
+    })
+    renderPage(<UsagePage />)
+    await screen.findByText("gpt-5.6")
+
+    await user.click(screen.getByRole("button", { name: "User" }))
+    expect(await screen.findByText("Alice Example")).toBeInTheDocument()
+    // "Alice" is the alias the summary shipped; the roster outranks it.
+    expect(screen.queryByText("Alice")).not.toBeInTheDocument()
+  })
+
+  it("leaves a dimension that is already its own name alone", async () => {
+    mockApi(summary())
+    renderPage(<UsagePage />)
+
+    // A model carries no server label, so the cell is the key itself and gains
+    // no title to hover.
+    expect(await screen.findByText("gpt-5.6")).not.toHaveAttribute("title")
   })
 
   it("keeps an active API key filter when drilling into a model", async () => {
@@ -901,7 +989,7 @@ describe("UsagePage", () => {
 
     const summaryCalls = fetchMock.mock.calls
       .map(([u]) => String(u))
-      .filter((u) => u.includes("/v1/usage/summary"))
+      .filter((u) => u.includes(`${API_ROOT}/usage/summary`))
     const main = summaryCalls.find(
       (u) => u.includes("dimensions=model") && u.includes("dimensions=user"),
     )
@@ -1192,7 +1280,7 @@ describe("UsagePage", () => {
     await vi.waitFor(() => {
       const last = fetchMock.mock.calls
         .map(([u]) => String(u))
-        .filter((u) => u.includes("/v1/usage/summary"))
+        .filter((u) => u.includes(`${API_ROOT}/usage/summary`))
         .at(-1)
       expect(last).toContain("model=gpt-5.6")
       expect(last).toContain("model=claude-sonnet-5")
@@ -1267,6 +1355,13 @@ describe("UsagePage gateway-run tools", () => {
             cost: 2.49,
           },
           {
+            tool: "web_fetch",
+            calls: 86,
+            errors: 7,
+            requests: 42,
+            cost: 0.43,
+          },
+          {
             tool: "code_execution",
             calls: 65,
             errors: 6,
@@ -1285,6 +1380,12 @@ describe("UsagePage gateway-run tools", () => {
     expect(within(row).getByText("13")).toBeInTheDocument()
     expect(within(row).getByText("105")).toBeInTheDocument()
     expect(within(row).getByText("$2.49")).toBeInTheDocument()
+
+    const fetchRow = screen.getByText("web fetch").closest("tr")!
+    expect(within(fetchRow).getByText("86")).toBeInTheDocument()
+    expect(within(fetchRow).getByText("7")).toBeInTheDocument()
+    expect(within(fetchRow).getByText("42")).toBeInTheDocument()
+    expect(within(fetchRow).getByText("$0.43")).toBeInTheDocument()
   })
 
   it("drills into the Activity log filtered on the clicked tool", async () => {

@@ -5,10 +5,21 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/gateway/**'
+      - 'cli/**'
       - 'alembic/**'
       - 'tests/integration/**'
       - 'tests/unit/**'
+      # Two unit tests read the tool cards to pin the UI ceilings to the server's.
+      - 'web/src/features/tools/**'
       - 'scripts/**'
+      # A unit test renders the release notes from this config.
+      - 'cliff.toml'
+      # A unit test runs this workflow's shell steps.
+      - '.github/workflows/otari-release.yml'
+      # A unit test maps every frontend-standards heading to the review rung
+      # that carries it, so a drift between the two has to fail here.
+      - '.github/skills/frontend-standards/**'
+      - '.github/instructions/frontend-standards.instructions.md'
       - 'pyproject.toml'
       - 'uv.lock'
       - '.github/workflows/otari-tests.yml'
@@ -16,25 +27,49 @@ on:
     branches: [ main ]
     paths:
       - 'src/gateway/**'
+      - 'cli/**'
       - 'alembic/**'
       - 'tests/integration/**'
       - 'tests/unit/**'
+      # Two unit tests read the tool cards to pin the UI ceilings to the server's.
+      - 'web/src/features/tools/**'
       - 'scripts/**'
+      # A unit test renders the release notes from this config.
+      - 'cliff.toml'
+      # A unit test runs this workflow's shell steps.
+      - '.github/workflows/otari-release.yml'
+      # A unit test maps every frontend-standards heading to the review rung
+      # that carries it, so a drift between the two has to fail here.
+      - '.github/skills/frontend-standards/**'
+      - '.github/instructions/frontend-standards.instructions.md'
       - 'pyproject.toml'
       - 'uv.lock'
       - '.github/workflows/otari-tests.yml'
   workflow_dispatch:
 
+# A new push to a pull request supersedes its older run.
+# A run on main always finishes, so every commit keeps its coverage upload.
+concurrency:
+  group: otari-tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-unit:
+    name: test-unit (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each value is INDEX/COUNT, and the list must hold every INDEX from 1 to COUNT.
+        shard: ["1/4", "2/4", "3/4", "4/4"]
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
-    - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
         python-version: 3.14
         activate-environment: true
@@ -45,25 +80,32 @@ jobs:
 
     - name: Run Otari unit tests
       run: |
-        uv run pytest tests/unit -v --cov --cov-report=xml -n auto
+        uv run pytest tests/unit -v --cov --cov-report=xml -n auto --shard ${{ matrix.shard }}
 
     - name: Upload coverage
-      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
       with:
         files: ./coverage.xml
         flags: unit
         fail_ci_if_error: false
 
   test-integration:
+    name: test-integration (${{ matrix.shard }})
     runs-on: ubuntu-latest
     environment: integration-tests
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each value is INDEX/COUNT, and the list must hold every INDEX from 1 to COUNT.
+        shard: ["1/4", "2/4", "3/4", "4/4"]
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
 
-    - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
         python-version: 3.14
         activate-environment: true
@@ -76,10 +118,10 @@ jobs:
       env:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: |
-        uv run pytest tests/integration -v --cov --cov-report=xml -n auto
+        uv run pytest tests/integration -v --cov --cov-report=xml -n auto --shard ${{ matrix.shard }}
 
     - name: Upload coverage
-      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
       with:
         files: ./coverage.xml
         flags: integration
@@ -93,7 +135,7 @@ jobs:
       with:
         persist-credentials: false
 
-    - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
         python-version: 3.14
         activate-environment: true

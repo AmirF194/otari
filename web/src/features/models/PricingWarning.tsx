@@ -1,12 +1,11 @@
 import { Button } from "@heroui/react"
 import { Link } from "@tanstack/react-router"
 import { useState } from "react"
-
-import { isDeploymentOperator } from "@/features/organization/roles"
-import { useOrganizationContext } from "@/shared/api/organizations"
+import { InfoBanner } from "@/design-system/feedback/InfoBanner"
+import { useDeploymentOperator } from "@/shared/api/organizations"
 import { useSettings, useUpdateSettings } from "@/shared/api/settings"
 import { useFailureCount } from "@/shared/api/usage"
-import { InfoBanner } from "@/shared/components/feedback/InfoBanner"
+import { formatNumber } from "@/shared/helpers/format"
 import { HOUR_S } from "@/shared/helpers/timeRange"
 
 // A gateway-wide alarm, shown on every management page: when `require_pricing` is
@@ -22,22 +21,14 @@ import { HOUR_S } from "@/shared/helpers/timeRange"
 // to those failures.
 export function PricingWarning() {
   // Both the read behind the alarm and the button that clears it are
-  // deployment-operator-only (`require_deployment_operator` on `/v1/settings`),
+  // deployment-operator-only (`require_deployment_operator` on `/settings`),
   // so the audience is stated here rather than left to be inferred from a
   // refused query: without it every tenant page load fired a `GET /v1/settings`
   // that 403s to feed a banner that could never render for them (#834). Off the
   // organization context, which the shell reads anyway, for the reason
   // `useProviderKeyEncryption` does: a second request to ask the same question
   // is the cost this removes.
-  const organization = useOrganizationContext()
-  // Fails open on a failed context read, which is what the rail does with the
-  // same class of gate: `/v1/settings` is `require_deployment_operator`, so it
-  // refuses with a 403 rather than a 404, and `nav/types.ts` settles what that
-  // means with no answer. Here it costs more than a hidden row, because the
-  // banner is the only thing reporting that traffic is being dropped right now.
-  // The ordinary tenant path, a resolved context saying no, still asks nothing.
-  const isOperator =
-    isDeploymentOperator(organization.data) || organization.isError
+  const { isOperator } = useDeploymentOperator()
   const settings = useSettings(isOperator)
   const updateSettings = useUpdateSettings()
   const [dismissed, setDismissed] = useState(false)
@@ -49,7 +40,7 @@ export function PricingWarning() {
     isOperator &&
     settings.data?.require_pricing === true &&
     settings.data.default_pricing === false
-  const showing = needsPricing && !dismissed
+  const isShowing = needsPricing && !dismissed
 
   // Every failure class the gateway served is counted (402 no pricing, 403 budget
   // or model access, 502 provider), not only the pricing rejections: the operator's
@@ -57,10 +48,10 @@ export function PricingWarning() {
   // failure is safer than a banner reading "0" while requests are being dropped.
   // Imported usage is excluded, so the link's filtered view matches this count.
   // Only polled while the alarm is up.
-  const failures = useFailureCount(HOUR_S, showing)
+  const failures = useFailureCount(HOUR_S, isShowing)
   const failureCount = failures.data?.total ?? 0
 
-  if (!showing) {
+  if (!isShowing) {
     return null
   }
 
@@ -93,7 +84,7 @@ export function PricingWarning() {
               <>
                 {" "}
                 <strong className="font-semibold">
-                  {failureCount.toLocaleString()}{" "}
+                  {formatNumber(failureCount)}{" "}
                   {failureCount === 1 ? "request" : "requests"} failed in the
                   last hour.
                 </strong>{" "}

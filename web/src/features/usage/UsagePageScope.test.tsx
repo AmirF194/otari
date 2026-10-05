@@ -13,7 +13,9 @@ import type { ReactElement } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import type { UsageSummary } from "@/client"
 import { UsagePage } from "@/features/usage/UsagePage"
-import { organizationContext, usageTotals } from "@/tests/fixtures"
+import { API_ROOT } from "@/shared/api/client"
+import { DeploymentProvider } from "@/shared/hooks/useDeployment"
+import { bootstrap, organizationContext, usageTotals } from "@/tests/fixtures"
 import { withRouter } from "@/tests/router"
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -42,13 +44,13 @@ function summary(): UsageSummary {
   }
 }
 
-// Answers on the path's tail, so one mock serves `/v1/usage/*` and
-// `/v1/organizations/me/usage/*` alike and which was asked for is what the
+// Answers on the path's tail, so one mock serves /api/v1/usage/* and
+// /api/v1/organizations/me/usage/* alike and which was asked for is what the
 // assertions read back off the spy.
 function mockApi(deploymentOperator: boolean) {
   return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const url = String(input)
-    if (url.endsWith("/v1/organizations/me")) {
+    if (url.endsWith(`${API_ROOT}/organizations/me`)) {
       return jsonResponse(
         organizationContext({ deployment_operator: deploymentOperator }),
       )
@@ -72,8 +74,12 @@ function renderPage(ui: ReactElement) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
+  // See UsagePage.test.tsx: the breakdowns read the roster, which is gated on a
+  // surface only the deployment context can report.
   return render(
-    <QueryClientProvider client={client}>{ui}</QueryClientProvider>,
+    <DeploymentProvider value={bootstrap()}>
+      <QueryClientProvider client={client}>{ui}</QueryClientProvider>
+    </DeploymentProvider>,
     { wrapper: withRouter({ url: "/usage" }) },
   )
 }
@@ -100,7 +106,7 @@ describe("UsagePage scope", () => {
     // from two endpoints, and a scope on only one would put another tenant's
     // totals above this tenant's chart.
     for (const url of reads) {
-      expect(url).toContain("/v1/organizations/me/usage/")
+      expect(url).toContain(`${API_ROOT}/organizations/me/usage/`)
     }
   })
 
@@ -112,7 +118,7 @@ describe("UsagePage scope", () => {
     const reads = usageReads(fetchMock)
     expect(reads).not.toHaveLength(0)
     for (const url of reads) {
-      expect(url).not.toContain("/v1/organizations/me/usage/")
+      expect(url).not.toContain(`${API_ROOT}/organizations/me/usage/`)
     }
   })
 })

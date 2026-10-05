@@ -39,7 +39,12 @@ RUN pip install --no-cache-dir --upgrade pip uv
 
 COPY pyproject.toml uv.lock ./
 COPY src ./src
-RUN uv sync --frozen --no-dev
+COPY cli ./cli
+# The e2b extra lets `sandbox_provider: e2b` work from the published image; the
+# adapter imports it only when that provider is selected. The metrics extra keeps
+# a Prometheus scrape one config flag away rather than a reinstall, and the redis
+# extra a rate limit shared across replicas.
+RUN uv sync --frozen --no-dev --extra e2b --extra metrics --extra redis
 
 FROM python:3.14-slim AS runtime
 
@@ -49,6 +54,7 @@ RUN useradd -m -u 1000 otari && chown otari:otari /app
 
 COPY --from=builder --chown=otari:otari /app/.venv /app/.venv
 COPY --chown=otari:otari src ./src
+COPY --chown=otari:otari cli ./cli
 COPY --from=web --chown=otari:otari /app/src/gateway/static/dashboard ./src/gateway/static/dashboard
 COPY --chown=otari:otari alembic ./alembic
 COPY --chown=otari:otari alembic.ini ./alembic.ini
@@ -60,7 +66,7 @@ ENV PATH="/app/.venv/bin:${PATH}"
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" || exit 1
 
 ARG OTARI_VERSION=0.0.0-dev
 ENV OTARI_VERSION=${OTARI_VERSION}

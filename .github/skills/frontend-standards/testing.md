@@ -17,8 +17,36 @@ lives in [AGENTS.md](../../../AGENTS.md) under "Test Notes".
 colocated: `Foo.tsx` → `Foo.test.tsx`, `format.ts` → `format.test.ts`.
 
 **Query the way an operator would.** `getByRole`, `getByLabelText`, `getByText`. Not
-`getByTestId`, and never a class selector: `.bg-surface` is a token that will be renamed, and
-a test that breaks on a restyle teaches everyone to stop trusting the suite.
+`getByTestId`, and never a class selector to *find* an element: `.bg-surface` is a token that
+will be renamed, and a test that breaks on a restyle teaches everyone to stop trusting the
+suite. Where a state has an accessible expression, assert that: `design-system/metrics/charts.tsx`
+switches `role="group"` / `role="img"` on whether the chart owns drag selection, so the role is
+the assertion and `.cursor-crosshair` is a hint that follows it.
+
+**The one exception is a layout property jsdom cannot compute.** There is no layout under
+jsdom, so "this tile reserves 42px so a missing chip does not collapse the row" is observable
+only as the class that causes it, and the screenshot suite that could see it is not a gate yet.
+Four rules make that a pin rather than a loophole: assert with `toHaveClass` on one scoped
+element (never `className` with `toContain`, see below), prefer a class naming a token over one
+naming a number (`min-h-[var(--text-caption-step--line-height)]`, not `min-h-10.5`), say at the
+site which layout fact is being pinned, and only for a fact no user-visible query can reach.
+`design-system/forms/FieldMessages.test.tsx:119` is the model.
+
+**The exception covers the assertion, not the query.** Reach the element the way any other test
+would, by its role, its text, or a structural step from either, and assert the class on what you
+found: the description's own parent is the caption line, and a step down from the value reaches
+the tile's aside row. `container.querySelector(".text-caption")` is the exception reopening as
+the rule it was carved out of, and it fails the "one scoped element" clause anyway, since a
+subtree search is not a scope. An absence follows the same shape: "this tile reserves no row"
+is the row not being rendered, not a class going unfound.
+
+A node the accessibility tree hides on purpose is not covered by that exception. `DataTable`'s
+detail host is `role="presentation"` deliberately (`DataTable.tsx:219`), and its comment says
+where to go instead: the content stays in the tree, so "a row is expanded" is asserted on the
+detail's own content rather than by counting hosts. What stays on the host is its identity:
+`DataTable.test.tsx` pins that the same `<tr>` is reused rather than recreated across a
+re-render, which is what stops the panel remounting and has no user-visible form at all. That
+is the whole of it, and it says so at the site.
 
 **Mock the network boundary, nothing inside it.** The page tests spy on the transport and let
 the real hooks, query keys, formatters, and derivations run:
@@ -35,6 +63,22 @@ Mocking `useModels` or `formatCost` instead hides exactly the regressions worth 
 changed query key, a loading state nobody renders, a formatter that rounds wrong. There is no
 `vi.mock("@/shared/api/<domain>")` anywhere in this tree, and adding the first one needs a reason
 in the diff.
+
+**Two forms reach that boundary, and which one to use follows from the page.** The spy above is
+for an authenticated page test, where it is also the assertion surface for the call list. The
+module form is for a subject that reaches the transport through more than one export, or before
+a spy can be installed, which is the public auth and invitation flows:
+
+```tsx
+vi.mock("@/shared/api/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/shared/api/client")>()
+  return { ...actual, apiFetch: vi.fn(), siteFetch: vi.fn() }
+})
+```
+
+`importOriginal` is what keeps it a boundary mock: everything but the transport stays real.
+Ten public and pre-authentication files use this form and five authenticated page tests use the
+spy, and that split is the rule rather than drift.
 
 **Render what the app renders.** A component that reads the URL needs a real router:
 `withRouter` / `renderWithRouter` from `src/tests/router.tsx`. The router resolves its first
@@ -161,6 +205,52 @@ trades away the per-keystroke path a real operator takes. Deliberately not
 done: `user.type` is one line and it is the library's own API. Revisit only if
 the suite gets slow enough to be worth the churn, and measure one file before
 committing to the rest.
+
+## A combo box inside a dialog: Escape is not the way to close its popover
+
+A form that lives in a `FormDialog` gives one keystroke two meanings, and the
+habit that works everywhere else is the one that breaks. `{Escape}` after
+picking an option is how a spec puts a react-aria popover away, because that
+popover `aria-hidden`s the rest of the page and hides the control the spec
+presses next. Inside a dialog the key travels on to the dialog, which either
+closes it or, where the form is dirty, swaps the footer for its unsaved-changes
+guard. The failure reads as a missing submit button, several lines below the
+line that caused it.
+
+This has cost a run on three pages: keys, routing and providers.
+
+**What to do after a pick depends on `menuTrigger`, and the default is the
+awkward one.** `ComboBoxField` defaults to `menuTrigger="focus"`, which
+`UserComboBox` and `providerFields` also set explicitly. Selecting an option
+hands focus back to the input, and a box that opens on focus reopens: the
+popover is open again, the page is `aria-hidden` again, and the dialog's submit
+is out of reach. So:
+
+- **A `menuTrigger="focus"` box needs focus moved off it**, by clicking a named
+  control inside the dialog: `await user.click(screen.getByLabelText("Name"))`
+  is what the keys dialog does. Not a bare `blur()`, which lands straight back
+  on the box because a modal contains focus, and reopens the popover for the
+  same reason.
+- **A `menuTrigger="input"` box needs nothing.** Its popover opens on typing,
+  so the pick leaves it closed and there is nothing for a keystroke to do.
+- **Where a spec has to dismiss without picking, send Escape only while the box
+  reports `aria-expanded="true"`**, and check the attribute rather than waiting
+  on it: a popover that is already closed satisfies a wait instantly, by which
+  point the keystroke has landed on the dialog.
+- **Query the submit through the dialog** (`within(dialog)` in Vitest,
+  `page.getByRole("dialog").getByRole(...)` in Playwright). The labels rule puts
+  the same words on the page trigger and on the dialog's submit, so an unscoped
+  query is ambiguous while the dialog is open, and ambiguous again on an empty
+  list where the empty state offers the same words a third time.
+- **In Vitest, use one `userEvent` instance for the whole flow.** Mixing a
+  fresh `userEvent.setup()` with the bare default drops the press: the submit
+  reports as enabled, inside the form, and nothing happens. It reads exactly
+  like a validation guard refusing, and it cost an afternoon being mistaken for
+  one.
+
+None of this applies to a combo box in a toolbar, which is what
+`e2e/helpers.ts`'s `dismissComboBox` was written for: it presses Escape and
+blurs unconditionally, and both are right outside a modal.
 
 ## Playwright: behavioral
 

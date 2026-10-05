@@ -1,9 +1,9 @@
-"""Regression test for streaming /v1/messages token + cost metering.
+"""Regression test for streaming /api/v1/messages token + cost metering.
 
-Reproduces the surface of mozilla-ai/otari#256: a streaming ``/v1/messages``
+Reproduces the surface of mozilla-ai/otari#256: a streaming ``/api/v1/messages``
 request whose stream completes cleanly must record the request's tokens and
 cost in the usage log, the same as the non-streaming path and as streaming
-``/v1/chat/completions``. The undercount originated in any-llm (the messages
+``/api/v1/chat/completions``. The undercount originated in any-llm (the messages
 bridge did not request usage on streaming, so the translated Anthropic events
 carried zero), fixed upstream in any-llm 1.21.0; otari's settlement path
 (``_messages_stream_usage`` -> ``streaming_generator``) already merges the
@@ -13,8 +13,10 @@ messages response that carries usage, the ``UsageLog`` row is non-zero.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import AsyncIterator, Callable
+from decimal import Decimal
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -34,7 +36,8 @@ from any_llm.types.messages import (
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from gateway.models.entities import UsageLog
+from gateway.core.config import API_ROOT, REQUEST_ID_HEADER
+from gateway.models.usage import UsageLog
 
 from .conftest import MODEL_NAME
 
@@ -46,11 +49,11 @@ _COMPACTION_OUTPUT_TOKENS = 20
 
 
 def _seed_budgeted_user(client: TestClient, headers: dict[str, str], user_id: str) -> None:
-    budget = client.post("/v1/budgets", json={"max_budget": 100.0}, headers=headers)
+    budget = client.post(f"{API_ROOT}/budgets", json={"max_budget": 100.0}, headers=headers)
     assert budget.status_code == 200
     budget_id = budget.json()["budget_id"]
     created = client.post(
-        "/v1/users",
+        f"{API_ROOT}/users",
         json={"user_id": user_id, "budget_id": budget_id},
         headers=headers,
     )
@@ -58,7 +61,7 @@ def _seed_budgeted_user(client: TestClient, headers: dict[str, str], user_id: st
 
 
 def _configure_pricing(client: TestClient, headers: dict[str, str], model_key: str) -> None:
-    res = client.post("/v1/pricing", json={"model_key": model_key, **_PRICING}, headers=headers)
+    res = client.post(f"{API_ROOT}/pricing", json={"model_key": model_key, **_PRICING}, headers=headers)
     assert res.status_code == 200
 
 
@@ -150,9 +153,7 @@ async def _stream_with_compaction_usage(**_kwargs: Any) -> AsyncIterator[Message
     return _gen()
 
 
-def _poll_usage_row(
-    make_session: Callable[[], Session], user_id: str, *, timeout: float = 3.0
-) -> UsageLog | None:
+def _poll_usage_row(make_session: Callable[[], Session], user_id: str, *, timeout: float = 3.0) -> UsageLog | None:
     deadline = time.time() + timeout
     while True:
         db = make_session()
@@ -176,7 +177,7 @@ def test_messages_streaming_records_tokens_and_cost(
 
     with patch("gateway.api.routes.messages.amessages", new=_stream_with_usage):
         response = client.post(
-            "/v1/messages",
+            f"{API_ROOT}/messages",
             json={
                 "model": MODEL_NAME,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -194,7 +195,7 @@ def test_messages_streaming_records_tokens_and_cost(
     assert "message_stop" in body
 
     row = _poll_usage_row(db_session_factory, user_id)
-    assert row is not None, "streaming /v1/messages must record a usage row"
+    assert row is not None, "streaming /api/v1/messages must record a usage row"
     assert row.status == "success"
     assert row.prompt_tokens == _INPUT_TOKENS
     assert row.completion_tokens == _OUTPUT_TOKENS
@@ -212,7 +213,7 @@ def test_messages_streaming_bills_compaction_iterations(
 
     with patch("gateway.api.routes.messages.amessages", new=_stream_with_compaction_usage):
         response = client.post(
-            "/v1/messages",
+            f"{API_ROOT}/messages",
             json={
                 "model": MODEL_NAME,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -228,8 +229,48 @@ def test_messages_streaming_bills_compaction_iterations(
     assert "message_stop" in body
 
     row = _poll_usage_row(db_session_factory, user_id)
-    assert row is not None, "streaming /v1/messages must bill compaction usage"
+    assert row is not None, "streaming /api/v1/messages must bill compaction usage"
     assert row.status == "success"
     assert row.prompt_tokens == _INPUT_TOKENS + _COMPACTION_INPUT_TOKENS
     assert row.completion_tokens == _OUTPUT_TOKENS + _COMPACTION_OUTPUT_TOKENS
     assert row.cost is not None and row.cost > 0.0
+
+
+def test_messages_streaming_carries_the_settled_cost_on_message_delta(
+    client: TestClient,
+    master_key_header: dict[str, str],
+    db_session_factory: Callable[[], Session],
+) -> None:
+    """The ``message_delta`` usage carries the same amount the usage row settled at."""
+    user_id = "stream-inline-cost-messages"
+    _seed_budgeted_user(client, master_key_header, user_id)
+    _configure_pricing(client, master_key_header, MODEL_NAME)
+
+    with patch("gateway.api.routes.messages.amessages", new=_stream_with_usage):
+        response = client.post(
+            f"{API_ROOT}/messages",
+            json={
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 64,
+                "stream": True,
+                "metadata": {"user_id": user_id},
+            },
+            headers=master_key_header,
+        )
+        assert response.status_code == 200, response.text
+        body = response.text
+
+    assert response.headers[REQUEST_ID_HEADER]
+    deltas = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ") and '"message_delta"' in line
+    ]
+    assert len(deltas) == 1
+    usage = deltas[0]["usage"]
+    assert usage["pricing_source"] == "deployment"
+
+    row = _poll_usage_row(db_session_factory, user_id)
+    assert row is not None and row.cost is not None
+    assert Decimal(usage["cost_usd"]) == row.cost

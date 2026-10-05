@@ -1,8 +1,10 @@
 """Data access for the reconciled control plane's identities."""
 
 import uuid
+from datetime import datetime
+from typing import Any, cast
 
-from sqlalchemy import func, nulls_last, select
+from sqlalchemy import CursorResult, func, nulls_last, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import col
@@ -104,6 +106,31 @@ class UserRepository(BaseRepository[User, UserCreate, UserBase]):
         await self.db.refresh(user)
         return user
 
+    async def any_active_with_password(self) -> bool:
+        """Whether some active identity on this deployment could sign in with a password.
+
+        Asked by the bootstrap so the sign-in screen offers the email and
+        password form to anyone who has one, not only once the *operator*
+        identity does (otari-ai#2100). ``POST /api/v1/auth/session`` has always
+        accepted a password from any identity; publishing the method off the
+        operator alone is what left a member who signed up on an unclaimed
+        deployment looking at a master-key box they hold no key for.
+
+        Deactivated rows are excluded because ``authenticate`` refuses them, so
+        a deployment whose only password-holder has been deactivated is one
+        where the form could not work.
+
+        A ``LIMIT 1`` existence check rather than a count: the answer is a
+        boolean and the table is unbounded.
+        """
+        result = await self.db.execute(
+            select(col(User.id))
+            .where(col(User.hashed_password).is_not(None))
+            .where(col(User.is_active).is_(True))
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
     async def list_all(self, *, skip: int = 0, limit: int = 100) -> tuple[list[User], int]:
         """Return a page of every identity on the deployment, plus the total.
 
@@ -156,6 +183,45 @@ class UserRepository(BaseRepository[User, UserCreate, UserBase]):
         land. A deployment that needs this guarantee runs PostgreSQL.
         """
         await self.db.execute(select(col(User.id)).where(col(User.id) == user_id).with_for_update())
+
+    async def claim_first_password(
+        self,
+        user_id: uuid.UUID,
+        *,
+        hashed_password: str,
+        require_unverified: bool,
+        values: dict[str, str | datetime | None],
+    ) -> bool:
+        """Set a first password only while the identity still has none; say whether this call did.
+
+        The one write every first-credential path goes through (signup, and an
+        invitation accepted with a password), because each of them checks
+        "no password yet" before it hashes one, and a check followed by a
+        plain write lets a slower caller overwrite a faster one's password.
+        The condition in the ``UPDATE`` is what decides instead: on PostgreSQL
+        the second writer waits on the first's row lock and then matches no
+        row, and on SQLite writes are serialized outright.
+
+        ``require_unverified`` also refuses an identity with a verified address,
+        which is what a provider sign-in leaves on one that never set a password.
+
+        Staged, not committed, and not synchronized into the session: a caller
+        that won commits, and one that lost rolls back.
+        """
+        statement = update(User).where(
+            col(User.id) == user_id,
+            col(User.hashed_password).is_(None),
+            col(User.is_active).is_(True),
+        )
+        if require_unverified:
+            statement = statement.where(col(User.email_verified_at).is_(None))
+        result = cast(
+            "CursorResult[Any]",
+            await self.db.execute(
+                statement.values(hashed_password=hashed_password, **values).execution_options(synchronize_session=False)
+            ),
+        )
+        return bool(result.rowcount)
 
     async def set_active_organization(self, user: User, organization_id: uuid.UUID) -> User:
         """Stage a change of the identity's active organization."""

@@ -21,18 +21,18 @@ import { useState } from "react"
 import { FiMail } from "react-icons/fi"
 
 import type { PendingOrganizationInvitation } from "@/client"
+import { ConfirmDialog } from "@/design-system/feedback/ConfirmDialog"
+import { EmptyState } from "@/design-system/feedback/EmptyState"
+import { ErrorBanner } from "@/design-system/feedback/ErrorBanner"
+import { PageLoading } from "@/design-system/feedback/PageLoading"
+import { PageIntro } from "@/design-system/layout/PageIntro"
+import { Section } from "@/design-system/layout/Section"
 import { membershipLabel } from "@/features/organization/roles"
 import {
   useAcceptPendingMembership,
   useDeclinePendingMembership,
   usePendingOrganizationInvitations,
 } from "@/shared/api/organizations"
-import { ConfirmDialog } from "@/shared/components/feedback/ConfirmDialog"
-import { EmptyState } from "@/shared/components/feedback/EmptyState"
-import { ErrorBanner } from "@/shared/components/feedback/ErrorBanner"
-import { PageLoading } from "@/shared/components/feedback/PageLoading"
-import { PageIntro } from "@/shared/components/layout/PageIntro"
-import { Section } from "@/shared/components/layout/Section"
 import { formatDateTime } from "@/shared/helpers/format"
 
 export function PendingInvitationsPage() {
@@ -51,7 +51,7 @@ export function PendingInvitationsPage() {
   // settled. A failed read settles too, and reading `isFetched` alone would
   // put "nothing is waiting" on screen next to the error banner saying the
   // list could not be read, which is a claim this page has no basis for.
-  const answered = invitations.data !== undefined
+  const hasAnswered = invitations.data !== undefined
 
   return (
     <div className="flex flex-col">
@@ -70,7 +70,7 @@ export function PendingInvitationsPage() {
         <PageLoading label="Loading invitations…" />
       ) : null}
 
-      {answered && waiting.length === 0 ? (
+      {hasAnswered && waiting.length === 0 ? (
         <EmptyState
           title="No invitations waiting"
           description="When an organization invites you, it appears here as well as in the email it sends, so a link you never received is not the only way in."

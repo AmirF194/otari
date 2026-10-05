@@ -1,12 +1,12 @@
 """Built-in tool & guardrail configuration for the admin dashboard.
 
-The service-endpoint and web-search fields that ``/v1/settings`` keeps
+The service-endpoint and web-search fields that ``/api/v1/settings`` keeps
 display-only (the ``*_url`` fields and the web-search knobs are excluded there on
 SSRF grounds) are made editable here, on their own page, with structural URL
 validation and per-service reachability tests. Standalone-only and master-key
 gated, mirroring the other management routers.
 
-* ``GET /v1/tool-settings`` returns each field's effective value (the value a
+* ``GET /api/v1/tool-settings`` returns each field's effective value (the value a
   request would actually use), grouped by service, with URL passwords masked. It
   is the one verb here a non-operator may call, because the roles matrix has the
   Tools pages at View for a member (otari-ai#1969): a member is told what the
@@ -14,11 +14,21 @@ gated, mirroring the other management routers.
   withheld from them entirely rather than masked. Masking a URL still publishes
   the host, which is internal infrastructure and the input to the SSRF gates on
   the Settings page.
-* ``PATCH /v1/tool-settings`` persists overrides (an explicit ``null`` clears a
+* ``PATCH /api/v1/tool-settings`` persists overrides (an explicit ``null`` clears a
   field back to the configured env/YAML default; an omitted field is unchanged)
   and applies them to the running worker.
-* ``POST /v1/tool-settings/{service}/test`` structurally validates a (typically
+* ``POST /api/v1/tool-settings/{service}/test`` structurally validates a (typically
   unsaved) URL and probes it for reachability, returning ``{ok, reason}``.
+* ``GET /api/v1/tool-settings/guardrails/profiles`` reads the guardrail catalog off
+  the service ``guardrails_url`` names. It sits here because that field is the
+  only input it takes, and on the reader router for the reason the GET above is:
+  a profile name is what a caller puts in a request body, so the set of them is
+  not the operator's to withhold, and the endpoint they were read from does not
+  appear in the answer.
+* ``GET /api/v1/tool-settings/guardrails/catalog`` lists the guardrails this
+  gateway can run itself, from the installed ``any_guardrail``. On the operator
+  router, unlike the profiles read beside it: it is the picker behind a form that
+  stores a vendor credential deployment-wide, which is not a tenant's to read.
 """
 
 from typing import Annotated, Literal, cast
@@ -29,38 +39,64 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gateway.api.deps import get_config, get_db, get_session_identity, require_deployment_operator, verify_master_key
+from gateway.api.deps import (
+    get_config,
+    get_db,
+    get_session_identity,
+    require_deployment_operator,
+    verify_catalog_reader,
+    verify_master_key,
+)
 from gateway.core.config import GatewayConfig
 from gateway.log_config import logger
 from gateway.models.tenancy import User as TenancyUser
+from gateway.services.guardrail_catalog import (
+    BuiltInGuardrailCatalog,
+    GuardrailCatalog,
+    build_builtin_guardrail_catalog,
+    fetch_guardrail_catalog,
+)
 from gateway.services.runtime_settings_service import SettingValue
 from gateway.services.tenancy.deployment_user_service import DeploymentUserService
 from gateway.services.tool_settings_service import (
+    GUARDRAILS_URL,
     SERVICE_URL_FIELD,
     TOOL_SETTABLE_KEYS,
     apply_override,
+    effective_value,
     effective_values,
     field_service,
     field_type,
+    get_field_options,
     stage_override,
     validate_url,
 )
 from gateway.services.url_safety import redact_url_secrets
 
-# Two routers, because one route here must not carry the operator gate, which is
-# the split #895 made for ``models.py``, ``pricing.py`` and ``usage.py``: a
+# Three routers, because two routes here must not carry the operator gate, which
+# is the split #895 made for ``models.py``, ``pricing.py`` and ``usage.py``: a
 # router-level dependency always runs, so a route cannot opt out of one in place.
 # The reader declares ``verify_master_key`` and then decides how much to return
 # from the caller's standing, exactly as the tenant-scoped routers do.
 operator_router = APIRouter(
-    prefix="/v1/tool-settings",
+    prefix="/tool-settings",
     tags=["tool-settings"],
     dependencies=[Depends(require_deployment_operator)],
 )
 reader_router = APIRouter(
-    prefix="/v1/tool-settings",
+    prefix="/tool-settings",
     tags=["tool-settings"],
     dependencies=[Depends(verify_master_key)],
+)
+# The built-in catalog, which describes the installed ``any_guardrail`` rather
+# than anything this deployment configured. A tenant reaches it: the organization
+# guardrail form is the picker's other caller, and it is owners and admins who
+# fill it, never an operator. Gated like the other catalog reads so admitting a
+# session is spelled at the router (see ``deps.verify_catalog_reader``).
+catalog_router = APIRouter(
+    prefix="/tool-settings",
+    tags=["tool-settings"],
+    dependencies=[Depends(verify_catalog_reader)],
 )
 
 # Derived from each field's declared type rather than from ``SERVICE_URL_FIELD``,
@@ -84,6 +120,8 @@ class ToolSettingField(BaseModel):
     # keeping float out of the type narrows the OpenAPI contract accordingly.
     value: bool | int | str | None
     description: str | None = None
+    # A write refuses any value outside this list.
+    options: list[str] | None = None
 
 
 class ToolSettingsResponse(BaseModel):
@@ -111,6 +149,7 @@ class UpdateToolSettingsRequest(BaseModel):
     sandbox_url: str | None = None
     sandbox_purpose_hint: str | None = None
     sandbox_session_image: str | None = None
+    code_execution_executor: str | None = None
     guardrails_url: str | None = None
 
 
@@ -149,6 +188,7 @@ def _current_fields(config: GatewayConfig, *, include_urls: bool = True) -> Tool
             type=field_type(key),  # type: ignore[arg-type]
             value=_display_value(config, key),
             description=GatewayConfig.model_fields[key].description,
+            options=get_field_options(key),
         )
         for key in keys
     ]
@@ -173,6 +213,72 @@ async def get_tool_settings(
         session_identity
     )
     return _current_fields(config, include_urls=include_urls)
+
+
+@reader_router.get("/guardrails/profiles")
+async def list_guardrail_profiles(
+    config: Annotated[GatewayConfig, Depends(get_config)],
+) -> GuardrailCatalog:
+    """List the guardrail profiles this deployment's guardrails service has built.
+
+    What an organization guardrail's ``profile`` may name, with the
+    ``validate_kwargs`` each one accepts, so the dashboard offers a picker and
+    typed fields instead of a free-text box beside an unrendered dict. The
+    profiles come from the service itself and the parameter schemas from the
+    ``any_guardrail`` registry; neither is a list kept in this repository. See
+    `gateway.services.guardrail_catalog`.
+
+    Reports ``available: false`` with a reason rather than an error when the
+    service is unconfigured, unreachable, or older than its ``/profiles``
+    endpoint, because a guardrails outage must not also break the page that
+    configures guardrails.
+
+    Read against ``guardrails_url``, which is the deployment's own service. An
+    entry that carries an endpoint of its own is not probed: that URL is
+    caller-supplied and fetching it here would make this a way to have the
+    gateway request an address of the caller's choosing.
+
+    Not on ``verify_catalog_reader``, despite being a catalog read: that plane is
+    the three deployment-describing reads a data-plane key may also make, and
+    admitting a key here would let any workspace credential dial the deployment's
+    guardrails service. This is a management read, so it takes the router's own gate.
+    """
+    return await fetch_guardrail_catalog(cast("str | None", effective_value(config, GUARDRAILS_URL)))
+
+
+@catalog_router.get("/guardrails/catalog")
+async def list_builtin_guardrails() -> BuiltInGuardrailCatalog:
+    """List the guardrails this gateway can run itself, for the form that defines one.
+
+    Every guardrail ``any_guardrail`` reaches over a hosted API, with the
+    constructor and per-call arguments each one takes, so a guardrail is
+    configured by picking it and filling typed fields. It is not the whole
+    library: a guardrail that works by holding model weights in the process
+    running it belongs in the guardrails service the profiles read beside this one
+    describes, not here. A parameter names the environment variable that fills it
+    where one exists, and ``requirement_groups`` carries the constraints satisfied
+    by any of several parameters, which no single required flag can state. This is
+    the counterpart of
+    ``GET /api/v1/providers/catalog``: the same picker, for a guardrail rather
+    than a provider, and on the same gate that one takes.
+
+    Reaches no service, so there is no unavailable state to report: the answer is
+    a property of the installed ``any_guardrail``, not of any deployment's state.
+
+    On the catalog router rather than the operator one beside it, because the
+    form this feeds belongs to an organization and is filled by an owner or
+    admin, who reaches no operator route. So it is readable without
+    deployment-wide standing, by a dashboard session and by any API key alike.
+    What it publishes carries no deployment state to withhold: the same bytes on
+    every deployment of the same build, and a parameter's environment variable is
+    a name, never whether that name is set.
+
+    The profiles read next door keeps the stricter gate, and the difference is
+    reach rather than audience. That one dials ``guardrails_url``, so admitting a
+    key there would let a workspace credential probe the deployment's own
+    service. This one dials nothing.
+    """
+    return build_builtin_guardrail_catalog()
 
 
 @operator_router.patch("")

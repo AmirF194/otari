@@ -2,11 +2,12 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 
 from gateway.api.routes import settings as settings_route
 from gateway.api.routes.settings import _CONFIG_VIEW, _DELIBERATELY_OMITTED, _config_fields
-from gateway.core.config import GatewayConfig
+from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.main import create_app
 from gateway.services import master_key_service
 from gateway.services.pricing_service import configure_default_pricing, default_pricing_enabled
@@ -26,19 +27,19 @@ def _client(tmp_path: Path, *, default_pricing: bool = False, require_pricing: b
 
 def test_settings_requires_auth(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
 def test_settings_rejects_non_master_key(tmp_path: Path) -> None:
     # The settings route is admin-only: a token that is not the master key is rejected.
     with _client(tmp_path) as client:
-        response = client.get("/v1/settings", headers={"Authorization": "Bearer not-the-master-key"})
+        response = client.get(f"{API_ROOT}/settings", headers={"Authorization": "Bearer not-the-master-key"})
     assert response.status_code == 401
 
 
 def test_rotate_master_key_rejects_configured_key(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
-        response = client.post("/v1/settings/master-key/rotate", headers=AUTH)
+        response = client.post(f"{API_ROOT}/settings/master-key/rotate", headers=AUTH)
     assert response.status_code == 409
     assert "configured master key" in response.json()["detail"]
 
@@ -50,20 +51,18 @@ def test_rotate_generated_master_key_invalidates_old_key(tmp_path: Path, monkeyp
 
     with TestClient(create_app(config)) as client:
         old_auth = {"Authorization": "Bearer otari-mk-old"}
-        rotated = client.post("/v1/settings/master-key/rotate", headers=old_auth)
+        rotated = client.post(f"{API_ROOT}/settings/master-key/rotate", headers=old_auth)
         assert rotated.status_code == 200, rotated.text
         assert rotated.json() == {"master_key": "otari-mk-new"}
 
-        old_response = client.get("/v1/settings", headers=old_auth)
+        old_response = client.get(f"{API_ROOT}/settings", headers=old_auth)
         assert old_response.status_code == 401
-        new_response = client.get("/v1/settings", headers={"Authorization": "Bearer otari-mk-new"})
+        new_response = client.get(f"{API_ROOT}/settings", headers={"Authorization": "Bearer otari-mk-new"})
         assert new_response.status_code == 200
         assert new_response.json()["master_key_source"] == "generated"
 
 
-def test_rotate_generated_master_key_rejects_a_stale_rotation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_rotate_generated_master_key_rejects_a_stale_rotation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(master_key_service, "generate_master_key", lambda: "otari-mk-old")
 
     async def _stale_rotation(*_: object) -> tuple[str, str]:
@@ -75,7 +74,9 @@ def test_rotate_generated_master_key_rejects_a_stale_rotation(
     config = GatewayConfig(database_url=f"sqlite:///{tmp_path / 'stale-master.db'}", require_pricing=False)
 
     with TestClient(create_app(config)) as client:
-        response = client.post("/v1/settings/master-key/rotate", headers={"Authorization": "Bearer otari-mk-old"})
+        response = client.post(
+            f"{API_ROOT}/settings/master-key/rotate", headers={"Authorization": "Bearer otari-mk-old"}
+        )
     assert response.status_code == 409
     assert response.json()["detail"] == "The master key was already rotated. Reload and try again."
 
@@ -92,18 +93,19 @@ def test_rotation_invalidates_the_old_generated_key_on_another_replica(
     with TestClient(create_app(first)) as first_client:
         with TestClient(create_app(second)) as second_client:
             old_auth = {"Authorization": "Bearer otari-mk-old"}
-            rotated = first_client.post("/v1/settings/master-key/rotate", headers=old_auth)
+            rotated = first_client.post(f"{API_ROOT}/settings/master-key/rotate", headers=old_auth)
             assert rotated.status_code == 200, rotated.text
 
-            assert second_client.get("/v1/settings", headers=old_auth).status_code == 401
-            assert second_client.get(
-                "/v1/settings", headers={"Authorization": "Bearer otari-mk-new"}
-            ).status_code == 200
+            assert second_client.get(f"{API_ROOT}/settings", headers=old_auth).status_code == 401
+            assert (
+                second_client.get(f"{API_ROOT}/settings", headers={"Authorization": "Bearer otari-mk-new"}).status_code
+                == 200
+            )
 
 
 def test_settings_reports_pricing_flags(tmp_path: Path) -> None:
     with _client(tmp_path, default_pricing=True, require_pricing=False) as client:
-        response = client.get("/v1/settings", headers={"Authorization": "Bearer sk-test-master"})
+        response = client.get(f"{API_ROOT}/settings", headers={"Authorization": "Bearer sk-test-master"})
 
     assert response.status_code == 200
     body = response.json()
@@ -116,7 +118,7 @@ def test_settings_reports_pricing_flags(tmp_path: Path) -> None:
 
 def test_settings_defaults(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
-        response = client.get("/v1/settings", headers={"Authorization": "Bearer sk-test-master"})
+        response = client.get(f"{API_ROOT}/settings", headers={"Authorization": "Bearer sk-test-master"})
 
     assert response.status_code == 200
     body = response.json()
@@ -129,7 +131,7 @@ def test_settings_defaults(tmp_path: Path) -> None:
 def test_settings_reports_secret_key_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OTARI_SECRET_KEY", raising=False)
     with _client(tmp_path) as client:
-        response = client.get("/v1/settings", headers=AUTH)
+        response = client.get(f"{API_ROOT}/settings", headers=AUTH)
 
     assert response.status_code == 200
     assert response.json()["secret_key_configured"] is False
@@ -140,7 +142,7 @@ def test_settings_reports_secret_key_configured(tmp_path: Path, monkeypatch: pyt
 
     monkeypatch.setenv("OTARI_SECRET_KEY", generate_secret_key())
     with _client(tmp_path) as client:
-        response = client.get("/v1/settings", headers=AUTH)
+        response = client.get(f"{API_ROOT}/settings", headers=AUTH)
 
     assert response.status_code == 200
     assert response.json()["secret_key_configured"] is True
@@ -166,7 +168,7 @@ def test_settings_patch_does_not_apply_when_commit_fails(tmp_path: Path, monkeyp
     with TestClient(create_app(config), raise_server_exceptions=False) as client:
         monkeypatch.setattr("sqlalchemy.ext.asyncio.AsyncSession.commit", _boom)
         response = client.patch(
-            "/v1/settings",
+            f"{API_ROOT}/settings",
             headers={"Authorization": "Bearer sk-test-master"},
             json={"default_pricing": True},
         )
@@ -179,7 +181,7 @@ def test_settings_patch_does_not_apply_when_commit_fails(tmp_path: Path, monkeyp
 
 def test_settings_includes_full_config_view(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
-        body = client.get("/v1/settings", headers=AUTH).json()
+        body = client.get(f"{API_ROOT}/settings", headers=AUTH).json()
 
     fields = body["config"]
     by_key = {field["key"]: field for field in fields}
@@ -223,6 +225,7 @@ def test_settings_includes_full_config_view(tmp_path: Path) -> None:
     for name in (
         "mcp_allow_private_hosts",
         "web_search_allow_private_hosts",
+        "web_retrieval_trust_env_proxy",
         "provider_allow_private_hosts",
         "sandbox_url",
         "guardrails_url",
@@ -242,6 +245,17 @@ def test_settings_includes_full_config_view(tmp_path: Path) -> None:
     # Secrets and complex catalog fields are never surfaced here.
     for secret in ("master_key", "providers", "pricing", "aliases", "platform"):
         assert secret not in by_key, secret
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_web_fetch_enablement_is_visible_and_startup_only(enabled: bool) -> None:
+    config = GatewayConfig(web_fetch_enabled=enabled)
+    field = next(field for field in _config_fields(config) if field.key == "web_fetch_enabled")
+
+    assert field.value is enabled
+    assert field.group == "Tools & network access"
+    assert field.type == "bool"
+    assert field.settable is False
 
 
 def test_config_view_redacts_url_credentials() -> None:
@@ -314,6 +328,26 @@ def test_config_view_shows_the_legal_link_targets() -> None:
     # Read-only: where the legal pages live is a restart-time decision.
     assert by_key["terms_url"].settable is False
     assert by_key["privacy_url"].settable is False
+
+
+def test_the_viewer_shows_the_ui_base_url_actually_in_use() -> None:
+    # Unset, public_base_url answers for it, so showing the bare field would
+    # tell an operator debugging a link that nothing is configured.
+    config = GatewayConfig(public_base_url="https://otari.example.com")
+    shown = {field.key: field.value for field in _config_fields(config)}
+
+    assert shown["ui_base_url"] == "https://otari.example.com"
+    assert GatewayConfig(ui_base_url="https://app.example.com").ui_base_url == "https://app.example.com"
+
+
+def test_the_ui_base_url_keeps_a_query_and_refuses_a_fragment() -> None:
+    # A query is how an edge serving one interface for several deployments
+    # tells each link apart; a fragment would collide with the hash route.
+    assert GatewayConfig(ui_base_url="https://app.example.com/ui/?edge=eu").ui_base_url == (
+        "https://app.example.com/ui?edge=eu"
+    )
+    with pytest.raises(ValidationError, match="no fragment"):
+        GatewayConfig(ui_base_url="https://app.example.com/ui#/login")
 
 
 def test_every_config_field_is_shown_or_deliberately_omitted() -> None:
@@ -397,7 +431,7 @@ def test_patch_applies_widened_settable_fields(tmp_path: Path) -> None:
     )
     with TestClient(create_app(config)) as client:
         response = client.patch(
-            "/v1/settings",
+            f"{API_ROOT}/settings",
             headers=AUTH,
             json={
                 "require_pricing": False,
@@ -429,7 +463,7 @@ def test_patch_applies_float_and_clears_nullable_field(tmp_path: Path) -> None:
     )
     with TestClient(create_app(config)) as client:
         response = client.patch(
-            "/v1/settings",
+            f"{API_ROOT}/settings",
             headers=AUTH,
             json={
                 "model_discovery_negative_ttl_seconds": 5.5,
@@ -457,7 +491,7 @@ def test_new_type_overrides_survive_restart(tmp_path: Path) -> None:
     first = GatewayConfig(database_url=db_url, master_key="sk-test-master")
     with TestClient(create_app(first)) as client:
         response = client.patch(
-            "/v1/settings",
+            f"{API_ROOT}/settings",
             headers=AUTH,
             json={
                 "model_cache_ttl_seconds": 45,
@@ -491,7 +525,7 @@ def test_patch_ignores_startup_only_field(tmp_path: Path) -> None:
         host="0.0.0.0",  # noqa: S104
     )
     with TestClient(create_app(config)) as client:
-        response = client.patch("/v1/settings", headers=AUTH, json={"host": "10.0.0.1"})
+        response = client.patch(f"{API_ROOT}/settings", headers=AUTH, json={"host": "10.0.0.1"})
 
     assert response.status_code == 200
     assert config.host == "0.0.0.0"  # noqa: S104
@@ -500,7 +534,7 @@ def test_patch_ignores_startup_only_field(tmp_path: Path) -> None:
 def test_patch_rejects_invalid_stream_policy(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         response = client.patch(
-            "/v1/settings",
+            f"{API_ROOT}/settings",
             headers=AUTH,
             json={"stream_missing_usage_policy": "bogus"},
         )
@@ -511,7 +545,7 @@ def test_patch_rejects_invalid_stream_policy(tmp_path: Path) -> None:
 def test_patch_rejects_negative_cache_ttl(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         response = client.patch(
-            "/v1/settings",
+            f"{API_ROOT}/settings",
             headers=AUTH,
             json={"model_cache_ttl_seconds": -1},
         )

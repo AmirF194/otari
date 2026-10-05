@@ -23,9 +23,9 @@ from sqlalchemy.orm import sessionmaker
 
 from gateway.api import deps
 from gateway.api.routes import auth_session as auth_session_route
-from gateway.core.config import GatewayConfig
+from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.main import create_app
-from gateway.models.entities import DashboardSession
+from gateway.models.tenancy import DashboardSession
 from gateway.services import dashboard_session_service, master_key_service
 from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME
 from gateway.services.tenancy.provisioning_service import BOOTSTRAP_IDENTITY_KEY
@@ -33,23 +33,24 @@ from gateway.services.tenancy.provisioning_service import BOOTSTRAP_IDENTITY_KEY
 MASTER_KEY = "sk-test-master"
 
 
-def _config(tmp_path: Path) -> GatewayConfig:
+def _config(tmp_path: Path, **overrides: object) -> GatewayConfig:
     return GatewayConfig(
         database_url=f"sqlite:///{tmp_path / 'session-test.db'}",
         master_key=MASTER_KEY,
         require_pricing=False,
+        **overrides,  # type: ignore[arg-type]
     )
 
 
 def _sign_in(client: TestClient, key: str = MASTER_KEY) -> None:
-    response = client.post("/v1/auth/session", json={"master_key": key})
+    response = client.post(f"{API_ROOT}/auth/session", json={"master_key": key})
     assert response.status_code == 200, response.text
 
 
 def test_sign_in_sets_cookie_and_cookie_authenticates_management_reads(tmp_path: Path) -> None:
     config = _config(tmp_path)
     with TestClient(create_app(config)) as client:
-        response = client.post("/v1/auth/session", json={"master_key": MASTER_KEY})
+        response = client.post(f"{API_ROOT}/auth/session", json={"master_key": MASTER_KEY})
         assert response.status_code == 200, response.text
         assert SESSION_COOKIE_NAME in response.cookies
         # The opaque token never contains the master key.
@@ -63,13 +64,13 @@ def test_sign_in_sets_cookie_and_cookie_authenticates_management_reads(tmp_path:
         assert "secure" not in set_cookie.lower()
 
         # The cookie alone (no Authorization header) now opens the management API.
-        settings = client.get("/v1/settings")
+        settings = client.get(f"{API_ROOT}/settings")
         assert settings.status_code == 200, settings.text
 
 
 def test_https_requests_get_a_secure_cookie(tmp_path: Path) -> None:
     with TestClient(create_app(_config(tmp_path)), base_url="https://testserver") as client:
-        response = client.post("/v1/auth/session", json={"master_key": MASTER_KEY})
+        response = client.post(f"{API_ROOT}/auth/session", json={"master_key": MASTER_KEY})
         assert response.status_code == 200, response.text
         assert "secure" in response.headers["set-cookie"].lower()
 
@@ -81,7 +82,7 @@ def test_forwarded_https_gets_a_secure_cookie(tmp_path: Path) -> None:
     # is not silently downgraded.
     with TestClient(create_app(_config(tmp_path))) as client:
         response = client.post(
-            "/v1/auth/session",
+            f"{API_ROOT}/auth/session",
             json={"master_key": MASTER_KEY},
             headers={"X-Forwarded-Proto": "https"},
         )
@@ -91,11 +92,11 @@ def test_forwarded_https_gets_a_secure_cookie(tmp_path: Path) -> None:
 
 def test_sign_in_rejects_a_wrong_key_without_setting_a_cookie(tmp_path: Path) -> None:
     with TestClient(create_app(_config(tmp_path))) as client:
-        response = client.post("/v1/auth/session", json={"master_key": "not-the-master-key"})
+        response = client.post(f"{API_ROOT}/auth/session", json={"master_key": "not-the-master-key"})
         assert response.status_code == 401
         assert SESSION_COOKIE_NAME not in response.cookies
 
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
 def test_header_credentials_win_over_the_cookie(tmp_path: Path) -> None:
@@ -103,17 +104,46 @@ def test_header_credentials_win_over_the_cookie(tmp_path: Path) -> None:
     # API clients keep exactly the pre-cookie behavior.
     with TestClient(create_app(_config(tmp_path))) as client:
         _sign_in(client)
-        response = client.get("/v1/settings", headers={"Authorization": "Bearer wrong-key"})
+        response = client.get(f"{API_ROOT}/settings", headers={"Authorization": "Bearer wrong-key"})
         assert response.status_code == 401
 
 
 def test_cross_site_requests_cannot_ride_the_cookie(tmp_path: Path) -> None:
     with TestClient(create_app(_config(tmp_path))) as client:
         _sign_in(client)
-        response = client.get("/v1/settings", headers={"Sec-Fetch-Site": "cross-site"})
+        response = client.get(f"{API_ROOT}/settings", headers={"Sec-Fetch-Site": "cross-site"})
         assert response.status_code == 401
         # Same-origin fetches (the dashboard itself) stay accepted.
-        assert client.get("/v1/settings", headers={"Sec-Fetch-Site": "same-origin"}).status_code == 200
+        assert client.get(f"{API_ROOT}/settings", headers={"Sec-Fetch-Site": "same-origin"}).status_code == 200
+
+
+def test_a_sibling_host_cannot_ride_the_cookie_unless_it_is_a_listed_origin(tmp_path: Path) -> None:
+    # A dashboard an edge serves from a sibling of this process is same-site
+    # to it, which SameSite=Strict lets through. Only an origin the operator
+    # listed for CORS is admitted; every other sibling stays refused, and so
+    # does a same-site request that names no origin at all.
+    listed = "https://app.example.com"
+    with TestClient(create_app(_config(tmp_path, cors_allow_origins=[listed]))) as client:
+        _sign_in(client)
+        same_site = {"Sec-Fetch-Site": "same-site"}
+        assert client.get(f"{API_ROOT}/settings", headers={**same_site, "Origin": listed}).status_code == 200
+        other = client.get(f"{API_ROOT}/settings", headers={**same_site, "Origin": "https://other.example.com"})
+        assert other.status_code == 401
+        assert client.get(f"{API_ROOT}/settings", headers=same_site).status_code == 401
+
+
+def test_a_wildcard_cors_entry_admits_no_sibling_host(tmp_path: Path) -> None:
+    with TestClient(create_app(_config(tmp_path, cors_allow_origins=["*"]))) as client:
+        _sign_in(client)
+        headers = {"Sec-Fetch-Site": "same-site", "Origin": "https://app.example.com"}
+        assert client.get(f"{API_ROOT}/settings", headers=headers).status_code == 401
+
+
+def test_with_no_listed_origin_a_sibling_host_stays_refused(tmp_path: Path) -> None:
+    with TestClient(create_app(_config(tmp_path))) as client:
+        _sign_in(client)
+        headers = {"Sec-Fetch-Site": "same-site", "Origin": "https://app.example.com"}
+        assert client.get(f"{API_ROOT}/settings", headers=headers).status_code == 401
 
 
 def test_sign_out_revokes_the_session_server_side(tmp_path: Path) -> None:
@@ -121,23 +151,21 @@ def test_sign_out_revokes_the_session_server_side(tmp_path: Path) -> None:
         _sign_in(client)
         stolen_cookie = client.cookies[SESSION_COOKIE_NAME]
 
-        response = client.delete("/v1/auth/session")
+        response = client.delete(f"{API_ROOT}/auth/session")
         assert response.status_code == 204
 
         # Even a kept copy of the cookie is dead after sign-out (server-side
         # revocation, not just cookie deletion in the browser).
         client.cookies.set(SESSION_COOKIE_NAME, stolen_cookie)
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
 def test_sign_out_without_a_session_is_a_no_op(tmp_path: Path) -> None:
     with TestClient(create_app(_config(tmp_path))) as client:
-        assert client.delete("/v1/auth/session").status_code == 204
+        assert client.delete(f"{API_ROOT}/auth/session").status_code == 204
 
 
-def test_sign_out_clears_the_cookie_even_when_revocation_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_sign_out_clears_the_cookie_even_when_revocation_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # A DB failure during revocation must not leave the browser holding a live
     # cookie: sign-out stays best-effort (204 + cookie cleared) and the
     # unrevoked session dies on its TTL.
@@ -147,18 +175,18 @@ def test_sign_out_clears_the_cookie_even_when_revocation_fails(
     monkeypatch.setattr(auth_session_route, "revoke_dashboard_session", _boom)
     with TestClient(create_app(_config(tmp_path))) as client:
         _sign_in(client)
-        response = client.delete("/v1/auth/session")
+        response = client.delete(f"{API_ROOT}/auth/session")
         assert response.status_code == 204
         set_cookie = response.headers.get("set-cookie", "")
         assert SESSION_COOKIE_NAME in set_cookie
-        assert 'expires=' in set_cookie.lower() or "max-age=0" in set_cookie.lower()
+        assert "expires=" in set_cookie.lower() or "max-age=0" in set_cookie.lower()
 
 
 def test_expired_sessions_stop_authenticating(tmp_path: Path) -> None:
     config = _config(tmp_path)
     with TestClient(create_app(config)) as client:
         _sign_in(client)
-        assert client.get("/v1/settings").status_code == 200
+        assert client.get(f"{API_ROOT}/settings").status_code == 200
 
         # Age the stored session past its TTL directly in the database.
         engine = create_engine(config.database_url)
@@ -167,7 +195,7 @@ def test_expired_sessions_stop_authenticating(tmp_path: Path) -> None:
             db.commit()
         engine.dispose()
 
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
 def test_sessions_survive_a_restart_but_not_a_configured_key_change(tmp_path: Path) -> None:
@@ -183,13 +211,13 @@ def test_sessions_survive_a_restart_but_not_a_configured_key_change(tmp_path: Pa
     # Same key across a restart: the session (the whole point of #338) survives.
     with TestClient(create_app(config_with(MASTER_KEY))) as client:
         client.cookies.set(SESSION_COOKIE_NAME, cookie)
-        assert client.get("/v1/settings").status_code == 200
+        assert client.get(f"{API_ROOT}/settings").status_code == 200
 
     # Rotating OTARI_MASTER_KEY across a restart revokes every session: a
     # session only proves possession of the old key and must die with it.
     with TestClient(create_app(config_with("sk-rotated-master"))) as client:
         client.cookies.set(SESSION_COOKIE_NAME, cookie)
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
 def test_rotation_then_restart_keeps_the_reminted_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,14 +227,14 @@ def test_rotation_then_restart_keeps_the_reminted_session(tmp_path: Path, monkey
     with TestClient(create_app(GatewayConfig(database_url=db_url, require_pricing=False))) as client:
         _sign_in(client, "otari-mk-first")
         monkeypatch.setattr(master_key_service, "generate_master_key", lambda: "otari-mk-second")
-        assert client.post("/v1/settings/master-key/rotate").status_code == 200
+        assert client.post(f"{API_ROOT}/settings/master-key/rotate").status_code == 200
         reminted = client.cookies[SESSION_COOKIE_NAME]
 
     # The startup key-change check must recognize the rotated key as current
     # and keep the session the rotation re-minted.
     with TestClient(create_app(GatewayConfig(database_url=db_url, require_pricing=False))) as client:
         client.cookies.set(SESSION_COOKIE_NAME, reminted)
-        assert client.get("/v1/settings").status_code == 200
+        assert client.get(f"{API_ROOT}/settings").status_code == 200
 
 
 def test_rotation_revokes_other_sessions_and_reminting_keeps_the_caller_signed_in(
@@ -229,18 +257,18 @@ def test_rotation_revokes_other_sessions_and_reminting_keeps_the_caller_signed_i
         monkeypatch.setattr(master_key_service, "generate_master_key", lambda: "otari-mk-second")
         # Rotate via the session cookie alone: the dashboard tab that signed in
         # with a cookie has no raw key to send.
-        rotated = client.post("/v1/settings/master-key/rotate")
+        rotated = client.post(f"{API_ROOT}/settings/master-key/rotate")
         assert rotated.status_code == 200, rotated.text
         assert rotated.json() == {"master_key": "otari-mk-second"}
 
         # The rotating tab got a fresh session on the response and stays signed in.
         assert client.cookies[SESSION_COOKIE_NAME] != rotating_session
-        assert client.get("/v1/settings").status_code == 200
+        assert client.get(f"{API_ROOT}/settings").status_code == 200
 
         # Every session minted before the rotation died with the old key.
         for stale in (other_tab_session, rotating_session):
             client.cookies.set(SESSION_COOKIE_NAME, stale)
-            assert client.get("/v1/settings").status_code == 401
+            assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
 def _sessions(config: GatewayConfig) -> list[tuple[str, str]]:
@@ -268,11 +296,11 @@ def test_a_session_names_the_operator_identity(tmp_path: Path) -> None:
     """
     config = _config(tmp_path)
     with TestClient(create_app(config)) as client:
-        signed_in = client.post("/v1/auth/session", json={"master_key": MASTER_KEY})
+        signed_in = client.post(f"{API_ROOT}/auth/session", json={"master_key": MASTER_KEY})
         assert signed_in.status_code == 200, signed_in.text
         body = signed_in.json()
 
-        operator = client.get("/v1/organizations/me", headers={"Otari-Key": MASTER_KEY})
+        operator = client.get(f"{API_ROOT}/organizations/me", headers={"Otari-Key": MASTER_KEY})
         assert operator.status_code == 200, operator.text
         assert body["active_organization_id"] == operator.json()["organization"]["id"]
 
@@ -285,8 +313,8 @@ def test_the_cookie_resolves_that_identity_on_every_later_request(tmp_path: Path
     with TestClient(create_app(_config(tmp_path))) as client:
         _sign_in(client)
 
-        by_cookie = client.get("/v1/organizations/me")
-        by_key = client.get("/v1/organizations/me", headers={"Otari-Key": MASTER_KEY})
+        by_cookie = client.get(f"{API_ROOT}/organizations/me")
+        by_key = client.get(f"{API_ROOT}/organizations/me", headers={"Otari-Key": MASTER_KEY})
 
         assert by_cookie.status_code == 200, by_cookie.text
         assert by_cookie.json()["organization"]["id"] == by_key.json()["organization"]["id"]
@@ -302,14 +330,14 @@ def test_deactivating_the_identity_ends_its_sessions(tmp_path: Path) -> None:
     config = _config(tmp_path)
     with TestClient(create_app(config)) as client:
         _sign_in(client)
-        assert client.get("/v1/settings").status_code == 200
+        assert client.get(f"{API_ROOT}/settings").status_code == 200
 
         engine = create_engine(config.database_url)
         with engine.begin() as connection:
             connection.execute(text('UPDATE "user" SET is_active = 0'))
         engine.dispose()
 
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
 def test_deleting_the_identity_revokes_its_sessions(tmp_path: Path) -> None:
@@ -330,7 +358,7 @@ def test_deleting_the_identity_revokes_its_sessions(tmp_path: Path) -> None:
         engine.dispose()
 
         assert _sessions(config) == []
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
 def test_a_first_sign_in_provisions_the_identity_it_binds_to(tmp_path: Path) -> None:
@@ -346,7 +374,7 @@ def test_a_first_sign_in_provisions_the_identity_it_binds_to(tmp_path: Path) -> 
         with engine.connect() as connection:
             assert connection.execute(text('SELECT COUNT(*) FROM "user"')).scalar_one() == 0
 
-        signed_in = client.post("/v1/auth/session", json={"master_key": MASTER_KEY})
+        signed_in = client.post(f"{API_ROOT}/auth/session", json={"master_key": MASTER_KEY})
         assert signed_in.status_code == 200, signed_in.text
 
         with engine.connect() as connection:
@@ -367,15 +395,15 @@ def test_rotation_re_mints_the_session_for_the_same_identity(tmp_path: Path, mon
         require_pricing=False,
     )
     with TestClient(create_app(config)) as client:
-        signed_in = client.post("/v1/auth/session", json={"master_key": "otari-mk-first"})
+        signed_in = client.post(f"{API_ROOT}/auth/session", json={"master_key": "otari-mk-first"})
         assert signed_in.status_code == 200, signed_in.text
         identity = signed_in.json()["user_id"].replace("-", "")
 
         monkeypatch.setattr(master_key_service, "generate_master_key", lambda: "otari-mk-second")
-        assert client.post("/v1/settings/master-key/rotate").status_code == 200
+        assert client.post(f"{API_ROOT}/settings/master-key/rotate").status_code == 200
 
         assert [user_id for _, user_id in _sessions(config)] == [identity]
-        assert client.get("/v1/organizations/me").status_code == 200
+        assert client.get(f"{API_ROOT}/organizations/me").status_code == 200
 
 
 _COMPLETION_BODY = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
@@ -402,10 +430,10 @@ def test_the_cookie_does_not_authenticate_the_request_plane(tmp_path: Path) -> N
     with TestClient(create_app(_config(tmp_path))) as client:
         _sign_in(client)
 
-        counted = client.post("/v1/messages/count_tokens", json=_COMPLETION_BODY)
+        counted = client.post(f"{API_ROOT}/messages/count_tokens", json=_COMPLETION_BODY)
         assert counted.status_code == 401, counted.text
 
-        chat = client.post("/v1/chat/completions", json=_COMPLETION_BODY)
+        chat = client.post(f"{API_ROOT}/chat/completions", json=_COMPLETION_BODY)
         assert chat.status_code == 401, chat.text
 
 
@@ -415,26 +443,29 @@ def test_the_cookie_still_reads_the_catalog(tmp_path: Path) -> None:
     These describe the deployment instead of acting on it: no provider call, no
     write, no billing, so ``verify_catalog_reader`` admits the cookie where the
     plane around it does not. Asserted here beside the refusal above, because the
-    two are one decision and a change to either should have to look at both.
+    two are one decision and a change to either should have to look at both. The
+    built-in guardrail catalog is the one an organization's own form reads rather
+    than a page of the operator's, and it is on this plane for the same reasons.
     """
     with TestClient(create_app(_config(tmp_path))) as client:
         _sign_in(client)
 
-        assert client.get("/v1/models").status_code == 200
-        assert client.get("/v1/pricing").status_code == 200
-        assert client.get("/v1/tools").status_code == 200
+        assert client.get(f"{API_ROOT}/models").status_code == 200
+        assert client.get(f"{API_ROOT}/pricing").status_code == 200
+        assert client.get(f"{API_ROOT}/tools").status_code == 200
+        assert client.get(f"{API_ROOT}/tool-settings/guardrails/catalog").status_code == 200
 
 
 def test_the_request_plane_still_refuses_anonymous_and_cross_site_callers(tmp_path: Path) -> None:
     """Hoisting the cookie check out of the dependency must not have loosened it."""
     with TestClient(create_app(_config(tmp_path))) as client:
-        assert client.post("/v1/chat/completions", json=_COMPLETION_BODY).status_code == 401
-        assert client.post("/v1/messages/count_tokens", json=_COMPLETION_BODY).status_code == 401
+        assert client.post(f"{API_ROOT}/chat/completions", json=_COMPLETION_BODY).status_code == 401
+        assert client.post(f"{API_ROOT}/messages/count_tokens", json=_COMPLETION_BODY).status_code == 401
 
         _sign_in(client)
         cross_site = {"Sec-Fetch-Site": "cross-site"}
-        assert client.post("/v1/chat/completions", json=_COMPLETION_BODY, headers=cross_site).status_code == 401
-        counted = client.post("/v1/messages/count_tokens", json=_COMPLETION_BODY, headers=cross_site)
+        assert client.post(f"{API_ROOT}/chat/completions", json=_COMPLETION_BODY, headers=cross_site).status_code == 401
+        counted = client.post(f"{API_ROOT}/messages/count_tokens", json=_COMPLETION_BODY, headers=cross_site)
         assert counted.status_code == 401
 
 
@@ -451,11 +482,11 @@ def test_repeated_failed_sign_ins_get_throttled(tmp_path: Path) -> None:
     with TestClient(create_app(_rate_limited_config(tmp_path, limit=2))) as client:
         # First two failures are real 401s (attempt count is still under the cap).
         for _ in range(2):
-            response = client.post("/v1/auth/session", json={"master_key": "wrong"})
+            response = client.post(f"{API_ROOT}/auth/session", json={"master_key": "wrong"})
             assert response.status_code == 401
 
         # The third failed attempt within the window is throttled, not a 401.
-        throttled = client.post("/v1/auth/session", json={"master_key": "wrong"})
+        throttled = client.post(f"{API_ROOT}/auth/session", json={"master_key": "wrong"})
         assert throttled.status_code == 429
         assert "Retry-After" in throttled.headers
 
@@ -464,9 +495,9 @@ def test_successful_sign_in_is_never_throttled(tmp_path: Path) -> None:
     with TestClient(create_app(_rate_limited_config(tmp_path, limit=2))) as client:
         # Exhaust the limit with failures...
         for _ in range(2):
-            assert client.post("/v1/auth/session", json={"master_key": "wrong"}).status_code == 401
+            assert client.post(f"{API_ROOT}/auth/session", json={"master_key": "wrong"}).status_code == 401
         # ...then the real key still gets in: only failures count against the cap.
-        assert client.post("/v1/auth/session", json={"master_key": MASTER_KEY}).status_code == 200
+        assert client.post(f"{API_ROOT}/auth/session", json={"master_key": MASTER_KEY}).status_code == 200
 
 
 def test_rate_limit_buckets_are_isolated_per_client_ip(tmp_path: Path) -> None:
@@ -482,21 +513,21 @@ def test_rate_limit_buckets_are_isolated_per_client_ip(tmp_path: Path) -> None:
         client_b = TestClient(app, client=("10.0.0.2", 12345))
 
         for _ in range(2):
-            assert client_a.post("/v1/auth/session", json={"master_key": "wrong"}).status_code == 401
-        assert client_a.post("/v1/auth/session", json={"master_key": "wrong"}).status_code == 429
+            assert client_a.post(f"{API_ROOT}/auth/session", json={"master_key": "wrong"}).status_code == 401
+        assert client_a.post(f"{API_ROOT}/auth/session", json={"master_key": "wrong"}).status_code == 429
 
         # A different IP is unaffected by A's usage: still real 401s, not
         # inheriting A's throttled state from a shared/global bucket.
         for _ in range(2):
-            assert client_b.post("/v1/auth/session", json={"master_key": "wrong"}).status_code == 401
-        assert client_b.post("/v1/auth/session", json={"master_key": "wrong"}).status_code == 429
+            assert client_b.post(f"{API_ROOT}/auth/session", json={"master_key": "wrong"}).status_code == 401
+        assert client_b.post(f"{API_ROOT}/auth/session", json={"master_key": "wrong"}).status_code == 429
 
 
 def test_login_rate_limit_disabled_by_config(tmp_path: Path) -> None:
     with TestClient(create_app(_rate_limited_config(tmp_path, limit=None))) as client:
         # Many failures in a row, none throttled: the limiter is off entirely.
         for _ in range(5):
-            assert client.post("/v1/auth/session", json={"master_key": "wrong"}).status_code == 401
+            assert client.post(f"{API_ROOT}/auth/session", json={"master_key": "wrong"}).status_code == 401
 
 
 def test_reactivating_the_identity_does_not_restore_its_old_sessions(tmp_path: Path) -> None:
@@ -508,9 +539,9 @@ def test_reactivating_the_identity_does_not_restore_its_old_sessions(tmp_path: P
     """
     config = _config(tmp_path)
     with TestClient(create_app(config)) as client:
-        signed_in = client.post("/v1/auth/session", json={"master_key": MASTER_KEY})
+        signed_in = client.post(f"{API_ROOT}/auth/session", json={"master_key": MASTER_KEY})
         assert signed_in.status_code == 200, signed_in.text
-        assert client.get("/v1/settings").status_code == 200
+        assert client.get(f"{API_ROOT}/settings").status_code == 200
         # Addressed by id rather than with a bare ``UPDATE "user"``: a fixture
         # that grows a second identity would otherwise deactivate it too, and
         # the assertion below would pass on sessions this test never minted.
@@ -521,19 +552,17 @@ def test_reactivating_the_identity_does_not_restore_its_old_sessions(tmp_path: P
             connection.execute(text('UPDATE "user" SET is_active = 0 WHERE id = :id'), {"id": identity})
 
         # The refusal is what triggers the revocation, so present the cookie once.
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
         assert [user_id for _, user_id in _sessions(config) if user_id == identity] == []
 
         with engine.begin() as connection:
             connection.execute(text('UPDATE "user" SET is_active = 1 WHERE id = :id'), {"id": identity})
         engine.dispose()
 
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
-def test_a_failed_revocation_still_answers_401_rather_than_503(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_failed_revocation_still_answers_401_rather_than_503(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The cleanup is best-effort, and a failed one must not change the answer.
 
     A deactivated identity's sessions are deleted on the read that refuses
@@ -553,7 +582,7 @@ def test_a_failed_revocation_still_answers_401_rather_than_503(
 
     config = _config(tmp_path)
     with TestClient(create_app(config)) as client:
-        signed_in = client.post("/v1/auth/session", json={"master_key": MASTER_KEY})
+        signed_in = client.post(f"{API_ROOT}/auth/session", json={"master_key": MASTER_KEY})
         assert signed_in.status_code == 200, signed_in.text
         identity = signed_in.json()["user_id"].replace("-", "")
 
@@ -562,12 +591,10 @@ def test_a_failed_revocation_still_answers_401_rather_than_503(
             connection.execute(text('UPDATE "user" SET is_active = 0 WHERE id = :id'), {"id": identity})
         engine.dispose()
 
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
 
 
-def test_a_failed_revocation_leaves_the_request_session_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_failed_revocation_leaves_the_request_session_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The revocation writes on its own session, not the caller's.
 
     ``_bump_last_used_at`` is the precedent: a best-effort write on the auth
@@ -587,7 +614,7 @@ def test_a_failed_revocation_leaves_the_request_session_alone(
 
     config = _config(tmp_path)
     with TestClient(create_app(config)) as client:
-        signed_in = client.post("/v1/auth/session", json={"master_key": MASTER_KEY})
+        signed_in = client.post(f"{API_ROOT}/auth/session", json={"master_key": MASTER_KEY})
         assert signed_in.status_code == 200, signed_in.text
         identity = signed_in.json()["user_id"].replace("-", "")
 
@@ -605,7 +632,7 @@ def test_a_failed_revocation_leaves_the_request_session_alone(
 
         monkeypatch.setattr(deps, "resolve_dashboard_session", _capture)
 
-        assert client.get("/v1/settings").status_code == 401
+        assert client.get(f"{API_ROOT}/settings").status_code == 401
         assert used and seen, (used, seen)
         assert used[-1] != seen[-1], "the revocation reused the request's session"
         assert _sessions(config) == []

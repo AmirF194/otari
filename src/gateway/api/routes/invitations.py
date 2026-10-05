@@ -1,17 +1,16 @@
 """Accepting an organization invitation (standalone mode only).
 
-Deliberately public, unlike every other route under ``/v1``: the person
-following an emailed link holds no master key and no session, and the token
-in the link is their whole proof of anything here. Both routes therefore take
-no ``CurrentIdentity`` and are scoped to exactly the one invitation the token
-names.
+Deliberately public: the person following an emailed link holds no master
+key and no session, and the token in the link is their whole proof of
+anything here. Both routes therefore take no ``CurrentIdentity`` and are
+scoped to exactly the one invitation the token names.
 
-No session is minted on accept: the token proves possession of an emailed
-link, not of a password, so accepting only resolves the membership to
+No session is minted on accept: accepting resolves the membership to
 ``active``, the same place ``POST /me/members`` already lands a member added
-directly. The identity it resolves to is password-less on the roster until it
-is claimed, and claiming it is ``POST /v1/auth/signup``, which the dashboard's
-accept page hands the recipient straight to (otari#835).
+directly. An invitee who has never signed in can set a password in the same
+call, which is the only way in on a deployment that sends no mail; without one,
+the identity stays password-less until ``POST /api/v1/auth/signup`` or a
+provider sign-in claims it.
 """
 
 from typing import Annotated
@@ -26,9 +25,10 @@ from gateway.models.tenancy import (
     InvitationPreviewPublic,
     ValidateInvitationRequest,
 )
+from gateway.services.budgets import WorkspaceBudgetDefaultService
 from gateway.services.tenancy import OrganizationService
 
-router = APIRouter(prefix="/v1/invitations", tags=["invitations"])
+router = APIRouter(prefix="/invitations", tags=["invitations"])
 
 
 def get_organization_service(db: Annotated[AsyncSession, Depends(get_db)]) -> OrganizationService:
@@ -39,7 +39,7 @@ def get_organization_service(db: Annotated[AsyncSession, Depends(get_db)]) -> Or
     public, one is master-key gated), and importing the dependency alone
     across that boundary is not worth it for one function.
     """
-    return OrganizationService(db)
+    return OrganizationService(db, membership_listener=WorkspaceBudgetDefaultService(db))
 
 
 OrganizationServiceDep = Annotated[OrganizationService, Depends(get_organization_service)]
@@ -48,7 +48,7 @@ OrganizationServiceDep = Annotated[OrganizationService, Depends(get_organization
 def _throttle(request: Request) -> None:
     """Throttle calls to these routes per client IP.
 
-    ``POST /v1/auth/session`` is the only other unauthenticated route that
+    ``POST /api/v1/auth/session`` is the only other unauthenticated route that
     takes a credential, and it is IP-limited (``auth_session._check_login_rate_limit``,
     via ``app.state.login_rate_limiter``); these two were not, and ``accept``
     writes. The token's entropy (``secrets.token_urlsafe(32)``) already rules
@@ -91,6 +91,11 @@ async def accept_invitation(
     service: OrganizationServiceDep,
     body: AcceptInvitationRequest,
 ) -> AcceptInvitationResultPublic:
-    """Accept a pending invitation, resolving it to an active membership."""
+    """Accept a pending invitation, resolving it to an active membership and optionally setting a first password."""
     _throttle(request)
-    return await service.accept_invitation(body.token)
+    return await service.accept_invitation(
+        body.token,
+        password=body.password,
+        full_name=body.full_name,
+        terms_accepted=body.terms_accepted,
+    )

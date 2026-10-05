@@ -1,18 +1,22 @@
-import { Button } from "@heroui/react"
 import { useState } from "react"
+import { Button } from "@/design-system/actions/Button"
+import { ErrorBanner } from "@/design-system/feedback/ErrorBanner"
+import { Checkbox } from "@/design-system/forms/Checkbox"
+import { PublicAuthFields } from "@/features/auth/overlayPublicAuthFields"
 import { useSignup } from "@/shared/api/auth"
 import { ApiError } from "@/shared/api/client"
-import { ErrorBanner } from "@/shared/components/feedback/ErrorBanner"
 import { emailFromHash } from "@/shared/helpers/hashParams"
 import {
   MAX_PASSWORD_BYTES,
   MIN_PASSWORD_LENGTH,
   newPasswordProblem,
 } from "@/shared/helpers/password"
+import { useDeployment } from "@/shared/hooks/useDeployment"
 import { TELEMETRY_EVENTS } from "@/shared/telemetry/events"
 import { useTelemetry } from "@/shared/telemetry/overlayTelemetry"
 
 import { AuthEmailField, AuthPasswordField, AuthTextField } from "./AuthFields"
+import { AuthHelp } from "./AuthHelp"
 import {
   goToPublicAuthPage,
   PublicAuthLayout,
@@ -20,46 +24,45 @@ import {
 } from "./PublicAuthLayout"
 
 /**
- * `#/signup`: claim the identity an admin already put on this deployment's
- * roster, by giving it a password.
+ * `#/signup`: set a password for an address, claiming or registering it.
  *
- * Two departures from the platform's own signup page, both of them the
- * gateway's behavior rather than a design preference:
+ * Which of the two is the deployment's own posture, published as `open_signup`
+ * in the bootstrap (otari-ai#2100). Closed, the default, `POST /v1/auth/signup`
+ * only ever completes an identity `organization_service` already added or
+ * invited by address and creates nothing from nothing, so the copy says so:
+ * a page reading as "create an account" would leave somebody who is not on the
+ * roster waiting for an email that is never sent. Open, an address nobody has
+ * added is registered with an organization of its own, and the same page is a
+ * registration form. The form itself is identical either way; only the wording
+ * moves, because the request is the same one.
  *
- * - **It is not registration.** `POST /v1/auth/signup` only ever completes an
- *   identity `organization_service` already added or invited by address; it
- *   creates nothing from nothing. The copy says so, because a page that reads
- *   as "create an account" would leave someone who is not on the roster
- *   waiting for an email that is never sent.
- * - **The response says nothing about the address.** It is enumeration-safe:
- *   unknown, already claimed, and genuinely just claimed all answer the same
- *   sentence. So success navigates to `#/check-email`, which is written in the
- *   conditional the server's own message uses, and nothing here branches on
- *   what came back.
+ * **The response says nothing about the address**, under either posture. It is
+ * enumeration-safe: unknown, already claimed, and genuinely just claimed all
+ * answer the same sentence. So success navigates to `#/check-email`, which is
+ * written in the conditional the server's own message uses, and nothing here
+ * branches on what came back.
  *
- * The platform's Google and GitHub buttons, its newsletter opt-in, and its
- * terms checkbox are all left behind. The first two are #651 and a hosted
- * marketing concern; the third has nothing to link to on a deployment that
- * published no terms, so the request omits `terms_accepted` rather than
- * asserting an acceptance of a document that does not exist. `terms_url` makes
- * that conditional rather than always true, and the server has carried
- * `terms_accepted` and its `terms_accepted_at` column throughout, so offering
- * the checkbox where there is a document to accept is unwired rather than
- * impossible.
+ * The platform's Google and GitHub buttons and its newsletter opt-in are left
+ * behind: the first is #651 and the second a hosted marketing concern. Its
+ * terms checkbox is here, conditionally, because the objection to it was that a
+ * deployment publishing no terms has nothing to link to; `terms_url` answers
+ * that, and the server has carried `terms_accepted` and its
+ * `terms_accepted_at` column throughout. Where there is a document, accepting
+ * it is required, which is what makes the recorded acceptance mean anything.
  *
- * `?email=…` prefills the address, which is how the accept-invitation page
- * hands an invitee straight here (otari#835). It arrives read-only, because
- * the invitation is bound to that address and claiming a different one would
- * answer with the same enumeration-safe sentence while doing nothing at all,
- * which is the failure this whole handoff exists to remove. The footer offers
+ * `?email=…` prefills the address for a link that names an invited one
+ * (otari#835); the accept-invitation page sets a first password itself, so
+ * it no longer sends anyone here. It arrives read-only, because the invitation
+ * is bound to that address and claiming a different one would answer with the
+ * same enumeration-safe sentence while doing nothing at all. The footer offers
  * the plain page for anyone who does need another address. Not a credential
- * and not treated as one: the token that proved anything was spent on the
- * accept, and `POST /v1/auth/signup` checks this address against the roster
- * itself.
+ * and not treated as one: `POST /v1/auth/signup` checks this address against
+ * the roster itself.
  */
 export function SignupPage({ hash }: { hash: string }) {
   const signup = useSignup()
   const { recordEvent } = useTelemetry()
+  const { open_signup, terms_url } = useDeployment()
   // Read straight from the prop rather than held in state: `PublicAuthPage` is
   // keyed on the whole hash, so a second link pasted into an open tab remounts
   // this page instead of re-rendering it with the first link's address.
@@ -68,11 +71,15 @@ export function SignupPage({ hash }: { hash: string }) {
   const [fullName, setFullName] = useState("")
   const [password, setPassword] = useState("")
   const [confirmPassword, setConfirmPassword] = useState("")
+  const [isTermsAccepted, setIsTermsAccepted] = useState(false)
 
   const problem = newPasswordProblem(password, confirmPassword)
-  const complete =
-    email.trim() !== "" && password !== "" && confirmPassword !== ""
-  const canSubmit = complete && problem === null
+  const isComplete =
+    email.trim() !== "" &&
+    password !== "" &&
+    confirmPassword !== "" &&
+    (terms_url === null || isTermsAccepted)
+  const canSubmit = isComplete && problem === null
 
   // A refusal describes a call that is no longer the one being made, so typing
   // clears it. Never while one is in flight: `reset()` returns the observer to
@@ -101,6 +108,12 @@ export function SignupPage({ hash }: { hash: string }) {
         email: email.trim(),
         password,
         full_name: fullName.trim() || null,
+        // Present only where a document was actually shown. Omitted rather than
+        // sent as `false` on a deployment that published none, so the column
+        // records an acceptance of something rather than a decision about a
+        // checkbox nobody saw. The box below is required, so reaching here with
+        // terms published means it was ticked.
+        ...(terms_url !== null ? { terms_accepted: true } : {}),
       },
       {
         onSuccess: () => {
@@ -125,26 +138,27 @@ export function SignupPage({ hash }: { hash: string }) {
 
   return (
     <PublicAuthLayout
-      title="Claim your account"
-      description="Set a password for the address an admin invited or added. You will confirm the address by email before your first sign-in."
+      title={open_signup ? "Create your account" : "Claim your account"}
+      description={
+        open_signup
+          ? "Create an account, then verify your email to sign in."
+          : "Set a password for the address an admin invited or added. You will confirm the address by email before your first sign-in."
+      }
       footer={
-        <>
-          <PublicAuthLink to="#/">
-            Already have a password? Sign in
-          </PublicAuthLink>
-          <PublicAuthLink to="#/resend-verification">
-            Need a new verification link?
-          </PublicAuthLink>
-        </>
+        <div className="otari-auth-actions flex flex-wrap items-center justify-between gap-x-4">
+          <PublicAuthLink to="#/">Sign in instead</PublicAuthLink>
+          <AuthHelp offersRecovery />
+        </div>
       }
     >
       <form
-        className="flex flex-col gap-4"
+        className="flex flex-col gap-3"
         onSubmit={(event) => {
           event.preventDefault()
           submit()
         }}
       >
+        <PublicAuthFields page="signup" isBusy={signup.isPending} />
         <AuthEmailField
           value={email}
           onChange={(next) => {
@@ -155,7 +169,9 @@ export function SignupPage({ hash }: { hash: string }) {
           description={
             invitedEmail
               ? "The address your invitation was sent to, which is the one it can claim."
-              : "The address an admin added or invited. Another address has nothing to claim."
+              : open_signup
+                ? undefined
+                : "The address an admin added or invited. Another address has nothing to claim."
           }
         />
         {/* Directly under the field rather than in the footer: this is the way
@@ -188,6 +204,7 @@ export function SignupPage({ hash }: { hash: string }) {
           }}
           autoComplete="new-password"
           description={`At least ${MIN_PASSWORD_LENGTH} characters, and at most ${MAX_PASSWORD_BYTES} bytes.`}
+          errorMessage={problem ?? undefined}
         />
         <AuthPasswordField
           label="Confirm password"
@@ -199,11 +216,41 @@ export function SignupPage({ hash }: { hash: string }) {
           autoComplete="new-password"
         />
 
-        {problem ? (
-          <p role="alert" className="text-caption text-danger">
-            {problem}
-          </p>
+        {/* Rendered only where there is a document to read, which is what the
+            deployment's `terms_url` says. Required rather than optional: an
+            acceptance the form would have submitted either way records nothing.
+            A plain anchor and not a router `Link`, because the target is an
+            address an operator configured and is usually off this origin, and
+            beside the control rather than inside its label, which is the only
+            arrangement that lets the terms be read: HTML exempts an
+            interactive descendant from a label's own activation, but
+            react-aria presses the label from a document-level handler that
+            knows no such exemption and that nothing on the anchor can stop, so
+            nested the link only ticked the box (otari-ai#2146). `ariaLabel`
+            carries the sentence the visible label no longer holds in full. */}
+        {terms_url !== null ? (
+          <div className="flex flex-wrap items-center gap-x-1 text-caption">
+            <Checkbox
+              isSelected={isTermsAccepted}
+              onChange={setIsTermsAccepted}
+              ariaLabel="I accept the terms of service"
+            >
+              <span className="text-caption">I accept the</span>
+            </Checkbox>
+            <span>
+              <a
+                href={terms_url}
+                target="_blank"
+                rel="noreferrer"
+                className="font-medium text-link hover:text-link-hover"
+              >
+                terms of service
+              </a>
+              .
+            </span>
+          </div>
         ) : null}
+
         <ErrorBanner error={signup.error} />
 
         <Button
@@ -213,7 +260,7 @@ export function SignupPage({ hash }: { hash: string }) {
           isPending={signup.isPending}
           isDisabled={!canSubmit}
         >
-          Claim account
+          {open_signup ? "Create account" : "Claim account"}
         </Button>
       </form>
     </PublicAuthLayout>

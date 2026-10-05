@@ -1,11 +1,16 @@
 """Provider metadata and runtime provider-credential management for the dashboard.
 
-The ``/v1/providers`` endpoint reports static, network-free metadata for every
-configured provider. The ``/v1/provider-credentials`` endpoints manage the
+The ``/api/v1/providers`` endpoint reports static, network-free metadata for every
+configured provider. The ``/api/v1/provider-credentials`` endpoints manage the
 ``provider_credentials`` table: providers an operator adds at runtime through the
-dashboard, encrypted at rest and merged over config.yml providers. Every route
-here describes or changes the gateway's own configuration, so the router is
-operator-gated; standalone-mode only (it is not mounted in hybrid).
+dashboard, encrypted at rest and merged over config.yml providers. Those describe or
+change the gateway's own configuration, so their router is operator-gated;
+standalone-mode only (it is not mounted in hybrid).
+
+``/api/v1/providers/catalog`` is the exception, on ``catalog_router``: it lists the
+providers any-llm knows, which is a property of the build rather than of this
+deployment, and the organization provider-key form needs it to offer a BYO provider
+at all.
 """
 
 import asyncio
@@ -17,10 +22,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gateway.api.deps import get_config, get_db, require_deployment_operator
-from gateway.core.config import PROVIDER_TYPE_ALIASES, GatewayConfig
+from gateway.api.deps import get_config, get_db, require_deployment_operator, verify_catalog_reader
+from gateway.core.config import PROVIDER_TYPE_ALIASES, RESERVED_PROVIDER_INSTANCE_NAMES, GatewayConfig
+from gateway.core.surface import Surface
 from gateway.log_config import logger
-from gateway.models.entities import ProviderCredential
+from gateway.models.providers import ProviderCredential
 from gateway.services.model_discovery_service import (
     background_discovery_enabled,
     discover_provider_models,
@@ -54,10 +60,22 @@ from gateway.services.secret_box import (
 from gateway.services.url_safety import UnsafeURLError, validate_provider_api_base
 
 router = APIRouter(
-    prefix="/v1",
     tags=["providers"],
     dependencies=[Depends(require_deployment_operator)],
 )
+# The registry reads, which name providers any-llm knows rather than anything this
+# deployment configured. A tenant reaches them: the organization provider-key form
+# is the picker's other caller, and it is owners and admins who fill it, never an
+# operator. Gated like the other catalog reads so admitting a session is spelled at
+# the router (see ``deps.verify_catalog_reader``).
+catalog_router = APIRouter(
+    tags=["providers"],
+    dependencies=[Depends(verify_catalog_reader)],
+)
+
+# Not hosted: a stored provider is shared by every organization and overrides their own keys.
+# Hiding the page does not stop the API from writing one.
+SURFACE = Surface("providers", hosted=False)
 
 
 class ProviderCapabilitiesSchema(BaseModel):
@@ -170,19 +188,19 @@ def _to_known_schema(provider: KnownProvider) -> KnownProviderSchema:
     )
 
 
-@router.get("/providers/catalog")
+@catalog_router.get("/providers/catalog")
 async def provider_catalog() -> list[KnownProviderSummarySchema]:
     """List every known provider for the add-provider picker: id and name only.
 
     Lightweight by design so the picker never lags: provider ids come from the
     any-llm registry and names from the bundled genai-prices dataset, so no
     provider SDK is imported. The autofill hints for a chosen provider come from
-    GET /v1/providers/catalog/{provider_id}, which imports only that one SDK.
+    GET /api/v1/providers/catalog/{provider_id}, which imports only that one SDK.
     """
     return [_to_summary_schema(summary) for summary in list_known_provider_summaries()]
 
 
-@router.get("/providers/catalog/{provider_id}")
+@catalog_router.get("/providers/catalog/{provider_id}")
 async def provider_catalog_detail(provider_id: str) -> KnownProviderSchema:
     """Autofill hints for one provider the add-provider form has selected.
 
@@ -290,7 +308,7 @@ async def provider_health(
 
 
 # --------------------------------------------------------------------------- #
-# Runtime provider-credential management (/v1/provider-credentials)
+# Runtime provider-credential management (/api/v1/provider-credentials)
 # --------------------------------------------------------------------------- #
 
 
@@ -371,6 +389,13 @@ class ReencryptProviderCredentialsResponse(BaseModel):
 
     reencrypted: int = Field(description="Number of stored provider keys re-encrypted.")
     unreadable: int = Field(description="Number of encrypted keys left untouched because they could not be decrypted.")
+    skipped: int = Field(
+        default=0,
+        description=(
+            "Number of rows whose stored key changed between the read and the write, so the "
+            "re-encryption was not applied. They already hold whoever wrote them last."
+        ),
+    )
 
 
 class TestProviderRequest(BaseModel):
@@ -394,6 +419,14 @@ def _validate_instance(instance: str, provider_type: str | None) -> None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Provider instance name must not contain ':' or '/'.",
+        )
+    if instance in RESERVED_PROVIDER_INSTANCE_NAMES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Provider instance name '{instance}' is reserved: 'otari' prices the gateway's own "
+                "tools and 'hosted' names a deployment-owned offering."
+            ),
         )
     if provider_type:
         impl = PROVIDER_TYPE_ALIASES.get(provider_type, provider_type)
@@ -507,7 +540,7 @@ async def reencrypt_stored_provider_keys(
     by replacing the affected provider keys.
     """
     try:
-        reencrypted, unreadable = await reencrypt_credentials(db)
+        reencrypted, unreadable, skipped = await reencrypt_credentials(db)
         await db.commit()
     except SecretBoxUnavailableError as exc:
         await db.rollback()
@@ -520,7 +553,7 @@ async def reencrypt_stored_provider_keys(
         await refresh_provider_cache(db, config)
     except SQLAlchemyError:
         logger.warning("Provider overlay refresh failed after re-encrypting credentials; converges within TTL")
-    return ReencryptProviderCredentialsResponse(reencrypted=reencrypted, unreadable=unreadable)
+    return ReencryptProviderCredentialsResponse(reencrypted=reencrypted, unreadable=unreadable, skipped=skipped)
 
 
 @router.get("/provider-credentials")

@@ -233,3 +233,176 @@ async def test_find_pricing_defaults_can_be_disabled(async_db: AsyncSession) -> 
 
     pricing = await find_model_pricing(async_db, "openai", "gpt-4o")
     assert pricing is None
+
+
+@pytest.mark.asyncio
+async def test_the_batch_ladder_answers_what_settlement_answers(async_db: AsyncSession) -> None:
+    """The two statements of the ladder must not drift apart.
+
+    `find_model_pricing` is the order a request is metered by, one model at a
+    time. `OrganizationPricingService.rates_in_effect` is the same order in a
+    batch, because the offered-models surface prices a page at once and asking
+    per model would be a query per model. Two implementations of one order is
+    the arrangement this pins: a rung added, reordered or re-spelled in either
+    has to be done in both, and this fails until it is.
+    """
+    from gateway.core.config import GatewayConfig
+    from gateway.models.money import to_usd
+    from gateway.models.pricing import API_ORIGIN, OrganizationModelPricing
+    from gateway.repositories.tenancy import OrganizationRepository
+    from gateway.services.organization_pricing_service import OrganizationPricingService
+    from gateway.services.pricing_service import normalize_effective_at
+
+    organization = await OrganizationRepository(async_db).create_organization(
+        name="Ladder", slug="ladder", created_by_user_id=None
+    )
+    organization_id = organization.id
+    as_of = normalize_effective_at(None)
+    configure_default_pricing(True)
+
+    # `openai:gpt-4o` is priced at *both* stored rungs, which is what makes the
+    # order decide rather than merely the lookup: a ladder that consulted the
+    # deployment first would answer 9.0 where settlement answers 1.0. The other
+    # two keys cover a rung each on their own.
+    async_db.add(
+        OrganizationModelPricing(
+            organization_id=organization_id,
+            model_key="openai:gpt-4o",
+            input_price_per_million=to_usd(1.0),
+            output_price_per_million=to_usd(2.0),
+            effective_from=as_of - timedelta(days=1),
+            origin=API_ORIGIN,
+        )
+    )
+    async_db.add(
+        ModelPricing(
+            model_key="openai:gpt-4o",
+            effective_at=as_of - timedelta(days=1),
+            input_price_per_million=9.0,
+            output_price_per_million=18.0,
+        )
+    )
+    async_db.add(
+        ModelPricing(
+            model_key="openai:gpt-4o-mini",
+            effective_at=as_of - timedelta(days=1),
+            input_price_per_million=3.0,
+            output_price_per_million=4.0,
+        )
+    )
+    await async_db.commit()
+
+    keys = ["openai:gpt-4o", "openai:gpt-4o-mini", "anthropic:claude-sonnet-4"]
+    service = OrganizationPricingService(async_db, GatewayConfig(), model_provider=None)
+    batch = await service.rates_in_effect(organization_id, keys, as_of)
+
+    for model_key in keys:
+        provider, _, model = model_key.partition(":")
+        settled = await find_model_pricing(async_db, provider, model, as_of=as_of, organization_id=organization_id)
+        rung = batch.get(model_key)
+        assert (rung is None) == (settled is None), model_key
+        if rung is None or settled is None:
+            continue
+        assert float(rung.rates.input_price_per_million) == float(settled.input_price_per_million), model_key
+        assert float(rung.rates.output_price_per_million) == float(settled.output_price_per_million), model_key
+
+    # The organization's own rate, not the deployment's 9.0 for the same key.
+    assert batch["openai:gpt-4o"].source == "organization"
+    assert float(batch["openai:gpt-4o"].rates.input_price_per_million) == 1.0
+    assert batch["openai:gpt-4o-mini"].source == "deployment"
+    assert batch["anthropic:claude-sonnet-4"].source == "defaults"
+
+
+@pytest.mark.asyncio
+async def test_resolve_pricing_reports_the_rung_that_answered(async_db: AsyncSession) -> None:
+    """``resolve_model_pricing`` names the same rung ``find_model_pricing`` stops on."""
+    from gateway.models.money import to_usd
+    from gateway.models.pricing import API_ORIGIN, OrganizationModelPricing
+    from gateway.repositories.tenancy import OrganizationRepository
+    from gateway.services.pricing_service import normalize_effective_at, resolve_model_pricing
+
+    organization = await OrganizationRepository(async_db).create_organization(
+        name="Sources", slug="sources", created_by_user_id=None
+    )
+    as_of = normalize_effective_at(None)
+    configure_default_pricing(True)
+    async_db.add(
+        OrganizationModelPricing(
+            organization_id=organization.id,
+            model_key="openai:gpt-4o",
+            input_price_per_million=to_usd(1.0),
+            output_price_per_million=to_usd(2.0),
+            effective_from=as_of - timedelta(days=1),
+            origin=API_ORIGIN,
+        )
+    )
+    async_db.add(
+        ModelPricing(
+            model_key="openai:gpt-4o-mini",
+            effective_at=as_of - timedelta(days=1),
+            input_price_per_million=3.0,
+            output_price_per_million=4.0,
+        )
+    )
+    await async_db.commit()
+
+    async def source_of(provider: str, model: str) -> str | None:
+        resolved = await resolve_model_pricing(async_db, provider, model, as_of=as_of, organization_id=organization.id)
+        return resolved.source if resolved is not None else None
+
+    assert await source_of("openai", "gpt-4o") == "organization"
+    assert await source_of("openai", "gpt-4o-mini") == "deployment"
+    assert await source_of("anthropic", "claude-sonnet-4") == "defaults"
+    assert await source_of("openai", "nonexistent-model") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_pricing_names_the_entry_that_answered(async_db: AsyncSession) -> None:
+    """Each rung names its own entry and when it took effect (#782)."""
+    from gateway.models.money import to_usd
+    from gateway.models.pricing import API_ORIGIN, OrganizationModelPricing
+    from gateway.repositories.tenancy import OrganizationRepository
+    from gateway.services.pricing_service import (
+        default_pricing_reference,
+        normalize_effective_at,
+        resolve_model_pricing,
+    )
+
+    organization = await OrganizationRepository(async_db).create_organization(
+        name="Provenance", slug="provenance", created_by_user_id=None
+    )
+    as_of = normalize_effective_at(None)
+    override_from = as_of - timedelta(days=2)
+    deployment_from = as_of - timedelta(days=3)
+    configure_default_pricing(True)
+    override = OrganizationModelPricing(
+        organization_id=organization.id,
+        model_key="openai:gpt-4o",
+        input_price_per_million=to_usd(1.0),
+        output_price_per_million=to_usd(2.0),
+        effective_from=override_from,
+        origin=API_ORIGIN,
+    )
+    async_db.add(override)
+    # Stored under the legacy spelling, which is the key the reference names.
+    async_db.add(
+        ModelPricing(
+            model_key="openai/gpt-4o-mini",
+            effective_at=deployment_from,
+            input_price_per_million=3.0,
+            output_price_per_million=4.0,
+        )
+    )
+    await async_db.commit()
+
+    async def resolve(provider: str, model: str) -> tuple[str | None, datetime | None]:
+        resolved = await resolve_model_pricing(async_db, provider, model, as_of=as_of, organization_id=organization.id)
+        assert resolved is not None
+        return resolved.reference, resolved.effective_at
+
+    assert await resolve("openai", "gpt-4o") == (str(override.id), override_from)
+    assert await resolve("openai", "gpt-4o-mini") == ("openai/gpt-4o-mini", deployment_from)
+    reference, effective_at = await resolve("anthropic", "claude-sonnet-4")
+    assert reference is not None
+    assert reference == default_pricing_reference("anthropic", "claude-sonnet-4", as_of)
+    assert effective_at is None

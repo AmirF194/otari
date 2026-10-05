@@ -15,7 +15,7 @@
 // an organization key, so there is no server-side call built from these specs
 // for the form to drift away from; the authority for the names below is
 // any-llm and boto3, which a server-side copy would be paraphrasing just as
-// this one does. The endpoint that would carry it, `/v1/providers/catalog`, is
+// this one does. The endpoint that would carry it, `/providers/catalog`, is
 // `require_deployment_operator`-gated, and the page that most needs these
 // fields (`/organization/provider-keys`) is used by organization owners and
 // admins who hold no deployment authority. Publishing it there would mean
@@ -29,6 +29,8 @@
 // against an upstream rename, which still surfaces as a provider error at
 // request time. `services/bedrock_gateway_auth.py` builds the same names on the
 // hybrid path, out of the platform's `extra_params` rather than out of these.
+
+import { REDACTED_SECRET } from "@/shared/helpers/redaction"
 
 /** One `client_args` entry a provider expects, and how to ask for it. */
 export interface ProviderCredentialFieldSpec {
@@ -67,11 +69,9 @@ export interface ProviderCredentialSpec {
   apiKeyHelpText?: string
 }
 
-// The value the gateway substitutes for a credential-shaped `client_args`
-// entry when it serializes a key, and the value that means "keep what is
-// stored" when it is sent back. Kept in step with `REDACTED_VALUE` in
-// `src/gateway/models/secret_fields.py`.
-export const REDACTED_CLIENT_ARG = "***"
+// The mask a credential-shaped `client_args` entry comes back as, under the
+// name this feature's call sites already use.
+export const REDACTED_CLIENT_ARG = REDACTED_SECRET
 
 const AWS_REGION_PATTERN = /^[a-z0-9-]+$/
 
@@ -231,14 +231,16 @@ export function mergeCredentialFields(
   rest: Record<string, unknown> | null,
   redacted: readonly string[] = [],
 ): Record<string, unknown> | null {
-  const merged: Record<string, unknown> = { ...(rest ?? {}) }
-  for (const key of new Set([...Object.keys(values), ...redacted])) {
-    const value = (values[key] ?? "").trim()
-    if (value !== "") {
-      merged[key] = value
-    } else if (redacted.includes(key)) {
-      merged[key] = REDACTED_CLIENT_ARG
-    }
+  const edited = [...new Set([...Object.keys(values), ...redacted])].flatMap(
+    (key): [string, unknown][] => {
+      const value = (values[key] ?? "").trim()
+      if (value !== "") return [[key, value]]
+      return redacted.includes(key) ? [[key, REDACTED_CLIENT_ARG]] : []
+    },
+  )
+  const merged: Record<string, unknown> = {
+    ...(rest ?? {}),
+    ...Object.fromEntries(edited),
   }
   return Object.keys(merged).length > 0 ? merged : null
 }
@@ -253,24 +255,30 @@ export function validateCredentialFields(
   values: CredentialFieldValues,
   redacted: readonly string[] = [],
 ): Record<string, string> {
-  const errors: Record<string, string> = {}
   const byKey = new Map(fields.map((field) => [field.key, field]))
   const isFilled = (field: ProviderCredentialFieldSpec) =>
     (values[field.key] ?? "").trim() !== "" || redacted.includes(field.key)
 
-  for (const field of fields) {
-    const value = (values[field.key] ?? "").trim()
-    if (value === "") {
-      if (field.isRequired && !redacted.includes(field.key)) {
-        errors[field.key] = `${field.label} is required for this provider.`
+  const errors: Record<string, string> = Object.fromEntries(
+    fields.flatMap((field): [string, string][] => {
+      const value = (values[field.key] ?? "").trim()
+      if (value === "") {
+        return field.isRequired && !redacted.includes(field.key)
+          ? [[field.key, `${field.label} is required for this provider.`]]
+          : []
       }
-      continue
-    }
-    if (field.pattern && !field.pattern.test(value)) {
-      errors[field.key] =
-        field.patternMessage ?? `${field.label} is not in the expected format.`
-    }
-  }
+      if (field.pattern && !field.pattern.test(value)) {
+        return [
+          [
+            field.key,
+            field.patternMessage ??
+              `${field.label} is not in the expected format.`,
+          ],
+        ]
+      }
+      return []
+    }),
+  )
 
   // Half a pair, reported on the half that is missing. Declared from both
   // sides, so filling in either one alone asks for the other.

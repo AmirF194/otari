@@ -23,10 +23,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from gateway.core.config import API_KEY_HEADER
-from gateway.models.entities import Budget, ScopedBudget, UsageLog, User
-from gateway.services.budget_service import ReservationHandle, reconcile_reservation, reserve_budget
-from gateway.services.scoped_budget_service import ApplicableBudget, reserve, settle
+from gateway.core.config import API_KEY_HEADER, API_ROOT
+from gateway.models.budgets import Budget, ScopedBudget
+from gateway.models.usage import UsageLog
+from gateway.models.users import User
+from gateway.services.budgets import ReservationHandle, reconcile_reservation, reserve_budget
+from gateway.services.budgets._scoped_enforcement import ApplicableBudget, reserve, settle
 
 from .conftest import MODEL_NAME
 
@@ -70,7 +72,7 @@ def _chat(client: TestClient, headers: dict[str, str], usage: ChatCompletion) ->
     with patch("gateway.api.routes.chat.acompletion") as mock:
         mock.side_effect = _acompletion
         return client.post(
-            "/v1/chat/completions",
+            f"{API_ROOT}/chat/completions",
             json={"model": MODEL_NAME, "messages": [{"role": "user", "content": "hi"}]},
             headers=headers,
         )
@@ -89,7 +91,7 @@ def test_spend_equals_the_exact_sum_of_the_rows_that_produced_it(
     """
     assert (
         client.post(
-            "/v1/pricing",
+            f"{API_ROOT}/pricing",
             json={
                 "model_key": MODEL_NAME,
                 "input_price_per_million": _RATE,
@@ -99,8 +101,12 @@ def test_spend_equals_the_exact_sum_of_the_rows_that_produced_it(
         ).status_code
         == 200
     )
-    assert client.post("/v1/users", json={"user_id": "ledger-user"}, headers=master_key_header).status_code == 200
-    key = client.post("/v1/keys", json={"key_name": "ledger", "user_id": "ledger-user"}, headers=master_key_header)
+    assert (
+        client.post(f"{API_ROOT}/users", json={"user_id": "ledger-user"}, headers=master_key_header).status_code == 200
+    )
+    key = client.post(
+        f"{API_ROOT}/keys", json={"key_name": "ledger", "user_id": "ledger-user"}, headers=master_key_header
+    )
     assert key.status_code == 200, key.text
     headers = {API_KEY_HEADER: f"Bearer {key.json()['key']}"}
 

@@ -9,11 +9,12 @@ import {
   TextField,
 } from "@heroui/react"
 import { type ReactNode, useMemo, useState } from "react"
-
+import { ComboBoxEmpty } from "@/design-system/forms/ComboBoxEmpty"
+import { Field } from "@/design-system/forms/Field"
+import { FieldMessages } from "@/design-system/forms/FieldMessages"
+import { SecretField } from "@/design-system/forms/SecretField"
 import { useProviderCatalog } from "@/shared/api/providers"
-import { Field } from "@/shared/components/forms/Field"
-import { FieldMessages } from "@/shared/components/forms/FieldMessages"
-import { SecretField } from "@/shared/components/forms/SecretField"
+import { providerDisplayName } from "@/shared/helpers/providers"
 
 import {
   type CredentialFieldValues,
@@ -174,7 +175,9 @@ export function ClientArgsField({
 
 // A searchable provider picker over the known-provider catalog. Selection sets
 // an id (provider id, or a provider_type) while the input shows the display
-// name. `extra` prepends synthetic options like "OpenAI-compatible".
+// name. `extra` prepends synthetic options like "OpenAI-compatible". The whole
+// catalog is offered, uncapped: it is any-llm's registry, a few dozen entries,
+// and a cap silently hid whichever providers sorted last.
 export function ProviderComboBox({
   label,
   value,
@@ -184,6 +187,7 @@ export function ProviderComboBox({
   extra = [],
   includeCatalog = true,
   excludeIds,
+  autoFocus,
 }: {
   label: string
   value: string
@@ -199,13 +203,25 @@ export function ProviderComboBox({
   // depends on what the form collects, not on the catalog. See
   // `BYO_UNSUPPORTED_PROVIDERS`.
   excludeIds?: readonly string[]
+  // Takes focus on mount, for the instance that is a form's first field. It
+  // also selects the trigger: see `menuTrigger` below.
+  autoFocus?: boolean
 }) {
   const catalog = useProviderCatalog()
   const options = useMemo(() => {
     const catalogOptions = includeCatalog
       ? (catalog.data ?? [])
-          .filter((p) => !excludeIds?.includes(p.id))
-          .map((p) => ({ id: p.id, name: p.name }))
+          .filter((provider) => !excludeIds?.includes(provider.id))
+          .map((provider) => ({
+            id: provider.id,
+            // The catalog falls back to the bare id when genai-prices has no
+            // name for a provider (`xai`), so spell it as the rest of the
+            // dashboard does.
+            name:
+              provider.name === provider.id
+                ? providerDisplayName(provider.id)
+                : provider.name,
+          }))
       : []
     return [...extra, ...catalogOptions]
   }, [catalog.data, extra, includeCatalog, excludeIds])
@@ -215,36 +231,53 @@ export function ProviderComboBox({
   // `value` on every render would wipe out what the user is typing, since the
   // options array is recreated each render.
   const [text, setText] = useState(
-    () => options.find((o) => o.id === value)?.name ?? "",
+    () => options.find((option) => option.id === value)?.name ?? "",
   )
 
   // When the input merely shows the current selection, treat the query as empty
   // so opening the dropdown reveals every option, not just the selected one.
-  const selectedName = options.find((o) => o.id === value)?.name ?? ""
+  const selectedName = options.find((option) => option.id === value)?.name ?? ""
   const query =
     text.trim() === selectedName.trim() ? "" : text.trim().toLowerCase()
-  const visible = options
-    .filter(
-      (o) =>
-        !query ||
-        o.name.toLowerCase().includes(query) ||
-        o.id.toLowerCase().includes(query),
-    )
-    .slice(0, 50)
+  const visible = options.filter(
+    (option) =>
+      !query ||
+      option.name.toLowerCase().includes(query) ||
+      option.id.toLowerCase().includes(query),
+  )
+
+  // Both gated on `includeCatalog`: a picker offering only the API dialects must
+  // not report a catalog it excludes.
+  const catalogPending = includeCatalog && catalog.isLoading
+  // A refused or failed read leaves `data` undefined, which is the same empty
+  // array a deployment with no providers gives. Reported as that, a catalog the
+  // caller was refused reads as a deployment with nothing to offer, and the
+  // refusal is invisible from the form.
+  const catalogFailed = includeCatalog && catalog.isError
+  const emptyMessage = catalogPending
+    ? "Loading the provider catalog…"
+    : catalogFailed
+      ? "The provider catalog could not be loaded. Reload the page to try again."
+      : "No provider to offer here."
 
   return (
     <ComboBox.Root
       allowsEmptyCollection
-      // Open the full list on focus/click and filter as you type: this is a
-      // pick-from-a-list control, not a free-text field, and it is not
-      // autofocused, so the list does not spring open when the form appears.
-      menuTrigger="focus"
+      // Opening on focus makes this read as a pick-from-a-list control rather
+      // than a free-text field, but an autofocused instance opens its list on
+      // mount: measured in jsdom, `autoFocus` leaves the input
+      // `aria-expanded="true"` with a listbox rendered, which puts the catalog
+      // over the form before anything has been asked. So that instance opens on
+      // typing instead, and its chevron still shows the whole catalog.
+      menuTrigger={autoFocus ? "input" : "focus"}
       inputValue={text}
       onInputChange={setText}
       onSelectionChange={(key) => {
         if (key != null) {
           onChange(String(key))
-          setText(options.find((o) => o.id === String(key))?.name ?? "")
+          setText(
+            options.find((option) => option.id === String(key))?.name ?? "",
+          )
         } else {
           // Selection cleared: clear the parent value too, so the submitted
           // data cannot keep a stale provider after the field is emptied.
@@ -261,6 +294,7 @@ export function ProviderComboBox({
             appending to it (otherwise "OpenAI-compatible" + typing filters to nothing). */}
         <Input
           placeholder={placeholder ?? "Search providers…"}
+          autoFocus={autoFocus}
           autoComplete="off"
           data-1p-ignore
           data-lpignore="true"
@@ -269,7 +303,22 @@ export function ProviderComboBox({
         <ComboBox.Trigger />
       </ComboBox.InputGroup>
       <ComboBox.Popover>
-        <ListBox items={visible} className="max-h-72 overflow-auto">
+        <ListBox
+          items={visible}
+          className="max-h-72 overflow-auto"
+          renderEmptyState={() => (
+            <ComboBoxEmpty
+              // A catalog that is still coming or did not arrive counts as an
+              // empty source, so a query matching none of `extra` says why the
+              // list is short rather than that nothing matches it.
+              isSourceEmpty={
+                options.length === 0 || catalogPending || catalogFailed
+              }
+              emptyMessage={emptyMessage}
+              noMatchesMessage="No provider matches what you typed."
+            />
+          )}
+        >
           {(option: { id: string; name: string }) => (
             <ListBoxItem id={option.id} textValue={option.name}>
               {option.name}

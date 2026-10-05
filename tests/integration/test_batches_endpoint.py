@@ -1,4 +1,4 @@
-"""Tests for the /v1/batches batch API endpoints."""
+"""Tests for the /api/v1/batches batch API endpoints."""
 
 import os
 from collections.abc import Generator
@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from any_llm.exceptions import BatchNotCompleteError
 from any_llm.types.batch import BatchResult, BatchResultError, BatchResultItem
-from any_llm.types.completion import CompletionUsage, PromptTokensDetails
+from any_llm.types.completion import ChatCompletion, CompletionUsage, PromptTokensDetails
 from fastapi.testclient import TestClient
 from openai.types.batch import Batch
 from openai.types.batch_request_counts import BatchRequestCounts
 
-from gateway.core.config import API_KEY_HEADER
+from gateway.core.config import API_KEY_HEADER, API_ROOT
 
 from .test_rate_limiting import _make_rate_limit_client
 
@@ -54,13 +54,13 @@ def _create_batch_body(**overrides: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# POST /v1/batches — Create batch
+# POST /api/v1/batches: Create batch
 # ---------------------------------------------------------------------------
 
 
 def test_create_batch_auth_required(client: TestClient) -> None:
-    """POST /v1/batches requires authentication."""
-    resp = client.post("/v1/batches", json=_create_batch_body())
+    """POST /api/v1/batches requires authentication."""
+    resp = client.post(f"{API_ROOT}/batches", json=_create_batch_body())
     assert resp.status_code == 401
 
 
@@ -68,7 +68,7 @@ def test_create_batch_with_api_key(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches works with API key and returns provider field."""
+    """POST /api/v1/batches works with API key and returns provider field."""
     mock_batch = _mock_batch()
 
     class _SupportsBatch:
@@ -78,7 +78,7 @@ def test_create_batch_with_api_key(
         patch("gateway.api.routes.batches.acreate_batch", new_callable=AsyncMock, return_value=mock_batch) as mock_call,
         patch("gateway.api.routes.batches.AnyLLM.get_provider_class", return_value=_SupportsBatch),
     ):
-        resp = client.post("/v1/batches", json=_create_batch_body(), headers=api_key_header)
+        resp = client.post(f"{API_ROOT}/batches", json=_create_batch_body(), headers=api_key_header)
 
     assert resp.status_code == 200
     data = resp.json()
@@ -98,14 +98,14 @@ def test_create_batch_with_master_key(
     client: TestClient,
     master_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches works with master key naming an existing user."""
+    """POST /api/v1/batches works with master key naming an existing user."""
     mock_batch = _mock_batch()
 
     class _SupportsBatch:
         SUPPORTS_BATCH = True
 
     resp = client.post(
-        "/v1/users",
+        f"{API_ROOT}/users",
         json={"user_id": "batch-master-user"},
         headers=master_key_header,
     )
@@ -116,7 +116,7 @@ def test_create_batch_with_master_key(
         patch("gateway.api.routes.batches.AnyLLM.get_provider_class", return_value=_SupportsBatch),
     ):
         resp = client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(user="batch-master-user"),
             headers=master_key_header,
         )
@@ -129,13 +129,13 @@ def test_create_batch_unsupported_provider(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches returns 422 for unsupported provider."""
+    """POST /api/v1/batches returns 422 for unsupported provider."""
 
     class _NoBatch:
         SUPPORTS_BATCH = False
 
     with patch("gateway.api.routes.batches.AnyLLM.get_provider_class", return_value=_NoBatch):
-        resp = client.post("/v1/batches", json=_create_batch_body(), headers=api_key_header)
+        resp = client.post(f"{API_ROOT}/batches", json=_create_batch_body(), headers=api_key_header)
 
     assert resp.status_code == 422
     assert "does not support batch operations" in resp.json()["detail"]
@@ -145,9 +145,9 @@ def test_create_batch_empty_requests(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches returns 422 for empty requests array."""
+    """POST /api/v1/batches returns 422 for empty requests array."""
     resp = client.post(
-        "/v1/batches",
+        f"{API_ROOT}/batches",
         json=_create_batch_body(requests=[]),
         headers=api_key_header,
     )
@@ -158,13 +158,13 @@ def test_create_batch_invalid_model_format(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches returns 400 when model has no provider prefix."""
+    """POST /api/v1/batches returns 400 when model has no provider prefix."""
     with patch(
         "gateway.api.routes.batches.AnyLLM.split_model_provider",
         side_effect=ValueError("Model must be in 'provider:model' format"),
     ):
         resp = client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(model="gpt-4o-mini"),
             headers=api_key_header,
         )
@@ -176,7 +176,7 @@ def test_create_batch_provider_error(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches returns 502 when provider fails."""
+    """POST /api/v1/batches returns 502 when provider fails."""
 
     class _SupportsBatch:
         SUPPORTS_BATCH = True
@@ -189,7 +189,7 @@ def test_create_batch_provider_error(
         ),
         patch("gateway.api.routes.batches.AnyLLM.get_provider_class", return_value=_SupportsBatch),
     ):
-        resp = client.post("/v1/batches", json=_create_batch_body(), headers=api_key_header)
+        resp = client.post(f"{API_ROOT}/batches", json=_create_batch_body(), headers=api_key_header)
 
     assert resp.status_code == 502
     assert resp.json()["detail"] == "LLM provider error"
@@ -201,7 +201,7 @@ def test_create_batch_logs_usage(
     api_key_header: dict[str, str],
     api_key_obj: dict[str, Any],
 ) -> None:
-    """POST /v1/batches creates a usage log entry."""
+    """POST /api/v1/batches creates a usage log entry."""
     mock_batch = _mock_batch()
     user_id = api_key_obj["user_id"]
 
@@ -212,11 +212,11 @@ def test_create_batch_logs_usage(
         patch("gateway.api.routes.batches.acreate_batch", new_callable=AsyncMock, return_value=mock_batch),
         patch("gateway.api.routes.batches.AnyLLM.get_provider_class", return_value=_SupportsBatch),
     ):
-        resp = client.post("/v1/batches", json=_create_batch_body(), headers=api_key_header)
+        resp = client.post(f"{API_ROOT}/batches", json=_create_batch_body(), headers=api_key_header)
 
     assert resp.status_code == 200
 
-    usage_resp = client.get(f"/v1/users/{user_id}/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/{user_id}/usage", headers=master_key_header)
     assert usage_resp.status_code == 200
     logs = usage_resp.json()
     batch_logs = [log for log in logs if log["endpoint"] == "/v1/batches"]
@@ -228,7 +228,7 @@ def test_create_batch_temp_file_cleanup(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches cleans up temp file even on error."""
+    """POST /api/v1/batches cleans up temp file even on error."""
     created_files: list[str] = []
 
     class _SupportsBatch:
@@ -249,7 +249,7 @@ def test_create_batch_temp_file_cleanup(
         patch("gateway.api.routes.batches.AnyLLM.get_provider_class", return_value=_SupportsBatch),
         patch("gateway.api.routes.batches.os.unlink", side_effect=tracking_unlink),
     ):
-        resp = client.post("/v1/batches", json=_create_batch_body(), headers=api_key_header)
+        resp = client.post(f"{API_ROOT}/batches", json=_create_batch_body(), headers=api_key_header)
 
     assert resp.status_code == 502
     # Temp file should have been cleaned up
@@ -258,7 +258,7 @@ def test_create_batch_temp_file_cleanup(
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/batches/{batch_id} — Retrieve batch
+# GET /api/v1/batches/{batch_id}: Retrieve batch
 # ---------------------------------------------------------------------------
 
 
@@ -266,11 +266,11 @@ def test_retrieve_batch(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """GET /v1/batches/{batch_id} retrieves batch status."""
+    """GET /api/v1/batches/{batch_id} retrieves batch status."""
     mock_batch = _mock_batch(status="in_progress")
 
     with patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock, return_value=mock_batch):
-        resp = client.get("/v1/batches/batch_abc123?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 200
     data = resp.json()
@@ -283,13 +283,13 @@ def test_retrieve_batch_missing_provider(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """GET /v1/batches/{batch_id} without provider returns 422."""
-    resp = client.get("/v1/batches/batch_abc123", headers=api_key_header)
+    """GET /api/v1/batches/{batch_id} without provider returns 422."""
+    resp = client.get(f"{API_ROOT}/batches/batch_abc123", headers=api_key_header)
     assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------
-# POST /v1/batches/{batch_id}/cancel — Cancel batch
+# POST /api/v1/batches/{batch_id}/cancel: Cancel batch
 # ---------------------------------------------------------------------------
 
 
@@ -297,7 +297,7 @@ def test_cancel_batch(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches/{batch_id}/cancel cancels a batch."""
+    """POST /api/v1/batches/{batch_id}/cancel cancels a batch."""
     mock_batch = _mock_batch(status="cancelling")
 
     with (
@@ -308,7 +308,7 @@ def test_cancel_batch(
         ),
         patch("gateway.api.routes.batches.acancel_batch", new_callable=AsyncMock, return_value=mock_batch),
     ):
-        resp = client.post("/v1/batches/batch_abc123/cancel?provider=openai", headers=api_key_header)
+        resp = client.post(f"{API_ROOT}/batches/batch_abc123/cancel?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 200
     data = resp.json()
@@ -318,7 +318,7 @@ def test_cancel_batch(
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/batches — List batches
+# GET /api/v1/batches: List batches
 # ---------------------------------------------------------------------------
 
 
@@ -326,13 +326,13 @@ def test_list_batches(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """GET /v1/batches lists batches for a provider."""
+    """GET /api/v1/batches lists batches for a provider."""
     mock_batches = [_mock_batch(id="batch_1"), _mock_batch(id="batch_2")]
 
     with patch(
         "gateway.api.routes.batches.alist_batches", new_callable=AsyncMock, return_value=mock_batches
     ) as mock_call:
-        resp = client.get("/v1/batches?provider=openai&limit=10&after=cursor_abc", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches?provider=openai&limit=10&after=cursor_abc", headers=api_key_header)
 
     assert resp.status_code == 200
     data = resp.json()
@@ -349,7 +349,7 @@ def test_list_batches(
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/batches/{batch_id}/results — Retrieve batch results
+# GET /api/v1/batches/{batch_id}/results: Retrieve batch results
 # ---------------------------------------------------------------------------
 
 
@@ -357,15 +357,31 @@ def test_retrieve_batch_results(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """GET /v1/batches/{batch_id}/results returns per-request results."""
-    mock_completion = MagicMock()
-    mock_completion.model = "gpt-4o-mini"
-    mock_completion.usage = None
-    mock_completion.model_dump.return_value = {"id": "chatcmpl-1", "choices": []}
+    """GET /api/v1/batches/{batch_id}/results returns per-request results."""
+    completion = ChatCompletion.model_validate(
+        {
+            "id": "chatcmpl-1",
+            "created": 1,
+            "model": "gpt-4o-mini",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "42",
+                        "reasoning": {"content": "Computed the answer."},
+                    },
+                }
+            ],
+            "provider_extension": {"request_id": "req-1"},
+        }
+    )
 
     mock_result = BatchResult(
         results=[
-            BatchResultItem(custom_id="req-1", result=mock_completion, error=None),
+            BatchResultItem(custom_id="req-1", result=completion, error=None),
             BatchResultItem(
                 custom_id="req-2", result=None, error=BatchResultError(code="rate_limit", message="Rate limit exceeded")
             ),
@@ -380,14 +396,16 @@ def test_retrieve_batch_results(
         ),
         patch("gateway.api.routes.batches.aretrieve_batch_results", new_callable=AsyncMock, return_value=mock_result),
     ):
-        resp = client.get("/v1/batches/batch_abc123/results?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123/results?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 200
     data = resp.json()
     assert "results" in data
     assert len(data["results"]) == 2
     assert data["results"][0]["custom_id"] == "req-1"
-    assert data["results"][0]["result"] == {"id": "chatcmpl-1", "choices": []}
+    assert data["results"][0]["result"] == completion.model_dump(mode="json")
+    assert data["results"][0]["result"]["choices"][0]["message"]["reasoning"] == "Computed the answer."
+    assert data["results"][0]["result"]["provider_extension"] == {"request_id": "req-1"}
     assert data["results"][0]["error"] is None
     assert data["results"][1]["custom_id"] == "req-2"
     assert data["results"][1]["result"] is None
@@ -399,7 +417,7 @@ def test_retrieve_batch_results_not_complete(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """GET /v1/batches/{batch_id}/results returns 409 when batch is not complete."""
+    """GET /api/v1/batches/{batch_id}/results returns 409 when batch is not complete."""
     with (
         patch(
             "gateway.api.routes.batches.aretrieve_batch",
@@ -412,7 +430,7 @@ def test_retrieve_batch_results_not_complete(
             side_effect=BatchNotCompleteError(batch_id="batch_abc123", status="in_progress"),
         ),
     ):
-        resp = client.get("/v1/batches/batch_abc123/results?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123/results?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 409
     detail = resp.json()["detail"]
@@ -427,7 +445,7 @@ def test_retrieve_batch_results_logs_usage(
     api_key_header: dict[str, str],
     api_key_obj: dict[str, Any],
 ) -> None:
-    """GET /v1/batches/{batch_id}/results creates a usage log entry."""
+    """GET /api/v1/batches/{batch_id}/results creates a usage log entry."""
     mock_result = BatchResult(results=[])
     user_id = api_key_obj["user_id"]
 
@@ -439,11 +457,11 @@ def test_retrieve_batch_results_logs_usage(
         ),
         patch("gateway.api.routes.batches.aretrieve_batch_results", new_callable=AsyncMock, return_value=mock_result),
     ):
-        resp = client.get("/v1/batches/batch_abc123/results?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123/results?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 200
 
-    usage_resp = client.get(f"/v1/users/{user_id}/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/{user_id}/usage", headers=master_key_header)
     assert usage_resp.status_code == 200
     logs = usage_resp.json()
     results_logs = [log for log in logs if log["endpoint"] == "/v1/batches/results"]
@@ -472,10 +490,10 @@ def test_create_batch_master_key_requires_user(
     client: TestClient,
     master_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches with master key and no user field is rejected with 400."""
+    """POST /api/v1/batches with master key and no user field is rejected with 400."""
     create_patch, supports_patch = _batch_enforcement_patches()
     with create_patch as mock_call, supports_patch:
-        resp = client.post("/v1/batches", json=_create_batch_body(), headers=master_key_header)
+        resp = client.post(f"{API_ROOT}/batches", json=_create_batch_body(), headers=master_key_header)
 
     assert resp.status_code == 400
     assert "user" in resp.json()["detail"].lower()
@@ -486,11 +504,11 @@ def test_create_batch_master_key_unknown_user(
     client: TestClient,
     master_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches with master key naming a nonexistent user returns 404."""
+    """POST /api/v1/batches with master key naming a nonexistent user returns 404."""
     create_patch, supports_patch = _batch_enforcement_patches()
     with create_patch as mock_call, supports_patch:
         resp = client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(user="no-such-user"),
             headers=master_key_header,
         )
@@ -504,9 +522,9 @@ def test_create_batch_blocked_user(
     client: TestClient,
     master_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches for a blocked user is rejected before the provider call."""
+    """POST /api/v1/batches for a blocked user is rejected before the provider call."""
     resp = client.post(
-        "/v1/users",
+        f"{API_ROOT}/users",
         json={"user_id": "batch-blocked-user", "blocked": True},
         headers=master_key_header,
     )
@@ -515,7 +533,7 @@ def test_create_batch_blocked_user(
     create_patch, supports_patch = _batch_enforcement_patches()
     with create_patch as mock_call, supports_patch:
         resp = client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(user="batch-blocked-user"),
             headers=master_key_header,
         )
@@ -529,9 +547,9 @@ def test_create_batch_over_budget_user(
     client: TestClient,
     master_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches for a user over budget is rejected before the provider call."""
+    """POST /api/v1/batches for a user over budget is rejected before the provider call."""
     budget_resp = client.post(
-        "/v1/budgets",
+        f"{API_ROOT}/budgets",
         json={"max_budget": 0.0},
         headers=master_key_header,
     )
@@ -539,7 +557,7 @@ def test_create_batch_over_budget_user(
     budget_id = budget_resp.json()["budget_id"]
 
     resp = client.post(
-        "/v1/users",
+        f"{API_ROOT}/users",
         json={"user_id": "batch-broke-user", "budget_id": budget_id},
         headers=master_key_header,
     )
@@ -548,7 +566,7 @@ def test_create_batch_over_budget_user(
     create_patch, supports_patch = _batch_enforcement_patches()
     with create_patch as mock_call, supports_patch:
         resp = client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(user="batch-broke-user"),
             headers=master_key_header,
         )
@@ -565,7 +583,7 @@ def test_create_batch_api_key_cannot_bill_other_user(
 ) -> None:
     """A non-master key naming a user other than its own is rejected."""
     resp = client.post(
-        "/v1/users",
+        f"{API_ROOT}/users",
         json={"user_id": "batch-victim-user"},
         headers=master_key_header,
     )
@@ -574,7 +592,7 @@ def test_create_batch_api_key_cannot_bill_other_user(
     create_patch, supports_patch = _batch_enforcement_patches()
     with create_patch as mock_call, supports_patch:
         resp = client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(user="batch-victim-user"),
             headers=api_key_header,
         )
@@ -593,7 +611,7 @@ def test_create_batch_stamps_owner_metadata(
     create_patch, supports_patch = _batch_enforcement_patches()
     with create_patch as mock_call, supports_patch:
         resp = client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(metadata={"team": "ml-ops", "otari_user_id": "spoofed-user"}),
             headers=api_key_header,
         )
@@ -610,10 +628,10 @@ def batch_rate_limit_client(postgres_url: str) -> Generator[TestClient]:
 
 
 def test_create_batch_rate_limited(batch_rate_limit_client: TestClient) -> None:
-    """POST /v1/batches enforces the per-user rate limit."""
+    """POST /api/v1/batches enforces the per-user rate limit."""
     header = {API_KEY_HEADER: "Bearer test-master-key"}
     resp = batch_rate_limit_client.post(
-        "/v1/users",
+        f"{API_ROOT}/users",
         json={"user_id": "batch-rl-user"},
         headers=header,
     )
@@ -622,17 +640,17 @@ def test_create_batch_rate_limited(batch_rate_limit_client: TestClient) -> None:
     create_patch, supports_patch = _batch_enforcement_patches()
     with create_patch, supports_patch:
         first = batch_rate_limit_client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(user="batch-rl-user"),
             headers=header,
         )
         second = batch_rate_limit_client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(user="batch-rl-user"),
             headers=header,
         )
         third = batch_rate_limit_client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(user="batch-rl-user"),
             headers=header,
         )
@@ -648,11 +666,11 @@ def test_retrieve_batch_owned_by_other_user_is_404(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """GET /v1/batches/{batch_id} hides batches owned by another user."""
+    """GET /api/v1/batches/{batch_id} hides batches owned by another user."""
     foreign = _mock_batch(metadata={"otari_user_id": "someone-else"})
 
     with patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock, return_value=foreign):
-        resp = client.get("/v1/batches/batch_abc123?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 404
     assert "not found" in resp.json()["detail"].lower()
@@ -663,11 +681,11 @@ def test_retrieve_batch_owned_by_self(
     api_key_header: dict[str, str],
     api_key_obj: dict[str, Any],
 ) -> None:
-    """GET /v1/batches/{batch_id} returns batches owned by the key's user."""
+    """GET /api/v1/batches/{batch_id} returns batches owned by the key's user."""
     own = _mock_batch(metadata={"otari_user_id": api_key_obj["user_id"]})
 
     with patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock, return_value=own):
-        resp = client.get("/v1/batches/batch_abc123?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 200
     assert resp.json()["id"] == "batch_abc123"
@@ -681,7 +699,7 @@ def test_retrieve_batch_master_key_sees_any(
     foreign = _mock_batch(metadata={"otari_user_id": "someone-else"})
 
     with patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock, return_value=foreign):
-        resp = client.get("/v1/batches/batch_abc123?provider=openai", headers=master_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123?provider=openai", headers=master_key_header)
 
     assert resp.status_code == 200
 
@@ -690,14 +708,14 @@ def test_cancel_batch_owned_by_other_user_is_404(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """POST /v1/batches/{batch_id}/cancel refuses batches owned by another user."""
+    """POST /api/v1/batches/{batch_id}/cancel refuses batches owned by another user."""
     foreign = _mock_batch(metadata={"otari_user_id": "someone-else"})
 
     with (
         patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock, return_value=foreign),
         patch("gateway.api.routes.batches.acancel_batch", new_callable=AsyncMock) as mock_cancel,
     ):
-        resp = client.post("/v1/batches/batch_abc123/cancel?provider=openai", headers=api_key_header)
+        resp = client.post(f"{API_ROOT}/batches/batch_abc123/cancel?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 404
     mock_cancel.assert_not_awaited()
@@ -707,14 +725,14 @@ def test_retrieve_batch_results_owned_by_other_user_is_404(
     client: TestClient,
     api_key_header: dict[str, str],
 ) -> None:
-    """GET /v1/batches/{batch_id}/results refuses batches owned by another user."""
+    """GET /api/v1/batches/{batch_id}/results refuses batches owned by another user."""
     foreign = _mock_batch(metadata={"otari_user_id": "someone-else"})
 
     with (
         patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock, return_value=foreign),
         patch("gateway.api.routes.batches.aretrieve_batch_results", new_callable=AsyncMock) as mock_results,
     ):
-        resp = client.get("/v1/batches/batch_abc123/results?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123/results?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 404
     mock_results.assert_not_awaited()
@@ -725,7 +743,7 @@ def test_list_batches_filters_foreign_batches(
     api_key_header: dict[str, str],
     api_key_obj: dict[str, Any],
 ) -> None:
-    """GET /v1/batches hides other users' batches but keeps own and legacy ones."""
+    """GET /api/v1/batches hides other users' batches but keeps own and legacy ones."""
     own = _mock_batch(id="batch_own", metadata={"otari_user_id": api_key_obj["user_id"]})
     foreign = _mock_batch(id="batch_foreign", metadata={"otari_user_id": "someone-else"})
     legacy = _mock_batch(id="batch_legacy")
@@ -735,7 +753,7 @@ def test_list_batches_filters_foreign_batches(
         new_callable=AsyncMock,
         return_value=[own, foreign, legacy],
     ):
-        resp = client.get("/v1/batches?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 200
     ids = [item["id"] for item in resp.json()["data"]]
@@ -750,7 +768,7 @@ def test_retrieve_batch_results_master_key_logs_batch_owner(
 ) -> None:
     """Master-key results retrieval attributes usage to the stamped batch owner."""
     resp = client.post(
-        "/v1/users",
+        f"{API_ROOT}/users",
         json={"user_id": "batch-owner-user"},
         headers=master_key_header,
     )
@@ -763,11 +781,11 @@ def test_retrieve_batch_results_master_key_logs_batch_owner(
         patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock, return_value=stamped),
         patch("gateway.api.routes.batches.aretrieve_batch_results", new_callable=AsyncMock, return_value=mock_result),
     ):
-        resp = client.get("/v1/batches/batch_abc123/results?provider=openai", headers=master_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123/results?provider=openai", headers=master_key_header)
 
     assert resp.status_code == 200
 
-    usage_resp = client.get("/v1/users/batch-owner-user/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/batch-owner-user/usage", headers=master_key_header)
     assert usage_resp.status_code == 200
     results_logs = [log for log in usage_resp.json() if log["endpoint"] == "/v1/batches/results"]
     assert len(results_logs) == 1
@@ -780,9 +798,9 @@ def test_retrieve_batch_results_records_tokens_and_cost(
     api_key_header: dict[str, str],
     api_key_obj: dict[str, Any],
 ) -> None:
-    """GET /v1/batches/{batch_id}/results records summed tokens and cost."""
+    """GET /api/v1/batches/{batch_id}/results records summed tokens and cost."""
     pricing_resp = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "openai:gpt-4o-mini",
             "input_price_per_million": 1.0,
@@ -807,11 +825,11 @@ def test_retrieve_batch_results_records_tokens_and_cost(
         ),
         patch("gateway.api.routes.batches.aretrieve_batch_results", new_callable=AsyncMock, return_value=mock_result),
     ):
-        resp = client.get("/v1/batches/batch_abc123/results?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/batch_abc123/results?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 200
 
-    usage_resp = client.get(f"/v1/users/{api_key_obj['user_id']}/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/{api_key_obj['user_id']}/usage", headers=master_key_header)
     assert usage_resp.status_code == 200
     results_logs = [log for log in usage_resp.json() if log["endpoint"] == "/v1/batches/results"]
     assert len(results_logs) >= 1
@@ -839,8 +857,7 @@ def _completed_results_patches(tokens: CompletionUsage | None = None, count: int
     mock_completion.model_dump.return_value = {"id": "chatcmpl-1", "choices": []}
     mock_result = BatchResult(
         results=[
-            BatchResultItem(custom_id=f"req-{index + 1}", result=mock_completion, error=None)
-            for index in range(count)
+            BatchResultItem(custom_id=f"req-{index + 1}", result=mock_completion, error=None) for index in range(count)
         ]
     )
     return (
@@ -869,7 +886,7 @@ def _create_recorded_batch(
         ),
         patch("gateway.api.routes.batches.AnyLLM.get_provider_class", return_value=_SupportsBatch),
     ):
-        resp = client.post("/v1/batches", json=_create_batch_body(**body_overrides), headers=headers)
+        resp = client.post(f"{API_ROOT}/batches", json=_create_batch_body(**body_overrides), headers=headers)
     assert resp.status_code == 200
     created_id: str = resp.json()["id"]
     return created_id
@@ -884,7 +901,7 @@ def test_recorded_batch_results_accounted_once(
     """A recorded batch logs usage and folds spend exactly once across retries."""
     user_id = api_key_obj["user_id"]
     pricing_resp = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "openai:gpt-4o-mini",
             "input_price_per_million": 1.0,
@@ -900,21 +917,21 @@ def test_recorded_batch_results_accounted_once(
         CompletionUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
     )
     with retrieve_patch, results_patch:
-        first = client.get(f"/v1/batches/{batch_id}/results?provider=openai", headers=api_key_header)
-        second = client.get(f"/v1/batches/{batch_id}/results?provider=openai", headers=api_key_header)
+        first = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
+        second = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
 
     # Both retrievals return the results; only the first bills.
     assert first.status_code == 200
     assert second.status_code == 200
 
-    usage_resp = client.get(f"/v1/users/{user_id}/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/{user_id}/usage", headers=master_key_header)
     results_logs = [log for log in usage_resp.json() if log["endpoint"] == "/v1/batches/results"]
     assert len(results_logs) == 1
 
     expected_cost = 100 / 1_000_000 * 1.0 + 50 / 1_000_000 * 2.0
     assert results_logs[0]["cost"] == pytest.approx(expected_cost)
 
-    user_resp = client.get(f"/v1/users/{user_id}", headers=master_key_header)
+    user_resp = client.get(f"{API_ROOT}/users/{user_id}", headers=master_key_header)
     assert user_resp.status_code == 200
     assert user_resp.json()["spend"] == pytest.approx(expected_cost)
 
@@ -933,7 +950,7 @@ def test_batch_lines_are_priced_one_request_at_a_time(
     """
     user_id = api_key_obj["user_id"]
     pricing_resp = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "openai:gpt-4o-mini",
             "input_price_per_million": 1.0,
@@ -951,10 +968,10 @@ def test_batch_lines_are_priced_one_request_at_a_time(
     line = CompletionUsage(prompt_tokens=100_000, completion_tokens=1_000, total_tokens=101_000)
     retrieve_patch, results_patch = _completed_results_patches(line, count=3)
     with retrieve_patch, results_patch:
-        resp = client.get(f"/v1/batches/{batch_id}/results?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
     assert resp.status_code == 200
 
-    usage_resp = client.get(f"/v1/users/{user_id}/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/{user_id}/usage", headers=master_key_header)
     results_logs = [log for log in usage_resp.json() if log["endpoint"] == "/v1/batches/results"]
     assert len(results_logs) == 1
     assert results_logs[0]["prompt_tokens"] == 300_000
@@ -980,7 +997,7 @@ def test_batch_lines_keep_their_cached_token_discount(
     """
     user_id = api_key_obj["user_id"]
     client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "openai:gpt-4o-mini",
             "input_price_per_million": 2.5,
@@ -999,16 +1016,18 @@ def test_batch_lines_keep_their_cached_token_discount(
     )
     retrieve_patch, results_patch = _completed_results_patches(line, count=1)
     with retrieve_patch, results_patch:
-        resp = client.get(f"/v1/batches/{batch_id}/results?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
     assert resp.status_code == 200
 
-    logs = client.get(f"/v1/users/{user_id}/usage", headers=master_key_header).json()
+    logs = client.get(f"{API_ROOT}/users/{user_id}/usage", headers=master_key_header).json()
     row = next(log for log in logs if log["endpoint"] == "/v1/batches/results")
     # 1000 fresh at 2.5/M + 9000 cached at 0.25/M + 500 output at 10/M.
     assert row["cost"] == pytest.approx(0.0025 + 0.00225 + 0.005)
     # The row shows the cached count its cost already reflects. Read through
-    # /v1/usage rather than the per-user view, which does not carry the column.
-    entries = client.get("/v1/usage", params={"endpoint": "/v1/batches/results"}, headers=master_key_header).json()
+    # /api/v1/usage rather than the per-user view, which does not carry the column.
+    entries = client.get(
+        f"{API_ROOT}/usage", params={"endpoint": "/v1/batches/results"}, headers=master_key_header
+    ).json()
     assert entries[0]["cache_read_tokens"] == 9_000
 
 
@@ -1027,7 +1046,7 @@ def test_a_batch_is_rounded_once_not_once_per_line(
     """
     user_id = api_key_obj["user_id"]
     client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "openai:gpt-4o-mini",
             "input_price_per_million": 0.15,
@@ -1040,10 +1059,10 @@ def test_a_batch_is_rounded_once_not_once_per_line(
     line = CompletionUsage(prompt_tokens=200, completion_tokens=2, total_tokens=202)
     retrieve_patch, results_patch = _completed_results_patches(line, count=3)
     with retrieve_patch, results_patch:
-        resp = client.get(f"/v1/batches/{batch_id}/results?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
     assert resp.status_code == 200
 
-    usage_resp = client.get(f"/v1/users/{user_id}/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/{user_id}/usage", headers=master_key_header)
     results_logs = [log for log in usage_resp.json() if log["endpoint"] == "/v1/batches/results"]
     assert results_logs[0]["cost"] == pytest.approx(0.000094)
 
@@ -1069,17 +1088,17 @@ def test_recorded_batch_results_defers_accounting_until_pricing_exists(
     # billed and the accounting slot is left unclaimed.
     retrieve_patch, results_patch = _completed_results_patches(tokens)
     with retrieve_patch, results_patch:
-        before_pricing = client.get(f"/v1/batches/{batch_id}/results?provider=openai", headers=api_key_header)
+        before_pricing = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
     assert before_pricing.status_code == 200
 
-    usage_resp = client.get(f"/v1/users/{user_id}/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/{user_id}/usage", headers=master_key_header)
     assert [log for log in usage_resp.json() if log["endpoint"] == "/v1/batches/results"] == []
-    user_resp = client.get(f"/v1/users/{user_id}", headers=master_key_header)
+    user_resp = client.get(f"{API_ROOT}/users/{user_id}", headers=master_key_header)
     assert user_resp.json()["spend"] == pytest.approx(0.0)
 
     # Add pricing, then retrieve again (and once more): now it accounts exactly once.
     pricing_resp = client.post(
-        "/v1/pricing",
+        f"{API_ROOT}/pricing",
         json={
             "model_key": "openai:gpt-4o-mini",
             "input_price_per_million": 1.0,
@@ -1091,18 +1110,18 @@ def test_recorded_batch_results_defers_accounting_until_pricing_exists(
 
     retrieve_patch, results_patch = _completed_results_patches(tokens)
     with retrieve_patch, results_patch:
-        first = client.get(f"/v1/batches/{batch_id}/results?provider=openai", headers=api_key_header)
-        second = client.get(f"/v1/batches/{batch_id}/results?provider=openai", headers=api_key_header)
+        first = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
+        second = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=api_key_header)
     assert first.status_code == 200
     assert second.status_code == 200
 
-    usage_resp = client.get(f"/v1/users/{user_id}/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/{user_id}/usage", headers=master_key_header)
     results_logs = [log for log in usage_resp.json() if log["endpoint"] == "/v1/batches/results"]
     assert len(results_logs) == 1
 
     expected_cost = 100 / 1_000_000 * 1.0 + 50 / 1_000_000 * 2.0
     assert results_logs[0]["cost"] == pytest.approx(expected_cost)
-    user_resp = client.get(f"/v1/users/{user_id}", headers=master_key_header)
+    user_resp = client.get(f"{API_ROOT}/users/{user_id}", headers=master_key_header)
     assert user_resp.json()["spend"] == pytest.approx(expected_cost)
 
 
@@ -1120,13 +1139,13 @@ def test_unrecorded_batch_results_logs_every_retrieval(
         CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
     )
     with retrieve_patch, results_patch:
-        first = client.get("/v1/batches/legacy_batch/results?provider=openai", headers=api_key_header)
-        second = client.get("/v1/batches/legacy_batch/results?provider=openai", headers=api_key_header)
+        first = client.get(f"{API_ROOT}/batches/legacy_batch/results?provider=openai", headers=api_key_header)
+        second = client.get(f"{API_ROOT}/batches/legacy_batch/results?provider=openai", headers=api_key_header)
 
     assert first.status_code == 200
     assert second.status_code == 200
 
-    usage_resp = client.get(f"/v1/users/{user_id}/usage", headers=master_key_header)
+    usage_resp = client.get(f"{API_ROOT}/users/{user_id}/usage", headers=master_key_header)
     results_logs = [log for log in usage_resp.json() if log["endpoint"] == "/v1/batches/results"]
     assert len(results_logs) == 2
 
@@ -1150,7 +1169,7 @@ def test_recorded_batch_foreign_caller_never_reaches_the_provider(
     batch_id = _create_recorded_batch(client, api_key_header)
 
     other_key_resp = client.post(
-        "/v1/keys",
+        f"{API_ROOT}/keys",
         json={"key_name": "foreign-caller", "user_id": "batch-foreign-caller"},
         headers=master_key_header,
     )
@@ -1158,7 +1177,7 @@ def test_recorded_batch_foreign_caller_never_reaches_the_provider(
     other_header = {API_KEY_HEADER: f"Bearer {other_key_resp.json()['key']}"}
 
     with patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock) as mock_retrieve:
-        resp = client.get(f"/v1/batches/{batch_id}?provider=openai", headers=other_header)
+        resp = client.get(f"{API_ROOT}/batches/{batch_id}?provider=openai", headers=other_header)
 
     assert resp.status_code == 404
     mock_retrieve.assert_not_awaited()
@@ -1173,7 +1192,7 @@ def test_recorded_batch_cancel_by_foreign_caller_never_reaches_the_provider(
     batch_id = _create_recorded_batch(client, api_key_header)
 
     other_key_resp = client.post(
-        "/v1/keys",
+        f"{API_ROOT}/keys",
         json={"key_name": "foreign-canceller", "user_id": "batch-foreign-canceller"},
         headers=master_key_header,
     )
@@ -1181,7 +1200,7 @@ def test_recorded_batch_cancel_by_foreign_caller_never_reaches_the_provider(
     other_header = {API_KEY_HEADER: f"Bearer {other_key_resp.json()['key']}"}
 
     with patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock) as mock_retrieve:
-        resp = client.post(f"/v1/batches/{batch_id}/cancel?provider=openai", headers=other_header)
+        resp = client.post(f"{API_ROOT}/batches/{batch_id}/cancel?provider=openai", headers=other_header)
 
     assert resp.status_code == 404
     mock_retrieve.assert_not_awaited()
@@ -1196,7 +1215,7 @@ def test_recorded_batch_results_by_foreign_caller_never_reaches_the_provider(
     batch_id = _create_recorded_batch(client, api_key_header)
 
     other_key_resp = client.post(
-        "/v1/keys",
+        f"{API_ROOT}/keys",
         json={"key_name": "foreign-results", "user_id": "batch-foreign-results"},
         headers=master_key_header,
     )
@@ -1204,7 +1223,7 @@ def test_recorded_batch_results_by_foreign_caller_never_reaches_the_provider(
     other_header = {API_KEY_HEADER: f"Bearer {other_key_resp.json()['key']}"}
 
     with patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock) as mock_retrieve:
-        resp = client.get(f"/v1/batches/{batch_id}/results?provider=openai", headers=other_header)
+        resp = client.get(f"{API_ROOT}/batches/{batch_id}/results?provider=openai", headers=other_header)
 
     assert resp.status_code == 404
     mock_retrieve.assert_not_awaited()
@@ -1219,7 +1238,7 @@ def test_recorded_batch_strict_ownership_ignores_missing_metadata(
     batch_id = _create_recorded_batch(client, api_key_header)
 
     other_key_resp = client.post(
-        "/v1/keys",
+        f"{API_ROOT}/keys",
         json={"key_name": "other", "user_id": "batch-other-user"},
         headers=master_key_header,
     )
@@ -1230,8 +1249,8 @@ def test_recorded_batch_strict_ownership_ignores_missing_metadata(
     # must keep a foreign key out (the metadata fallback would fail open).
     no_marker = _mock_batch(id=batch_id, status="completed", metadata=None)
     with patch("gateway.api.routes.batches.aretrieve_batch", new_callable=AsyncMock, return_value=no_marker):
-        foreign = client.get(f"/v1/batches/{batch_id}?provider=openai", headers=other_header)
-        owner = client.get(f"/v1/batches/{batch_id}?provider=openai", headers=api_key_header)
+        foreign = client.get(f"{API_ROOT}/batches/{batch_id}?provider=openai", headers=other_header)
+        owner = client.get(f"{API_ROOT}/batches/{batch_id}?provider=openai", headers=api_key_header)
 
     assert foreign.status_code == 404
     assert owner.status_code == 200
@@ -1244,7 +1263,7 @@ def test_recorded_batch_list_hides_foreign_without_metadata(
 ) -> None:
     """List filtering uses the records table, so an unmarked foreign batch is hidden."""
     other_key_resp = client.post(
-        "/v1/keys",
+        f"{API_ROOT}/keys",
         json={"key_name": "other-list", "user_id": "batch-list-other"},
         headers=master_key_header,
     )
@@ -1260,7 +1279,7 @@ def test_recorded_batch_list_hides_foreign_without_metadata(
         _mock_batch(id=foreign_id, metadata=None),
     ]
     with patch("gateway.api.routes.batches.alist_batches", new_callable=AsyncMock, return_value=listed):
-        resp = client.get("/v1/batches?provider=openai", headers=api_key_header)
+        resp = client.get(f"{API_ROOT}/batches?provider=openai", headers=api_key_header)
 
     assert resp.status_code == 200
     ids = [item["id"] for item in resp.json()["data"]]
@@ -1295,7 +1314,7 @@ def test_batch_endpoints_not_in_hybrid_mode(
     app = create_app(platform_config)
     with TestClient(app) as platform_client:
         resp = platform_client.post(
-            "/v1/batches",
+            f"{API_ROOT}/batches",
             json=_create_batch_body(),
             headers={"Authorization": "Bearer test-master-key"},
         )

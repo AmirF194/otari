@@ -2,10 +2,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { render, screen } from "@testing-library/react"
 import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-
 import { VerifyEmailPage } from "@/features/auth/VerifyEmailPage"
 import { ApiError, apiFetch } from "@/shared/api/client"
+import { DeploymentProvider } from "@/shared/hooks/useDeployment"
+import { ThemeProvider } from "@/shared/hooks/useTheme"
 import { TELEMETRY_EVENTS } from "@/shared/telemetry/events"
+import { bootstrap } from "@/tests/fixtures"
 import { recordEvent, resetTelemetrySpy } from "@/tests/telemetry"
 
 vi.mock("@/shared/api/client", async (importOriginal) => {
@@ -28,9 +30,13 @@ function renderPage(hash: string) {
   return {
     client,
     ...render(
-      <QueryClientProvider client={client}>
-        <VerifyEmailPage hash={hash} />
-      </QueryClientProvider>,
+      <DeploymentProvider value={bootstrap()}>
+        <ThemeProvider>
+          <QueryClientProvider client={client}>
+            <VerifyEmailPage hash={hash} />
+          </QueryClientProvider>
+        </ThemeProvider>
+      </DeploymentProvider>,
     ),
   }
 }
@@ -55,7 +61,7 @@ describe("VerifyEmailPage", () => {
     ).toBeInTheDocument()
     expect(screen.getByText(/ada@example.com is confirmed/)).toBeInTheDocument()
     const [path, init] = vi.mocked(apiFetch).mock.calls[0] ?? []
-    expect(path).toBe("/v1/auth/verify-email")
+    expect(path).toBe("/auth/verify-email")
     // In the body, not the URL: the token is a bearer credential and a URL is
     // what an access log retains.
     expect(JSON.parse(String(init?.body))).toEqual({ token: "abc123" })
@@ -74,9 +80,13 @@ describe("VerifyEmailPage", () => {
 
     render(
       <StrictMode>
-        <QueryClientProvider client={client}>
-          <VerifyEmailPage hash="#/verify-email?token=abc123" />
-        </QueryClientProvider>
+        <DeploymentProvider value={bootstrap()}>
+          <ThemeProvider>
+            <QueryClientProvider client={client}>
+              <VerifyEmailPage hash="#/verify-email?token=abc123" />
+            </QueryClientProvider>
+          </ThemeProvider>
+        </DeploymentProvider>
       </StrictMode>,
     )
 
@@ -94,9 +104,13 @@ describe("VerifyEmailPage", () => {
     const { client, rerender } = renderPage("#/verify-email?token=abc123")
     await screen.findByRole("heading", { name: "Email verified" })
     rerender(
-      <QueryClientProvider client={client}>
-        <VerifyEmailPage hash="#/verify-email?token=abc123" />
-      </QueryClientProvider>,
+      <DeploymentProvider value={bootstrap()}>
+        <ThemeProvider>
+          <QueryClientProvider client={client}>
+            <VerifyEmailPage hash="#/verify-email?token=abc123" />
+          </QueryClientProvider>
+        </ThemeProvider>
+      </DeploymentProvider>,
     )
 
     expect(apiFetch).toHaveBeenCalledTimes(1)
@@ -185,9 +199,13 @@ describe("the telemetry the verification page records", () => {
 
     render(
       <StrictMode>
-        <QueryClientProvider client={client}>
-          <VerifyEmailPage hash="#/verify-email?token=abc123" />
-        </QueryClientProvider>
+        <DeploymentProvider value={bootstrap()}>
+          <ThemeProvider>
+            <QueryClientProvider client={client}>
+              <VerifyEmailPage hash="#/verify-email?token=abc123" />
+            </QueryClientProvider>
+          </ThemeProvider>
+        </DeploymentProvider>
       </StrictMode>,
     )
 

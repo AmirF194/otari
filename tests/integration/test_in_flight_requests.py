@@ -1,4 +1,4 @@
-"""GET /v1/usage/in-flight reports what the gateway is serving right now.
+"""GET /api/v1/usage/in-flight reports what the gateway is serving right now.
 
 The usage log only records requests that have settled, so a slow backend (a local
 model taking 30 seconds) is invisible while it runs. These tests pin the two
@@ -33,11 +33,12 @@ from any_llm.types.completion import (
 )
 from fastapi.testclient import TestClient
 
+from gateway.core.config import API_ROOT
 from gateway.inflight import InFlightRegistry
 
 from .conftest import MODEL_NAME
 
-IN_FLIGHT = "/v1/usage/in-flight"
+IN_FLIGHT = f"{API_ROOT}/usage/in-flight"
 _MESSAGES = [{"role": "user", "content": "Hello"}]
 
 
@@ -52,9 +53,7 @@ def _completion() -> ChatCompletion:
         object="chat.completion",
         created=0,
         model=MODEL_NAME,
-        choices=[
-            Choice(index=0, message=ChatCompletionMessage(role="assistant", content="hi"), finish_reason="stop")
-        ],
+        choices=[Choice(index=0, message=ChatCompletionMessage(role="assistant", content="hi"), finish_reason="stop")],
         usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
     )
 
@@ -71,7 +70,7 @@ def _chunk() -> ChatCompletionChunk:
 
 def _chat(client: TestClient, headers: dict[str, str], **extra: Any) -> Any:
     return client.post(
-        "/v1/chat/completions",
+        f"{API_ROOT}/chat/completions",
         json={"model": MODEL_NAME, "messages": _MESSAGES, **extra},
         headers=headers,
     )
@@ -87,9 +86,7 @@ def test_in_flight_requires_the_master_key(client: TestClient, api_key_header: d
     assert client.get(IN_FLIGHT, headers=api_key_header).status_code == 401
 
 
-def test_an_idle_gateway_reports_nothing_in_flight(
-    client: TestClient, master_key_header: dict[str, str]
-) -> None:
+def test_an_idle_gateway_reports_nothing_in_flight(client: TestClient, master_key_header: dict[str, str]) -> None:
     resp = client.get(IN_FLIGHT, headers=master_key_header)
 
     assert resp.status_code == 200
@@ -179,9 +176,7 @@ def test_a_request_is_registered_while_its_provider_call_runs(
     assert len(registry) == 0
 
 
-def test_a_failed_request_does_not_stay_in_flight(
-    client: TestClient, api_key_header: dict[str, str]
-) -> None:
+def test_a_failed_request_does_not_stay_in_flight(client: TestClient, api_key_header: dict[str, str]) -> None:
     with patch("gateway.api.routes.chat.acompletion", side_effect=RuntimeError("provider down")):
         assert _chat(client, api_key_header).status_code >= 400
 
@@ -210,7 +205,7 @@ def test_a_stream_stays_in_flight_until_its_body_is_consumed(
     with patch("gateway.api.routes.chat.acompletion", side_effect=open_stream):
         with client.stream(
             "POST",
-            "/v1/chat/completions",
+            f"{API_ROOT}/chat/completions",
             json={"model": MODEL_NAME, "messages": _MESSAGES, "stream": True},
             headers=api_key_header,
         ) as response:
@@ -222,9 +217,7 @@ def test_a_stream_stays_in_flight_until_its_body_is_consumed(
     assert len(registry) == 0
 
 
-def test_a_pass_through_request_is_registered_too(
-    client: TestClient, api_key_header: dict[str, str]
-) -> None:
+def test_a_pass_through_request_is_registered_too(client: TestClient, api_key_header: dict[str, str]) -> None:
     """Embeddings, images, audio and friends run through their own scaffold.
 
     They write activity rows like any other request, and an image generation
@@ -245,7 +238,7 @@ def test_a_pass_through_request_is_registered_too(
 
     with patch("gateway.api.routes.embeddings.aembedding", side_effect=slow_embedding):
         resp = client.post(
-            "/v1/embeddings",
+            f"{API_ROOT}/embeddings",
             json={"model": "openai:text-embedding-3-small", "input": "hello"},
             headers=api_key_header,
         )
@@ -286,7 +279,7 @@ def test_which_refusals_reach_the_registry(
     with patch.object(InFlightRegistry, "begin", autospec=True, wraps=None) as begin:
         begin.return_value = "tracked"
         resp = client.post(
-            "/v1/chat/completions",
+            f"{API_ROOT}/chat/completions",
             json={"model": model, "messages": _MESSAGES},
             headers=api_key_header,
         )

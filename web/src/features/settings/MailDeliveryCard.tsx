@@ -1,11 +1,11 @@
 import { Button } from "@heroui/react"
 import { useState } from "react"
+import { ErrorBanner } from "@/design-system/feedback/ErrorBanner"
+import { InfoBanner } from "@/design-system/feedback/InfoBanner"
+import { PageLoading } from "@/design-system/feedback/PageLoading"
+import { Field } from "@/design-system/forms/Field"
+import { SettingsGroup } from "@/design-system/layout/SettingsGroup"
 import { useMailSettings, useSendTestMail } from "@/shared/api/settings"
-import { ErrorBanner } from "@/shared/components/feedback/ErrorBanner"
-import { InfoBanner } from "@/shared/components/feedback/InfoBanner"
-import { PageLoading } from "@/shared/components/feedback/PageLoading"
-import { Field } from "@/shared/components/forms/Field"
-import { SettingsGroup } from "@/shared/components/layout/SettingsGroup"
 
 // What each transport means to an operator reading this page. Keyed by the
 // server's value rather than derived from it, so an unknown transport (a build
@@ -54,7 +54,7 @@ export function MailDeliveryCard() {
   const [to, setTo] = useState("")
 
   const data = mail.data
-  const ready = data?.ready ?? false
+  const isReady = data?.ready ?? false
   const result = sendTest.data
   // Nothing is claimed about mail until the server has answered. Falling back
   // to "unavailable" while the request is in flight would state the very thing
@@ -85,7 +85,7 @@ export function MailDeliveryCard() {
                 {data.public_base_url ?? "Not set"}
               </dd>
             </dl>
-            {ready ? null : <MissingSettings missing={data.missing} />}
+            {isReady ? null : <MissingSettings missing={data.missing} />}
           </>
         ) : null}
       </div>
@@ -96,7 +96,7 @@ export function MailDeliveryCard() {
           <p className="mt-1 max-w-3xl text-caption">
             {loading
               ? "Checking whether this deployment can send mail…"
-              : ready
+              : isReady
                 ? "Sends a short message through the configured transport, so you can confirm delivery before anyone is invited."
                 : "Unavailable until a transport and a public base URL are configured."}
           </p>
@@ -111,7 +111,7 @@ export function MailDeliveryCard() {
           <Button
             size="sm"
             variant="ghost"
-            isDisabled={!ready || to.trim() === "" || sendTest.isPending}
+            isDisabled={!isReady || to.trim() === "" || sendTest.isPending}
             onPress={() => sendTest.mutate({ to: to.trim() })}
           >
             {sendTest.isPending ? "Sending…" : "Send test email"}

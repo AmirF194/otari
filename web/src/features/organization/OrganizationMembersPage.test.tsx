@@ -14,7 +14,11 @@ import type {
   Workspace,
   WorkspaceMember,
 } from "@/client"
-import { OrganizationMembersPage } from "@/features/organization/OrganizationMembersPage"
+import {
+  OrganizationMembersPage,
+  parseAddresses,
+} from "@/features/organization/OrganizationMembersPage"
+import { API_ROOT } from "@/shared/api/client"
 import { DeploymentProvider } from "@/shared/hooks/useDeployment"
 import {
   bootstrap,
@@ -45,7 +49,12 @@ function mockApi(opts: {
   context?: OrganizationContext
   members?: OrganizationMember[]
   workspaces?: Workspace[]
+  // Holds the workspace roster in flight, so the dialog can be typed into
+  // before its default lands: `fetchAllPaged` walks every page, so on a cold
+  // cache that is the real order.
+  workspacesGate?: Promise<unknown>
   inviteResult?: unknown
+  bulkInviteResult?: unknown
   // The gateway's spend rows. The roster joins them on `attribution_user_id`
   // to show what a member may call and what they have spent, neither of which
   // is a column on the membership itself.
@@ -68,6 +77,60 @@ function mockApi(opts: {
   const budgetList = opts.budgets ?? []
   const requests: Request[] = []
 
+  // The join the gateway does now (otari#1381), so a test still describes the
+  // world in its parts: which workspaces exist, who is in them, what each
+  // membership is capped at, and what the gateway identity behind a member has
+  // spent. The page reads the result off the row rather than assembling it.
+  const ceilingFor = (membershipId: string) =>
+    scopedBudgets.find(
+      (budget) =>
+        budget.scope_type === "workspace_member" &&
+        budget.scope_id === membershipId &&
+        // The aggregate one, as the route matches it: a ceiling carrying a
+        // provider key caps that credential rather than the membership.
+        budget.provider_key_id === null,
+    ) ?? null
+  const joined = (member: OrganizationMember): OrganizationMember => ({
+    ...member,
+    workspaces: workspaces.flatMap((workspace) =>
+      (workspaceMembers[workspace.id] ?? [])
+        .filter((row) => row.user_id === member.user_id)
+        .map((row) => {
+          const ceiling = ceilingFor(row.id)
+          return {
+            workspace_id: workspace.id,
+            workspace_name: workspace.name,
+            workspace_member_id: row.id,
+            role: row.role,
+            ceiling: ceiling
+              ? {
+                  id: ceiling.id,
+                  budget_id: ceiling.budget_id,
+                  max_budget: ceiling.max_budget,
+                }
+              : null,
+          }
+        }),
+    ),
+    // Withheld from a caller who does not operate the deployment, which is what
+    // the route does with these deployment-wide figures.
+    attribution: context.deployment_operator
+      ? (() => {
+          const row = users.find(
+            (user) => user.user_id === member.attribution_user_id,
+          )
+          return row
+            ? {
+                spend: row.spend,
+                reserved: row.reserved,
+                blocked: row.blocked,
+                allowed_models: row.allowed_models,
+              }
+            : null
+        })()
+      : null,
+  })
+
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = String(input)
     const method = (init?.method ?? "GET").toUpperCase()
@@ -77,40 +140,44 @@ function mockApi(opts: {
       body: init?.body ? JSON.parse(String(init.body)) : undefined,
     })
 
-    if (url.includes("/v1/providers")) {
+    if (url.includes(`${API_ROOT}/providers`)) {
       return jsonResponse({ providers: [] })
     }
-    if (url.includes("/v1/models/discoverable")) {
+    if (url.includes(`${API_ROOT}/models/discoverable`)) {
       return jsonResponse({ models: [] })
     }
-    if (url.includes("/v1/aliases")) {
+    if (url.includes(`${API_ROOT}/aliases`)) {
       return jsonResponse([])
     }
-    if (url.includes("/v1/budgets")) {
+    if (url.includes(`${API_ROOT}/budgets`)) {
       return jsonResponse(budgetList)
     }
-    if (url.includes("/v1/scoped-budgets")) {
+    if (url.includes(`${API_ROOT}/scoped-budgets`)) {
       if (method === "GET") return jsonResponse(scopedBudgets)
       return jsonResponse(
         scopedBudgets[0] ?? {},
         method === "DELETE" ? 204 : 200,
       )
     }
-    if (url.includes("/members") && url.includes("/v1/workspaces/")) {
-      const id = url.split("/v1/workspaces/")[1]?.split("/")[0] ?? ""
+    if (url.includes("/members") && url.includes(`${API_ROOT}/workspaces/`)) {
+      const id = url.split(`${API_ROOT}/workspaces/`)[1]?.split("/")[0] ?? ""
       const roster = workspaceMembers[id] ?? []
       if (method === "GET") {
         return jsonResponse({ data: roster, count: roster.length })
       }
       return jsonResponse(roster[0] ?? {})
     }
-    if (url.includes("/v1/workspaces")) {
+    if (url.includes(`${API_ROOT}/workspaces`)) {
+      if (opts.workspacesGate) await opts.workspacesGate
       return jsonResponse({ data: workspaces, count: workspaces.length })
     }
-    if (url.includes("/v1/users")) {
+    if (url.includes(`${API_ROOT}/users`)) {
       return jsonResponse(method === "PATCH" ? users[0] : users)
     }
-    if (url.includes("/v1/organizations/me/member-invitations")) {
+    if (url.includes(`${API_ROOT}/organizations/me/member-invitations/bulk`)) {
+      return jsonResponse(opts.bulkInviteResult)
+    }
+    if (url.includes(`${API_ROOT}/organizations/me/member-invitations`)) {
       if (method === "POST") {
         return jsonResponse(
           opts.inviteResult ?? {
@@ -129,9 +196,17 @@ function mockApi(opts: {
       }
       return jsonResponse({ message: "Invitation revoked" })
     }
-    if (url.includes("/v1/organizations/me/members")) {
+    if (url.includes(`${API_ROOT}/organizations/me/members`)) {
       if (method === "GET") {
-        return jsonResponse({ data: members, count: members.length })
+        // The window, like the route: a test that ignored it could not tell a
+        // paged read from a read of everything.
+        const params = new URL(url, "http://localhost").searchParams
+        const skip = Number(params.get("skip") ?? 0)
+        const limit = Number(params.get("limit") ?? 100)
+        return jsonResponse({
+          data: members.slice(skip, skip + limit).map(joined),
+          count: members.length,
+        })
       }
       if (method === "POST") {
         return jsonResponse(
@@ -211,7 +286,7 @@ describe("OrganizationMembersPage", () => {
 
     const patch = requests.find((request) => request.method === "PATCH")
     expect(patch?.url).toContain(
-      "/v1/organizations/me/members/analyst-membership",
+      `${API_ROOT}/organizations/me/members/analyst-membership`,
     )
     expect(patch?.body).toEqual({ role: "admin" })
   })
@@ -256,7 +331,7 @@ describe("OrganizationMembersPage", () => {
 
     const remove = requests.find((request) => request.method === "DELETE")
     expect(remove?.url).toContain(
-      "/v1/organizations/me/members/analyst-membership",
+      `${API_ROOT}/organizations/me/members/analyst-membership`,
     )
   })
 
@@ -273,7 +348,7 @@ describe("OrganizationMembersPage", () => {
     expect(within(rowFor("Analyst")).getByText("ACTIVE")).toBeInTheDocument()
   })
 
-  it("adds a member by address, into the workspaces that were ticked", async () => {
+  it("invites a member by address, into the workspaces that were ticked", async () => {
     const requests = mockApi({
       members: [OWNER],
       workspaces: [workspace({ id: "ws-1", name: "Production" })],
@@ -281,22 +356,95 @@ describe("OrganizationMembersPage", () => {
     const user = userEvent.setup()
     renderPage(<OrganizationMembersPage />)
 
-    await user.click(await screen.findByRole("button", { name: "Add member" }))
-    await user.type(screen.getByLabelText("Email address"), "ada@example.com")
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
+    await user.type(screen.getByLabelText("Email addresses"), "ada@example.com")
     await pickOption(user, "Role", "Admin")
     // Ticked by default, since a member in no workspace can reach nothing.
     expect(await screen.findByLabelText("Production")).toBeChecked()
-    // The header action hides itself while the form is open, so the remaining
-    // button of this name is the form's own submit.
-    await user.click(screen.getByRole("button", { name: "Add member" }))
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Invite member",
+      }),
+    )
 
     const post = requests.find((request) => request.method === "POST")
-    expect(post?.url).toContain("/v1/organizations/me/members")
+    expect(post?.url).toContain(
+      `${API_ROOT}/organizations/me/member-invitations`,
+    )
     expect(post?.body).toEqual({
       email: "ada@example.com",
       role: "admin",
       workspace_assignments: [{ workspace_id: "ws-1", role: "member" }],
     })
+  })
+
+  it.each([false, true])(
+    "offers the invitation whether or not mail can be sent (mail_ready: %s)",
+    async (mailReady) => {
+      // Adding someone straight to `active` left an identity nobody could claim
+      // where mail cannot be sent; an invitation always hands back a link.
+      mockApi({ members: [OWNER] })
+      renderPage(<OrganizationMembersPage />, { mail_ready: mailReady })
+
+      await screen.findByRole("button", { name: "Invite member" })
+      expect(screen.queryByRole("button", { name: "Add member" })).toBeNull()
+    },
+  )
+
+  it("keeps the header trigger on screen while its dialog is open", async () => {
+    // The dialog sits over the page rather than replacing the action, so the
+    // control does not vanish from under the pointer while it is open.
+    mockApi({ members: [OWNER] })
+    const user = userEvent.setup()
+    renderPage(<OrganizationMembersPage />)
+
+    const add = await screen.findByRole("button", { name: "Invite member" })
+    await user.click(add)
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument()
+    expect(add).toBeVisible()
+  })
+
+  it("opens the dialog on a blank draft, not on the last one typed", async () => {
+    // Reset on the way in: clearing on the way out would blank the fields
+    // while the dialog is still animating away.
+    mockApi({ members: [OWNER] })
+    const user = userEvent.setup()
+    renderPage(<OrganizationMembersPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
+    await user.type(screen.getByLabelText("Email addresses"), "ada@example.com")
+    // A draft this far along is dirty, so the way out is through the guard.
+    await user.keyboard("{Escape}")
+    await user.click(screen.getByRole("button", { name: "Discard" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
+
+    await user.click(screen.getByRole("button", { name: "Invite member" }))
+    expect(await screen.findByLabelText("Email addresses")).toHaveValue("")
+  })
+
+  it("reads nothing on its own account for the closed dialog", async () => {
+    // The form is mounted from the first paint, so anything it reads would be
+    // read on page load. Today it reads only the workspace list the page itself
+    // needs, which is why one GET serves both.
+    const requests = mockApi({
+      members: [OWNER],
+      workspaces: [workspace({ id: "ws-1", name: "Production" })],
+    })
+    renderPage(<OrganizationMembersPage />)
+
+    await screen.findByRole("button", { name: "Invite member" })
+    await waitFor(() =>
+      expect(
+        requests.filter((request) =>
+          request.url.startsWith(`${API_ROOT}/workspaces?`),
+        ),
+      ).toHaveLength(1),
+    )
   })
 
   it("leaves the default alone once the operator has cleared it", async () => {
@@ -307,13 +455,15 @@ describe("OrganizationMembersPage", () => {
     const user = userEvent.setup()
     renderPage(<OrganizationMembersPage />)
 
-    await user.click(await screen.findByRole("button", { name: "Add member" }))
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
     const production = await screen.findByLabelText("Production")
     await user.click(production)
 
     // The seed is a starting point, not a value re-imposed on every render:
     // typing after clearing it must not tick the box again.
-    await user.type(screen.getByLabelText("Email address"), "ada@example.com")
+    await user.type(screen.getByLabelText("Email addresses"), "ada@example.com")
     expect(production).not.toBeChecked()
   })
 
@@ -325,13 +475,19 @@ describe("OrganizationMembersPage", () => {
     const user = userEvent.setup()
     renderPage(<OrganizationMembersPage />)
 
-    await user.click(await screen.findByRole("button", { name: "Add member" }))
-    await user.type(screen.getByLabelText("Email address"), "ada@example.com")
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
+    await user.type(screen.getByLabelText("Email addresses"), "ada@example.com")
     // Deliberate now rather than the default: clearing the seeded workspace is
     // a choice, and the form says what it costs before the request goes.
     await user.click(await screen.findByLabelText("Production"))
     expect(screen.getByText(/no workspace/)).toBeInTheDocument()
-    await user.click(screen.getByRole("button", { name: "Add member" }))
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Invite member",
+      }),
+    )
 
     const post = requests.find((request) => request.method === "POST")
     // No assignment is not the same request as an empty list of them.
@@ -366,19 +522,108 @@ describe("OrganizationMembersPage", () => {
     ).toBeInTheDocument()
   })
 
-  it("invites a member by email and shows the accept link when mail is not configured", async () => {
-    const requests = mockApi({ members: [OWNER] })
+  it("keeps an address typed before the roster lands inside the guard", async () => {
+    // The default workspace is part of the seed; what the operator has already
+    // typed is not. Seeding the fields as they stand when the roster answers
+    // made the guard forget an address typed in the meantime, and Escape then
+    // closed without asking.
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    mockApi({
+      members: [OWNER],
+      workspaces: [workspace({ id: "ws-1", name: "Production" })],
+      workspacesGate: gate,
+    })
     const user = userEvent.setup()
-    renderPage(<OrganizationMembersPage />, { mail_ready: false })
+    renderPage(<OrganizationMembersPage />)
 
     await user.click(
       await screen.findByRole("button", { name: "Invite member" }),
     )
+    await user.type(screen.getByLabelText("Email addresses"), "ada@example.com")
+
+    // Now the roster answers and seeds the workspace default.
+    release()
+    expect(await screen.findByLabelText("Production")).toBeChecked()
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }))
+
     expect(
-      screen.getByText(/Invitation email is unavailable/),
+      await screen.findByRole("button", { name: "Discard" }),
     ).toBeInTheDocument()
-    await user.type(screen.getByLabelText("Email address"), "ada@example.com")
-    await user.click(screen.getByRole("button", { name: "Send invitation" }))
+  })
+
+  it("guards a role change on the invite form, with no address typed", async () => {
+    // The guard reads one snapshot of the whole draft. It read the address
+    // alone, so changing the role, or unticking the seeded workspace the form
+    // itself warns about, was discarded with nothing asked.
+    mockApi({
+      members: [OWNER],
+      workspaces: [workspace({ id: "ws-1", name: "Production" })],
+    })
+    const user = userEvent.setup()
+    renderPage(<OrganizationMembersPage />)
+
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
+    await pickOption(user, "Role", "Admin")
+
+    // Through Cancel: in jsdom focus lands on `<body>` after picking from a
+    // `Select`, so a keystroke reaches nothing.
+    await user.click(screen.getByRole("button", { name: "Cancel" }))
+
+    expect(
+      await screen.findByRole("button", { name: "Discard" }),
+    ).toBeInTheDocument()
+  })
+
+  it("guards an unticked workspace on the invite form, and reopens clean", async () => {
+    mockApi({
+      members: [OWNER],
+      workspaces: [workspace({ id: "ws-1", name: "Production" })],
+    })
+    const user = userEvent.setup()
+    renderPage(<OrganizationMembersPage />, { mail_ready: true })
+
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
+    // Seeded once the roster answers, which is after mount: unticking it is a
+    // change, and the seed it is compared against is the ticked default.
+    const production = await screen.findByLabelText("Production")
+    expect(production).toBeChecked()
+    await user.click(production)
+
+    await user.keyboard("{Escape}")
+    await user.click(await screen.findByRole("button", { name: "Discard" }))
+
+    // And the roster landing is not itself a change: the reopened form is
+    // clean, so Escape closes it rather than asking.
+    await user.click(screen.getByRole("button", { name: "Invite member" }))
+    await screen.findByLabelText("Production")
+    await user.keyboard("{Escape}")
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
+  })
+
+  it("invites a member by email and shows the accept link when the send did not go out", async () => {
+    const requests = mockApi({ members: [OWNER] })
+    const user = userEvent.setup()
+    renderPage(<OrganizationMembersPage />, { mail_ready: true })
+
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
+    await user.type(screen.getByLabelText("Email addresses"), "ada@example.com")
+    // Scoped: the trigger and the submit say the same thing, which is the label
+    // rule, so an unscoped press is ambiguous.
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Invite member",
+      }),
+    )
 
     const post = requests.find(
       (request) =>
@@ -389,11 +634,148 @@ describe("OrganizationMembersPage", () => {
       role: "member",
     })
 
-    // mail_sent is false in the mocked response, so the link is offered to
-    // share by hand rather than the form just closing.
-    expect(await screen.findByText("Invitation sent")).toBeInTheDocument()
+    // mail_sent is false in the mocked response, which with a transport
+    // configured means the send itself failed. The dialog says the email did
+    // not go out rather than claiming it did, and the link the server left
+    // relative is made absolute so it can be pasted anywhere.
     expect(
-      screen.getByText("/#/accept-invitation?token=abc123"),
+      await screen.findByText(/Otari did not send the email/),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        `${window.location.origin}${window.location.pathname}#/accept-invitation?token=abc123`,
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it("confirms the send, and still offers the link, when the email went out", async () => {
+    // The link is offered either way, so an operator can forward it over chat
+    // too. The acknowledgement is one way out of two here, since a delivered
+    // invitation leaves nothing behind that only this dialog holds.
+    mockApi({
+      members: [OWNER],
+      inviteResult: {
+        invitation_id: "invitation-1",
+        organization_member_id: "invited-membership",
+        email: "ada@example.com",
+        role: "member",
+        status: "invited",
+        mail_sent: true,
+        accept_link: "/#/accept-invitation?token=abc123",
+        expires_at: "2026-01-08T00:00:00+00:00",
+        created_at: "2026-01-01T00:00:00+00:00",
+      },
+    })
+    const user = userEvent.setup()
+    renderPage(<OrganizationMembersPage />, { mail_ready: true })
+
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
+    await user.type(screen.getByLabelText("Email addresses"), "ada@example.com")
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Invite member",
+      }),
+    )
+
+    const sent = await screen.findByText(
+      /An email with an accept link was sent/,
+    )
+    expect(within(sent).getByText("ada@example.com")).toBeInTheDocument()
+    expect(screen.queryByText(/Otari did not send the email/)).toBeNull()
+    expect(
+      screen.getByText(
+        `${window.location.origin}${window.location.pathname}#/accept-invitation?token=abc123`,
+      ),
+    ).toBeInTheDocument()
+
+    await user.keyboard("{Escape}")
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
+  })
+
+  it("splits pasted addresses on commas, semicolons and whitespace, once each", () => {
+    expect(
+      parseAddresses(
+        " ada@example.com, bob@example.com;\ncy@example.com  ADA@example.com,,",
+      ),
+    ).toEqual(["ada@example.com", "bob@example.com", "cy@example.com"])
+  })
+
+  it("invites several addresses in one call and reports each one", async () => {
+    const invitation = (email: string, mailSent: boolean) => ({
+      invitation_id: `invitation-${email}`,
+      organization_member_id: `membership-${email}`,
+      email,
+      role: "member",
+      status: "invited",
+      mail_sent: mailSent,
+      accept_link: `/#/accept-invitation?token=${email}`,
+      expires_at: "2026-01-08T00:00:00+00:00",
+      created_at: "2026-01-01T00:00:00+00:00",
+    })
+    const requests = mockApi({
+      members: [OWNER],
+      workspaces: [workspace({ id: "ws-1", name: "Production" })],
+      bulkInviteResult: {
+        invited: [
+          invitation("ada@example.com", true),
+          invitation("bob@example.com", false),
+        ],
+        failed: [{ email: "taken@example.com", detail: "Already a member" }],
+      },
+    })
+    const user = userEvent.setup()
+    renderPage(<OrganizationMembersPage />, { mail_ready: true })
+
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
+    await screen.findByLabelText("Production")
+    await user.type(
+      screen.getByLabelText("Email addresses"),
+      "ada@example.com, taken@example.com{Enter}bob@example.com",
+    )
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Invite 3 members",
+      }),
+    )
+
+    expect(await screen.findByText(/Invited 2 of 3/)).toBeInTheDocument()
+    const posts = requests.filter(
+      (request) =>
+        request.method === "POST" && request.url.includes("member-invitations"),
+    )
+    // One request, carrying the role and workspaces for every address.
+    expect(posts).toHaveLength(1)
+    expect(posts[0].url).toContain("/member-invitations/bulk")
+    expect(posts[0].body).toEqual({
+      emails: ["ada@example.com", "taken@example.com", "bob@example.com"],
+      role: "member",
+      workspace_assignments: [{ workspace_id: "ws-1", role: "member" }],
+    })
+    expect(screen.getByText("Already a member")).toBeInTheDocument()
+    expect(screen.getByText("Email sent.")).toBeInTheDocument()
+    // Only the address whose email did not go out gets a link to share.
+    expect(
+      screen.getByText(
+        `${window.location.origin}${window.location.pathname}#/accept-invitation?token=bob@example.com`,
+      ),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/token=ada@example.com/)).toBeNull()
+  })
+
+  it("says a link comes back to share when mail cannot be sent", async () => {
+    mockApi({ members: [OWNER] })
+    const user = userEvent.setup()
+    renderPage(<OrganizationMembersPage />, { mail_ready: false })
+
+    await user.click(
+      await screen.findByRole("button", { name: "Invite member" }),
+    )
+    expect(
+      screen.getByText(/you get an accept link to share with them/),
     ).toBeInTheDocument()
   })
 
@@ -432,8 +814,87 @@ describe("OrganizationMembersPage", () => {
 
     const revoke = requests.find((request) => request.method === "DELETE")
     expect(revoke?.url).toContain(
-      "/v1/organizations/me/member-invitations/invitation-1",
+      `${API_ROOT}/organizations/me/member-invitations/invitation-1`,
     )
+  })
+
+  it("asks for a page of the roster rather than walking it", async () => {
+    // The other half of otari#1381: with the row carrying its own workspaces,
+    // ceilings and spend, the table has nothing left to join against and can
+    // ask for the window it shows.
+    const requests = mockApi({
+      members: Array.from({ length: 30 }, (_, index) =>
+        organizationMember({
+          organization_member_id: `member-${index}`,
+          user_id: `user-${index}`,
+          full_name: `Member ${String(index).padStart(2, "0")}`,
+        }),
+      ),
+    })
+    renderPage(<OrganizationMembersPage />)
+
+    await screen.findByText("Member 00")
+    // The window's worth, not the roster: 24 is the last of a page of 25.
+    expect(screen.getByText("Member 24")).toBeInTheDocument()
+    expect(screen.queryByText("Member 25")).toBeNull()
+    await waitFor(() => {
+      expect(
+        requests.some((request) =>
+          request.url.includes("/organizations/me/members?skip=0&limit=25"),
+        ),
+      ).toBe(true)
+    })
+  })
+
+  it("pages the roster without reading the rest", async () => {
+    const user = userEvent.setup()
+    const requests = mockApi({
+      members: Array.from({ length: 30 }, (_, index) =>
+        organizationMember({
+          organization_member_id: `member-${index}`,
+          user_id: `user-${index}`,
+          full_name: `Member ${String(index).padStart(2, "0")}`,
+        }),
+      ),
+    })
+    renderPage(<OrganizationMembersPage />)
+
+    await screen.findByText("Member 00")
+    await user.click(screen.getByRole("button", { name: "Next page, members" }))
+
+    await waitFor(() => {
+      expect(
+        requests.some((request) =>
+          request.url.includes("/organizations/me/members?skip=25&limit=25"),
+        ),
+      ).toBe(true)
+    })
+    expect(await screen.findByText("Member 25")).toBeInTheDocument()
+  })
+
+  it("reads the roster alone, and the rest only when the editor opens", async () => {
+    // otari#1381. The table used to fetch seven collections and join them in
+    // the browser: every gateway identity, every workspace, a roster per
+    // workspace, every budget and every ceiling. The row carries what it needs
+    // now, and the three the editor wants are asked for when it opens.
+    const requests = mockApi({
+      context: organizationContext({ deployment_operator: true }),
+      members: [ANALYST],
+      workspaces: [workspace()],
+    })
+    renderPage(<OrganizationMembersPage />)
+    await screen.findByText("Analyst")
+
+    const read = (path: string) =>
+      requests.some(
+        (request) => request.method === "GET" && request.url.includes(path),
+      )
+    await waitFor(() => {
+      expect(read(`${API_ROOT}/organizations/me/members`)).toBe(true)
+    })
+    expect(read(`${API_ROOT}/users`)).toBe(false)
+    expect(read(`${API_ROOT}/scoped-budgets`)).toBe(false)
+    expect(read(`${API_ROOT}/budgets`)).toBe(false)
   })
 
   it("shows what a member may call and what they have spent", async () => {
@@ -517,9 +978,26 @@ describe("OrganizationMembersPage", () => {
     await actor.click(block)
 
     const patch = requests.find(
-      (r) => r.method === "PATCH" && r.url.includes("/v1/users/"),
+      (r) => r.method === "PATCH" && r.url.includes(`${API_ROOT}/users/`),
     )
     expect(patch?.body).toEqual({ blocked: true })
+  })
+
+  it("opens the member editor in a dialog, naming the member", async () => {
+    mockApi({ members: [OWNER, ANALYST], workspaces: [workspace()] })
+    const actor = userEvent.setup()
+    renderPage(<OrganizationMembersPage />)
+
+    await screen.findByText("Analyst")
+    await actor.click(
+      within(rowFor("Analyst")).getByRole("button", { name: "Edit" }),
+    )
+
+    // A dialog rather than a band above the roster: the row keeps its place,
+    // and the page under it does not shift by the height of a form
+    // (otari-ai#2125).
+    const dialog = await screen.findByRole("dialog", { name: "Edit member" })
+    expect(within(dialog).getByText("Workspace access")).toBeInTheDocument()
   })
 
   it("edits model access, workspace membership and the workspace budget in one save", async () => {
@@ -570,26 +1048,27 @@ describe("OrganizationMembersPage", () => {
     // Bravo. A budget is picked, never an amount: the figure is the budget's.
     await pickOption(actor, "Budget in Default Workspace", "Large")
     await actor.click(screen.getByLabelText("Bravo"))
-    await actor.click(screen.getByRole("button", { name: "Save changes" }))
+    await actor.click(screen.getByRole("button", { name: "Save" }))
 
     // All three writes land from the one save. Model access goes to the spend
     // row the membership is joined to, and it is the third table the editor
     // touches: without this the title would be claiming it without proof.
     const access = requests.find(
-      (r) => r.method === "PATCH" && r.url.includes("/v1/users/"),
+      (r) => r.method === "PATCH" && r.url.includes(`${API_ROOT}/users/`),
     )
     expect(access?.body).toEqual({ allowed_models: ANALYST_ACCESS })
 
     const join = requests.find(
       (r) =>
         r.method === "POST" &&
-        r.url.includes(`/v1/workspaces/${SECOND}/members/`),
+        r.url.includes(`${API_ROOT}/workspaces/${SECOND}/members/`),
     )
     expect(join).toBeDefined()
 
     const ceiling = requests.find(
       (r) =>
-        r.method === "PATCH" && r.url.includes("/v1/scoped-budgets/ceiling-1"),
+        r.method === "PATCH" &&
+        r.url.includes(`${API_ROOT}/scoped-budgets/ceiling-1`),
     )
     expect(ceiling?.body).toEqual({ budget_id: "bud-large" })
 
@@ -606,7 +1085,7 @@ describe("OrganizationMembersPage for a tenant who does not operate the deployme
   })
 
   it("asks for none of the deployment-wide reads", async () => {
-    // `/v1/users`, `/v1/budgets` and `/v1/scoped-budgets` have refused a tenant
+    // /api/v1/users, /api/v1/budgets and /api/v1/scoped-budgets have refused a tenant
     // since #821. An organization owner is one, so the page must not ask: the
     // refusals rendered as "this endpoint requires deployment operator access"
     // across a page that is theirs (otari#838).
@@ -621,9 +1100,15 @@ describe("OrganizationMembersPage for a tenant who does not operate the deployme
     // asked for nothing at all.
     await screen.findByText("Analyst")
     expect(
-      requests.some((r) => r.url.includes("/v1/organizations/me/members")),
+      requests.some((r) =>
+        r.url.includes(`${API_ROOT}/organizations/me/members`),
+      ),
     ).toBe(true)
-    for (const path of ["/v1/users", "/v1/budgets", "/v1/scoped-budgets"]) {
+    for (const path of [
+      `${API_ROOT}/users`,
+      `${API_ROOT}/budgets`,
+      `${API_ROOT}/scoped-budgets`,
+    ]) {
       expect(
         requests.filter((r) => r.method === "GET" && r.url.includes(path)),
       ).toHaveLength(0)
@@ -666,7 +1151,7 @@ describe("OrganizationMembersPage for a tenant who does not operate the deployme
   it("saves a workspace placement without asking for scoped budgets", async () => {
     // The gate cannot live on the query alone: `refetch()` runs the query
     // function even when `enabled` is false, so the editor's ceilings pass would
-    // still ask `/v1/scoped-budgets`, be refused, and put the operator refusal
+    // still ask /api/v1/scoped-budgets, be refused, and put the operator refusal
     // back on a page this branch just cleared of it (otari#838).
     const requests = mockApi({
       members: [OWNER, ANALYST],
@@ -685,12 +1170,12 @@ describe("OrganizationMembersPage for a tenant who does not operate the deployme
     expect(
       screen.queryByLabelText("Budget in Default Workspace"),
     ).not.toBeInTheDocument()
-    await actor.click(screen.getByRole("button", { name: "Save changes" }))
+    await actor.click(screen.getByRole("button", { name: "Save" }))
 
     await waitFor(() =>
-      expect(requests.some((r) => r.url.includes("/v1/scoped-budgets"))).toBe(
-        false,
-      ),
+      expect(
+        requests.some((r) => r.url.includes(`${API_ROOT}/scoped-budgets`)),
+      ).toBe(false),
     )
   })
 

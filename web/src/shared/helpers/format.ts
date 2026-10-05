@@ -1,22 +1,71 @@
-export function formatNumber(value: number | null | undefined): string {
-  if (value == null) {
-    return "0"
-  }
-  return new Intl.NumberFormat("en-US").format(value)
-}
+// These three are re-exported rather than defined here: they carry no product
+// vocabulary, so components in the design system need them, and that layer may
+// not import this one. This module stays the single formatter module a page
+// reaches for (DESIGN.md, "Where things come from"), so the names it published
+// are unchanged and there is one implementation of each.
+export {
+  formatNumber,
+  formatPct,
+  formatRelative,
+} from "@/design-system/helpers/format"
 
+const usdPerRequest = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 4,
+})
+
+// What one request or one charge line cost. Four decimals throughout rather
+// than only below a cent: a gateway's per-request costs sit in the hundredths
+// and thousandths, so 2.34 cents rendered as "$0.02" drops the two digits an
+// operator reading a request log is there for. Two decimals at least, so a
+// whole-dollar cost still reads as money.
 export function formatCost(value: number | null | undefined): string {
   if (value == null) {
     return "$0.00"
   }
-  // Show more precision for tiny per-request costs so they don't read as $0.00.
-  const fractionDigits = value !== 0 && Math.abs(value) < 0.01 ? 4 : 2
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: fractionDigits,
-  }).format(value)
+  return usdPerRequest.format(value)
+}
+
+// A per-million rate, as opposed to a spend. Same precision as a cost and a
+// separate name on purpose: $0.075 per million is a real published rate and
+// "$0.08" is a figure nobody set, so the reason these carry four decimals is
+// not the reason a cost does, and one moving should not drag the other.
+export function formatRate(value: number): string {
+  return usdPerRequest.format(value)
+}
+
+// Below what four decimals can show, fall back to significant digits. A
+// per-call rate is routinely smaller than a per-million one: $0.00002 per
+// search renders as "$0.0000" above and reads as free.
+const usdSignificant = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  maximumSignificantDigits: 3,
+})
+
+export function formatUnitRate(value: number): string {
+  if (value === 0) return usdPerRequest.format(0)
+  return value < 0.0001
+    ? usdSignificant.format(value)
+    : usdPerRequest.format(value)
+}
+
+// A millisecond duration an operator reads at a glance: "820 ms", "1.50 s".
+// `undefined` rather than a placeholder when the row recorded none, so a table
+// cell can render the em dash that keeps it aligned and a stat card can drop
+// the figure instead.
+export function formatLatency(
+  ms: number | null | undefined,
+): string | undefined {
+  if (ms == null) {
+    return undefined
+  }
+  if (ms < 1000) {
+    return `${Math.round(ms)} ms`
+  }
+  return `${(ms / 1000).toFixed(2)} s`
 }
 
 // Compact token counts for context windows: 128000 -> "128K", 1000000 -> "1M".
@@ -95,6 +144,36 @@ export function formatDateTime(iso: string | null | undefined): string {
   return date.toLocaleString()
 }
 
+// The heading a dated row sits under in a history list: "Today", "Yesterday",
+// or the date, with the year only when it is not the current one.
+//
+// `now` is a parameter rather than a `new Date()` read inside, so a list left
+// open across midnight relabels when its caller re-reads the clock instead of
+// keeping yesterday's rows under "Today" until something else rerenders it.
+export function formatDateGroup(
+  iso: string | null | undefined,
+  now: Date = new Date(),
+): string {
+  if (!iso) {
+    return "\u2014"
+  }
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) {
+    return iso
+  }
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  if (date.toDateString() === now.toDateString()) return "Today"
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday"
+  return date.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(date.getFullYear() !== now.getFullYear()
+      ? { year: "numeric" as const }
+      : {}),
+  })
+}
+
 // Compact USD for aggregate tiles: cents precision (not the per-request 4dp that
 // formatCost uses), so four+ figure totals stay readable. Non-null: callers guard
 // nullable per-request costs (e.g. `cost === null ? "—" : formatUsd(cost)`).
@@ -132,8 +211,12 @@ export function formatTokens(value: number): string {
   return String(value)
 }
 
-export function formatPct(fraction: number): string {
-  return `${(fraction * 100).toFixed(1)}%`
+const scoreFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 3 })
+
+// A guardrail vendor's score, which is whatever scale that vendor uses: shown
+// as given, to three places, and never as a percentage it may not be.
+export function formatScore(value: number): string {
+  return scoreFormat.format(value)
 }
 
 // Period-over-period change. null when there is no comparable previous value
@@ -144,47 +227,4 @@ export function deltaFraction(
 ): number | null {
   if (previous === undefined || previous === 0) return null
   return (current - previous) / previous
-}
-
-/**
- * A relative time, compact: "3m ago", "2h ago", "5d ago", "2mo ago", "1y ago".
- *
- * Compact is the product's voice for this everywhere, which is a copy decision
- * with a layout consequence: "6 minutes ago" needed 130px of column where "6m
- * ago" fits 120, and a table lane widened to fit a phrase is a layout problem
- * wearing a copy costume. One implementation rather than two, because Activity
- * had grown its own and the two shapes were visibly different on pages sitting
- * one click apart.
- *
- * Deliberately not `Intl.RelativeTimeFormat`: its narrow style still prints
- * "6 min. ago" and its unit thresholds are not ours to choose.
- */
-export function formatRelative(
-  iso: string | null | undefined,
-  now: number = Date.now(),
-): string {
-  if (!iso) {
-    return "never"
-  }
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) {
-    return iso
-  }
-  const seconds = Math.round((now - date.getTime()) / 1000)
-  // A clock skewed a few seconds ahead of the server is common and "in 2s" is
-  // never what an operator wants to read about a request that already landed,
-  // so the future collapses to the present rather than being spelled out.
-  if (seconds < 0) return "just now"
-  if (seconds < 60) return `${seconds}s ago`
-  const minutes = Math.round(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.round(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.round(hours / 24)
-  if (days < 30) return `${days}d ago`
-  // The coarse buckets floor where the finer ones round, so "1y ago" covers the
-  // whole year it names rather than a value at 18 months reading as two.
-  const months = Math.floor(days / 30)
-  if (months < 12) return `${months}mo ago`
-  return `${Math.floor(months / 12)}y ago`
 }

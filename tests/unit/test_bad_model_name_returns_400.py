@@ -24,6 +24,7 @@ from gateway.api.routes._pipeline import _raise_for_unresolvable_model, resolve_
 # _raise_for_unresolvable_model
 # ---------------------------------------------------------------------------
 
+
 def test_value_error_maps_to_400() -> None:
     with pytest.raises(HTTPException) as exc_info:
         _raise_for_unresolvable_model("nosuchmodel", ValueError("Invalid model format"))
@@ -50,6 +51,7 @@ def test_detail_contains_model_name() -> None:
 # resolve_dispatch_provider
 # ---------------------------------------------------------------------------
 
+
 def _make_ctx(resolved_provider: object = None) -> MagicMock:
     ctx = MagicMock()
     ctx.resolved_provider = resolved_provider
@@ -58,6 +60,7 @@ def _make_ctx(resolved_provider: object = None) -> MagicMock:
     # first) are both no-ops without a session, and are covered end to end in
     # tests/integration/test_gateway_rejection_logging.py.
     ctx.db = None
+    ctx.rate_limit_grant = None
     return ctx
 
 
@@ -76,6 +79,9 @@ class _NoHostedCredential:
 
     async def resolve_hosted_credential(self, **kwargs: object) -> None:
         return None
+
+    async def get_hosted_models(self, **kwargs: object) -> dict[str, frozenset[str] | None]:
+        return {}
 
 
 @pytest.mark.asyncio
