@@ -66,6 +66,7 @@ from gateway.services.mcp_loop_responses import (
     responses_tool_loop,
     responses_tool_loop_stream,
 )
+from gateway.services.provider_kwargs import apply_endpoint_defaults
 from gateway.services.tool_format import inject_purpose_hints_responses, openai_to_responses_tools
 from gateway.services.tools import (
     CODE_EXECUTION_HEADER,
@@ -743,7 +744,9 @@ async def create_response(
                 raise_all_streaming_attempts_failed(_ADAPTER, exc, route)
 
         # Standalone: single attempt streaming.
-        call_kwargs = {**provider_kwargs, **_with_codex_extra_body(base_request_fields, provider), "model": model}
+        call_kwargs = apply_endpoint_defaults(
+            {**provider_kwargs, **_with_codex_extra_body(base_request_fields, provider), "model": model}, resolved
+        )
         return await run_single_attempt_stream(
             adapter=_ADAPTER,
             ctx=ctx,
@@ -776,7 +779,9 @@ async def create_response(
         return result.model_dump(exclude_none=True)
 
     # Standalone non-stream path
-    call_kwargs = {**provider_kwargs, **_with_codex_extra_body(base_request_fields, provider), "model": model}
+    call_kwargs = apply_endpoint_defaults(
+        {**provider_kwargs, **_with_codex_extra_body(base_request_fields, provider), "model": model}, resolved
+    )
     result = await run_standalone_non_stream(
         adapter=_ADAPTER,
         ctx=ctx,

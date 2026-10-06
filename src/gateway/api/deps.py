@@ -38,9 +38,14 @@ from gateway.repositories.budgets import BudgetRepositories
 from gateway.repositories.files import FileRepositories
 from gateway.repositories.inference import InferenceRepositories
 from gateway.repositories.overview.overview_repository import OverviewRepository
-from gateway.repositories.providers import OrgProviderKeyModelRepository
+from gateway.repositories.providers import OrgProviderKeyModelRepository, ProviderEndpointRepository
 from gateway.repositories.rate_limits import RateLimitRuleRepository
-from gateway.repositories.tenancy import OrganizationGuardrailDefinitionRepository, OrgProviderKeyRepository
+from gateway.repositories.tenancy import (
+    OrganizationGuardrailDefinitionRepository,
+    OrgProviderKeyRepository,
+    WorkspaceRepository,
+)
+from gateway.repositories.users_repository import get_active_user
 from gateway.services.api_keys import ApiKeyService
 from gateway.services.budgets import BudgetMembershipListener, BudgetService
 from gateway.services.code_execution import SandboxContainerRegistry
@@ -52,7 +57,7 @@ from gateway.services.log_writer import LogWriter
 from gateway.services.master_key_service import hash_master_key, is_generated_master_key, load_master_key_hash
 from gateway.services.organization_pricing_service import OrganizationPricingService
 from gateway.services.overview.overview_service import OverviewService
-from gateway.services.providers import OrgProviderModelService
+from gateway.services.providers import OrgProviderModelService, ProviderEndpointService, refresh_provider_endpoint_cache
 from gateway.services.rate_limits import RateLimitService
 from gateway.services.routing import clear_router_backend_cache
 from gateway.services.tenancy import OrganizationService, organization_guardrail_runner
@@ -1098,6 +1103,34 @@ def get_org_provider_model_service(
 
 
 OrgProviderModelServiceDep = Annotated[OrgProviderModelService, Depends(get_org_provider_model_service)]
+
+
+def get_provider_endpoint_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    uow: Annotated[UnitOfWork, Depends(get_unit_of_work)],
+    config: Annotated[GatewayConfig, Depends(get_config)],
+) -> ProviderEndpointService:
+    """Build the owned provider endpoint service on the request's session and unit of work."""
+
+    async def resolve_workspace(workspace_id: uuid.UUID | None) -> uuid.UUID | None:
+        if workspace_id is None:
+            return await default_workspace_id(db)
+        return workspace_id if await WorkspaceRepository(db).get(workspace_id) is not None else None
+
+    async def user_is_active(user_id: str) -> bool:
+        return await get_active_user(db, user_id) is not None
+
+    return ProviderEndpointService(
+        uow,
+        config=config,
+        endpoints=ProviderEndpointRepository(uow),
+        resolve_workspace=resolve_workspace,
+        user_is_active=user_is_active,
+        refresh_cache=lambda: refresh_provider_endpoint_cache(uow),
+    )
+
+
+ProviderEndpointServiceDep = Annotated[ProviderEndpointService, Depends(get_provider_endpoint_service)]
 
 
 def get_rate_limit_service(

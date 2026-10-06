@@ -81,6 +81,11 @@ from gateway.services.provider_store_service import (
     reset_provider_cache,
     run_provider_refresher,
 )
+from gateway.services.providers import (
+    load_provider_endpoints_at_startup,
+    reset_provider_endpoint_cache,
+    run_provider_endpoint_refresher,
+)
 from gateway.services.rate_limits import load_rate_limit_rules_at_startup, run_rate_limit_refresher
 from gateway.services.runtime_settings_service import apply_overrides_from_db
 from gateway.services.search_backend import close_search_client
@@ -251,6 +256,11 @@ _LIFESPAN_WORKERS: tuple[_LifespanWorker, ...] = (
         "organization provider key",
         lambda _config, _container: run_org_provider_refresher(),
         reset_org_provider_cache,
+    ),
+    _LifespanWorker(
+        "provider endpoint",
+        lambda _config, _container: run_provider_endpoint_refresher(),
+        reset_provider_endpoint_cache,
     ),
     # Not a cache of rows like its neighbours: this holds constructed vendor
     # clients, so its tick rebuilds only what a write moved and its reset gives
@@ -685,6 +695,7 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
             # client here so the first request to need one does not wait for a
             # vendor handshake.
             await load_guardrail_runner_at_startup()
+            await load_provider_endpoints_at_startup()
             log_writer = create_log_writer(config.log_writer_strategy)
             container: Container = app.state.container
             # The retention sweep below resolves this same port, so both it and

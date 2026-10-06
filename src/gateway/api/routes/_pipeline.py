@@ -98,7 +98,6 @@ from gateway.api.routes._platform import (
 from gateway.api.routes._platform import (
     default_attempt_kwargs as default_attempt_kwargs,  # explicit re-export for the route modules
 )
-from gateway.api.routes._schema_derive import SENSITIVE_PARAM_FIELDS
 from gateway.api.routes._tools import _build_web_retrieval_backend, _resolve_sandbox_purpose_hint
 from gateway.core.config import ATTEMPT_ID_HEADER, REQUEST_ID_HEADER, GatewayConfig
 from gateway.core.database import DATABASE_ERRORS, release_session
@@ -113,6 +112,7 @@ from gateway.core.error_codes import (
     error_headers,
 )
 from gateway.core.metered_pricing import calculate_metered_cost, quantize_cost
+from gateway.core.provider_params import SENSITIVE_PARAM_FIELDS
 from gateway.core.unit_of_work import UnitOfWork
 from gateway.core.usage import (
     cache_read_tokens_of,
@@ -212,6 +212,7 @@ from gateway.services.provider_kwargs import (
     provider_key,
     resolve_provider_selector,
 )
+from gateway.services.providers import owned_endpoint_http_client
 from gateway.services.routing import (
     BudgetState,
     CompiledPlan,
@@ -1097,12 +1098,16 @@ async def resolve_dispatch_provider(
     Whichever of the two produced it, the result then passes through
     :func:`_serve_from_hosted_credential`, which is where ``model_provider`` is
     asked to serve a candidate no stored credential could. That is the last rung
-    and never displaces an earlier one; see that function.
+    and never displaces an earlier one; see that function. The caller's own
+    endpoint skips it, holding its credential already, and is given the one HTTP
+    client allowed to dial it.
     """
     if ctx.resolved_provider is not None:
-        return await _serve_from_hosted_credential(ctx, ctx.resolved_provider, adapter=adapter, port=model_provider)
+        return await _prepare_for_dispatch(ctx, ctx.resolved_provider, adapter=adapter, port=model_provider)
     try:
-        resolved = resolve_provider_selector(config, model_selector, ctx.user_id, workspace_id=ctx.workspace_id)
+        resolved = resolve_provider_selector(
+            config, model_selector, ctx.user_id, workspace_id=ctx.workspace_id, owned_endpoints=True
+        )
     except (ValueError, AnyLLMError) as exc:
         # A reservation is already held for this selector, so it is released before the rejection is recorded.
         await release_reservation(ctx)
@@ -1120,7 +1125,22 @@ async def resolve_dispatch_provider(
             request_id=ctx.request_id,
         )
         _raise_for_unresolvable_model(model_selector, exc)
-    return await _serve_from_hosted_credential(ctx, resolved, adapter=adapter, port=model_provider)
+    return await _prepare_for_dispatch(ctx, resolved, adapter=adapter, port=model_provider)
+
+
+async def _prepare_for_dispatch(
+    ctx: RequestContext,
+    resolved: ResolvedProvider,
+    *,
+    adapter: FormatAdapter[Any, Any],
+    port: ModelProviderPort,
+) -> ResolvedProvider:
+    if resolved.owned_endpoint is not None:
+        # The client re-checks and pins the endpoint's address on every request
+        # and follows no redirect; see ``services/providers``.
+        client_args = {"http_client": owned_endpoint_http_client()}
+        return replace(resolved, kwargs={**resolved.kwargs, "client_args": client_args})
+    return await _serve_from_hosted_credential(ctx, resolved, adapter=adapter, port=port)
 
 
 async def _warn_if_hosted_upstream_is_unpriced(
@@ -1982,7 +2002,9 @@ async def resolve_request_context(
             )
         else:
             try:
-                resolved = resolve_provider_selector(config, model, user_id, workspace_id=workspace_id)
+                resolved = resolve_provider_selector(
+                    config, model, user_id, workspace_id=workspace_id, owned_endpoints=True
+                )
                 gate_instance, gate_impl, gate_model = resolved.instance, resolved.provider, resolved.model
                 # Reused by the route handler for dispatch (see `RequestContext.resolved_provider`)
                 # instead of calling `resolve_provider_selector` a second time.
@@ -2030,6 +2052,7 @@ async def resolve_request_context(
             and gate_instance is not None
             and gate_impl is not None
             and gate_instance not in config.providers
+            and (resolved_provider is None or resolved_provider.owned_endpoint is None)
         ):
             org_allowlist = cached_org_model_restriction(workspace_id, gate_impl.value)
             if org_allowlist is not None and gate_model not in org_allowlist:
@@ -2114,8 +2137,11 @@ async def resolve_request_context(
             estimated_tokens=estimated_tokens,
         )
         # A key flagged exclude_from_budget logs its cost and is never reserved, reconciled into users.spend, or gated.
-        # A master-key caller has no API key and stays on the enforced path.
-        budget_exempt = api_key is not None and api_key.exclude_from_budget
+        # A master-key caller has no API key and stays on the enforced path. A request to the caller's own endpoint
+        # is exempt too, its owner paying the upstream; a routing plan never resolves one, so no fallover leaves it.
+        budget_exempt = (api_key is not None and api_key.exclude_from_budget) or (
+            resolved_provider is not None and resolved_provider.owned_endpoint is not None
+        )
         # Reserve first so user/blocked/budget rejections (404/403) take
         # precedence over the missing-pricing rejection (402); refund if we
         # then reject for missing pricing.

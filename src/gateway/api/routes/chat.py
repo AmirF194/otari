@@ -71,6 +71,7 @@ from gateway.services.mcp_loop import (
     mcp_tool_loop,
     mcp_tool_loop_stream,
 )
+from gateway.services.provider_kwargs import apply_endpoint_defaults
 from gateway.services.tools import CODE_EXECUTION_HEADER, WEB_SEARCH_HEADER, Dialect, ToolUseBudget
 from gateway.streaming import OPENAI_STREAM_FORMAT, StreamFormat, openai_error_event
 from gateway.types.attempt import Attempt
@@ -628,7 +629,9 @@ async def run_chat_completion(
         resolved = await resolve_dispatch_provider(
             ctx, config, request.model, adapter=adapter, model_provider=model_provider
         )
-        call_kwargs = {**resolved.kwargs, **request_fields, "model": resolved.dispatch_model}
+        call_kwargs = apply_endpoint_defaults(
+            {**resolved.kwargs, **request_fields, "model": resolved.dispatch_model}, resolved
+        )
         return await run_single_attempt_stream(
             adapter=adapter,
             ctx=ctx,
@@ -669,7 +672,9 @@ async def run_chat_completion(
     resolved = await resolve_dispatch_provider(
         ctx, config, request.model, adapter=adapter, model_provider=model_provider
     )
-    call_kwargs = {**resolved.kwargs, **request_fields, "model": resolved.dispatch_model}
+    call_kwargs = apply_endpoint_defaults(
+        {**resolved.kwargs, **request_fields, "model": resolved.dispatch_model}, resolved
+    )
     result = await run_standalone_non_stream(
         adapter=adapter,
         ctx=ctx,

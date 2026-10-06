@@ -115,7 +115,8 @@ It also owns `models/pricing_schemas.py`.
 ### providers
 
 Provider credentials: instances configured at runtime, organization-scoped
-provider keys, their health, and what a dispatch needs to reach a provider.
+provider keys, endpoints a workspace or a user owns, their health, and what a
+dispatch needs to reach a provider.
 
 `tenancy/org_provider_key_service.py` has three divider sections (organization
 keys, workspace overrides, model restrictions) and splits along them.
