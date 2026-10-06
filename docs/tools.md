@@ -328,13 +328,16 @@ A workspace policy can disable code execution or narrow the deployment limits:
 - `executor`, the one field that is a choice rather than a narrowing (see above)
 
 Manage it under
-`/api/v1/workspaces/{workspace_id}/code-execution-policy` or from Tools. A policy
+`/api/v1/workspaces/{workspace_id}/code-execution-policy`. The dashboard's Code
+execution page sets `enabled`; every other field is set through the API. A policy
 cannot enable a missing deployment backend or exceed the deployment limits.
 Workspace-selected images must come from
 `sandbox_allowed_session_images` or the deployment's own session image.
 
 The authenticating API key determines the workspace. With no policy, deployment
-defaults apply. In hybrid mode, the control plane resolves the policy instead.
+defaults apply. In hybrid mode, the control plane resolves the policy instead. A hosted
+control plane reads a workspace with no policy as off, and gives each workspace
+it creates an enabled one, so a new workspace starts with code execution on.
 
 ## Web retrieval
 

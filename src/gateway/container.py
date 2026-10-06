@@ -64,6 +64,7 @@ from gateway.ports.web_search_policy_port import WebSearchPolicyPort
 from gateway.repositories.tenancy import UserRepository
 from gateway.services.tenancy.membership_listener import MembershipListener
 from gateway.services.tenancy.organization_service import OrganizationService
+from gateway.services.tenancy.workspace_listener import WorkspaceListener
 
 T = TypeVar("T")
 
@@ -86,6 +87,7 @@ PortFactory = Callable[[AsyncSession | None], T]
 # ``get_unit_of_work`` may construct one.
 UnitOfWorkPortFactory = Callable[[AsyncSession | None, UnitOfWork | None], T]
 MembershipListenerBuilder = Callable[[UnitOfWork], MembershipListener]
+WorkspaceListenerBuilder = Callable[[UnitOfWork], WorkspaceListener]
 Register = Callable[["Container"], None]
 
 
@@ -254,7 +256,9 @@ def _growth_signal_adapter(session: AsyncSession | None) -> GrowthSignalPort:
 
 
 def _identity_provider_adapter_factory(
-    config: GatewayConfig | None, membership_listener: MembershipListenerBuilder | None
+    config: GatewayConfig | None,
+    membership_listener: MembershipListenerBuilder | None,
+    workspace_listener: WorkspaceListenerBuilder | None = None,
 ) -> UnitOfWorkPortFactory[IdentityProviderPort]:
     """Build the core ``IdentityProviderPort`` factory, bound to this app's ``open_signup`` setting.
 
@@ -270,7 +274,12 @@ def _identity_provider_adapter_factory(
             raise ContainerError(msg)
         return DeploymentIdentityProviderAdapter(
             UserRepository(session),
-            OrganizationService(session, membership_listener=membership_listener(uow), uow=uow),
+            OrganizationService(
+                session,
+                membership_listener=membership_listener(uow),
+                uow=uow,
+                workspace_listener=workspace_listener(uow) if workspace_listener is not None else None,
+            ),
             open_signup=bool(config and config.open_signup),
         )
 
@@ -458,6 +467,7 @@ def build_container(
     config: GatewayConfig | None = None,
     *,
     membership_listener: MembershipListenerBuilder | None = None,
+    workspace_listener: WorkspaceListenerBuilder | None = None,
 ) -> Container:
     """Build the composition-root container for this deployment.
 
@@ -467,7 +477,9 @@ def build_container(
 
     ``membership_listener`` builds the listener the OAuth sign-in adapter's
     organization service notifies. It is a parameter because its builder lives
-    in the API layer, which this module cannot import.
+    in the API layer, which this module cannot import. ``workspace_listener``
+    builds what sets up a workspace that adapter's open signup creates, for the
+    same reason.
 
     Raises:
         BootstrapError: If the selector is present but blank, or names a
@@ -497,7 +509,7 @@ def build_container(
     container.bind(TelemetryStoragePort, _telemetry_storage_adapter)
     # OAuth sign-in: the base applies this deployment's `open_signup` setting.
     container.bind_with_unit_of_work(
-        IdentityProviderPort, _identity_provider_adapter_factory(config, membership_listener)
+        IdentityProviderPort, _identity_provider_adapter_factory(config, membership_listener, workspace_listener)
     )
     # API key format: the base mints the open-source shape and checks every
     # presented key against its own rows. A hosted overlay binds a format that
