@@ -1,21 +1,8 @@
-"""Identity adapter enforcing the base build's roster policy on an OAuth sign-in.
-
-Satisfies :class:`gateway.ports.identity_provider_port.IdentityProviderPort` with
-the policy Otari's base build already applies to every other way in: an account
-exists here because an operator put it here. A social identity signs in as an
-account already on the roster and never creates one, so enabling Google or GitHub
-sign-in widens *how* a member authenticates, never *who* may.
-
-This is a real implementation and not a Null Object, per ``ARCHITECTURE.md``'s
-cardinal property. There is a live decision behind the port (link, refuse, and
-whether the provider's assertion is enough to lift the local verification gate),
-and it is the decision an overlay is most likely to want to replace: a hosted
-edition provisions on first sight, and an enterprise edition maps a directory
-connection onto an organization. Both bind here without editing this tree.
-"""
+"""Core adapter for ``IdentityProviderPort``."""
 
 from datetime import UTC, datetime
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.exceptions.identity_exceptions import (
@@ -26,18 +13,21 @@ from gateway.exceptions.identity_exceptions import (
 from gateway.models.tenancy import User
 from gateway.ports.identity_provider_port import IdentityProviderPort
 from gateway.repositories.tenancy import UserRepository
+from gateway.services.budgets import WorkspaceBudgetDefaultService
 from gateway.services.tenancy.email_address import validated_email
+from gateway.services.tenancy.organization_service import OrganizationService
 
 
-class RosterIdentityProviderAdapter(IdentityProviderPort):
-    """Resolves an OAuth identity onto an account an operator already added.
+class DeploymentIdentityProviderAdapter(IdentityProviderPort):
+    """Applies this deployment's ``open_signup`` setting to an OAuth sign-in.
 
     The adapter stages its writes on the request's session and does not commit them.
     The session is ``None`` where the deployment has no database, and ``resolve`` needs one.
     """
 
-    def __init__(self, session: AsyncSession | None) -> None:
+    def __init__(self, session: AsyncSession | None, *, open_signup: bool) -> None:
         self._session = session
+        self._open_signup = open_signup
 
     async def resolve(
         self,
@@ -47,27 +37,32 @@ class RosterIdentityProviderAdapter(IdentityProviderPort):
         full_name: str | None,
         email_verified: bool,
     ) -> User:
-        """Return the roster identity this OAuth identity signs in as.
+        """Return the account for this OAuth sign-in.
 
-        The address must be one the provider verified.
-        An unverified or missing address is refused whether or not it is on the roster.
+        The provider must have verified the email address.
+        If the provider sent no address, or did not verify it, the sign-in is refused and no account is created.
 
-        A successful call stages these changes on the identity and commits none of them:
+        If ``open_signup`` is enabled and there is no existing account for the address, a new account is created.
+        The new account has its own organization and workspace.
+        No verification email is sent, because the provider has already verified the address.
 
-        - It records ``provider`` if the identity names none.
-          An identity that already names a provider keeps it.
+        A successful call stages these changes on the account and commits none of them:
+
+        - It records ``provider`` if the account names none.
+          An account that already names a provider keeps it.
         - It marks an unverified address verified, which lets a deployment with no mail admit a member.
           Verifying the address also removes its password and its pending email verification token.
           The provider confirms who owns the address, not who set a password on it while it was unverified.
           A password on an address that is already verified is kept.
-        - It sets ``full_name`` if the identity has none.
+        - It sets ``full_name`` if the account has none.
 
-        NOTE: Concurrent sign-ins on one identity are serialized on PostgreSQL only.
+        NOTE: Concurrent sign-ins on one account are serialized on PostgreSQL only.
         On SQLite, the later of two concurrent sign-ins can overwrite the provider that the first recorded.
 
         Raises:
             OAuthEmailNotVerifiedError: If the provider returned no address, or one it did not verify.
-            OAuthIdentityUnknownError: If no active identity here holds that address.
+            OAuthIdentityUnknownError: If the account for the address is deactivated,
+                or if no account exists and ``open_signup`` is disabled.
 
         """
         assert self._session is not None, "resolving an identity needs a database session"
@@ -81,7 +76,9 @@ class RosterIdentityProviderAdapter(IdentityProviderPort):
 
         users = UserRepository(self._session)
         identity = await users.get_by_email(address)
-        # A deactivated identity is refused as unknown, so the answer does not confirm that the account exists.
+        if identity is None and self._open_signup:
+            identity = await self._register(address, full_name=full_name)
+        # A deactivated account is refused as unknown, so the response does not confirm that the account exists.
         if identity is None or not identity.is_active:
             raise OAuthIdentityUnknownError(provider)
 
@@ -102,5 +99,23 @@ class RosterIdentityProviderAdapter(IdentityProviderPort):
         self._session.add(identity)
         return identity
 
+    async def _register(self, address: str, *, full_name: str | None) -> User:
+        """Create an account for the address, or return the account a concurrent sign-in created first.
 
-__all__ = ["RosterIdentityProviderAdapter"]
+        NOTE: A lost race rolls back only to the savepoint, so the session's transaction stays usable.
+        """
+        assert self._session is not None
+        try:
+            async with self._session.begin_nested():
+                return await OrganizationService(
+                    self._session,
+                    membership_listener=WorkspaceBudgetDefaultService(self._session),
+                ).provision_signup_tenancy(email=address, full_name=full_name)
+        except IntegrityError:
+            identity = await UserRepository(self._session).get_by_email(address)
+            if identity is None:
+                raise
+            return identity
+
+
+__all__ = ["DeploymentIdentityProviderAdapter"]
