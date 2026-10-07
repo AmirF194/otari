@@ -9,8 +9,8 @@ marks the routing capability line provisional, and whether that port should exis
 at all is an open maintainer decision, so this does not presume one.
 
 A policy's ``select`` may hand the ordering to a *router backend*
-(``backends.py``), which is where the learned kNN router (``knn.py``) and the
-weighted load balancer (``weighted.py``) plug in. The split is deliberate: the
+(``backends.py``), which is where the learned kNN router (``knn.py``), the
+weighted load balancer (``weighted.py``) and the priority order plug in. The split is deliberate: the
 compiler stays pure and synchronous, and a backend's asynchronous work
 (embedding, reading stored examples) happens in the request pipeline, which
 passes the resulting order in as a value.
@@ -19,10 +19,13 @@ passes the resulting order in as a value.
 from gateway.services.routing.backends import (
     KNN_BACKEND,
     NOOP_BACKEND,
+    PRIORITY_BACKEND,
     WEIGHTED_BACKEND,
     RouterBackend,
     RoutingContext,
     RoutingDecision,
+    backend_is_priority,
+    backend_is_weighted,
     backend_pool_is_teachable,
     backend_requires_pricing,
     clear_router_backend_cache,
@@ -38,26 +41,36 @@ from gateway.services.routing.compiler import (
     needs_budget_state,
     selection_consults_router,
 )
+from gateway.services.routing.decide import RoutingSignal, decide_ordering, explain_router_ordering
+from gateway.services.routing.knn import KnnRoutingMemory, unpriced_router_candidates
 from gateway.types.budget_state import BudgetState
 
 __all__ = [
     "KNN_BACKEND",
     "NOOP_BACKEND",
+    "PRIORITY_BACKEND",
     "WEIGHTED_BACKEND",
     "BudgetState",
     "CompiledPlan",
     "DroppedCandidate",
+    "KnnRoutingMemory",
     "NoEligibleCandidatesError",
     "RouterBackend",
     "RouterOrdering",
     "RoutingContext",
     "RoutingDecision",
+    "RoutingSignal",
+    "backend_is_priority",
+    "backend_is_weighted",
     "backend_pool_is_teachable",
     "backend_requires_pricing",
     "clear_router_backend_cache",
     "compile_policy",
+    "decide_ordering",
+    "explain_router_ordering",
     "get_router_backend",
     "known_backends",
     "needs_budget_state",
     "selection_consults_router",
+    "unpriced_router_candidates",
 ]

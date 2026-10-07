@@ -85,7 +85,9 @@ Organizations, workspaces, members, invitations, email-domain claims, first-boot
 provisioning, the setup guide, and the gateway's billing users.
 
 It defines `MembershipListener`, the interface budgets implements to react to a
-membership change without organizations importing budgets. It also owns
+membership change without organizations importing budgets. The listener writes
+through the caller's Unit of Work, so a service that changes membership is built
+with one and makes the change inside its block. It also owns
 `models/users.py`, `repositories/users_repository.py` and
 `services/workspace_scope.py`.
 
@@ -113,7 +115,8 @@ It also owns `models/pricing_schemas.py`.
 ### providers
 
 Provider credentials: instances configured at runtime, organization-scoped
-provider keys, their health, and what a dispatch needs to reach a provider.
+provider keys, endpoints a workspace or a user owns, their health, and what a
+dispatch needs to reach a provider.
 
 `tenancy/org_provider_key_service.py` has three divider sections (organization
 keys, workspace overrides, model restrictions) and splits along them.
@@ -135,8 +138,13 @@ Routing policies, their compiled plans and the router backends.
 Uploaded files: the Files API, the `file_objects` table, and a file's
 lifecycle, including its expiry and the sweep that gives its storage back.
 The bytes sit in a pluggable blob backend. The row holds the metadata and
-the reference to them. The domain owns `ports/file_storage_port.py` and
-`adapters/file_storage_adapter.py`.
+the reference to them. The domain owns `ports/file_storage_port.py`,
+`ports/provider_file_port.py` and their adapters.
+
+`file_provider_copies` is the second table. A provider-native feature reads an
+attached file only under an ID that provider issued, so a copy is put there with
+an expiry and the row says which account holds it. Otari's store stays the
+source of truth and the copy is a cache.
 
 The model never calls files, so it is not a tool. Inference normalizes an
 uploaded file into a request. Tools hands one to a sandbox and returns one
@@ -151,7 +159,7 @@ transactions, with output compensation and cleanup storage calls outside them.
 The tools the gateway runs itself: the tool loop, MCP, web search, web
 retrieval and code execution.
 
-It owns the code execution, MCP server and web search policy ports in `ports/`,
+It owns the code execution, code execution policy, MCP server and web search policy ports in `ports/`,
 and their adapters in `adapters/`.
 
 `mcp_server_port.py` names where a workspace's MCP servers come from. One
@@ -161,9 +169,17 @@ resolved server is connected to directly; neither implementation proxies MCP
 traffic.
 
 `web_search_policy_port.py` names where a workspace's web search policy comes
-from, in the same two ways. The policy says who may search and how far. A
+from, in the same two ways. The policy says who may search and how far, and
+carries the workspace's own search key where its organization brought one. A
 tools service applies it to a request with one rule on every plane, and
 neither implementation carries a search.
+
+It also owns an organization's web search keys and each workspace's choice
+among them (`org_web_search_keys`, `workspace_web_search_key_overrides`).
+
+`code_execution_policy_port.py` names where a workspace's code execution
+policy comes from, in the same two ways. The policy says who may run code and
+within which limits, and neither implementation runs code.
 
 **The tool test.** A tool is something the model calls during a request. The
 domain holds the registry, the loop and each tool's settings. A capability the
@@ -184,7 +200,8 @@ evidence. The evaluator is pure policy code with no database, so the domain has
 a service package and no repository.
 
 Its evaluator is `otari_agent.domain`, in the `otari-agent` workspace member
-(`cli/`), so `otari hook` can run without the gateway.
+(`cli/`), so `otari hook` can run without the gateway, which is what it does:
+the hook evaluates in process and never calls this route.
 
 ### usage-and-telemetry
 
@@ -213,6 +230,17 @@ grow into a route for the data plane's own traffic.
 plane, and the value that says which of them a process serves. `surface.py`
 says which deployments publish a dashboard page and `feature.py` shapes an
 optional feature, so the three together are how a build describes itself.
+
+### rate-limits
+
+The `rate_limits` rules an operator adds, changes and removes from the
+dashboard, stored beside the ones config.yml declares. The service keeps the
+stored rules in `config.rate_limits`, and the request path reads that list on
+every request, so this domain holds no enforcement. Counting stays in
+`gateway/rate_limit.py`, over the rate-limit store port. A config.yml rule is
+listed and never edited here.
+
+Built in the target shape from the start.
 
 ### alerts
 

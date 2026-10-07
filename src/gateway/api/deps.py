@@ -2,6 +2,7 @@ import secrets
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -21,6 +22,7 @@ from gateway.models.api_keys import APIKey
 from gateway.models.tenancy import User as TenancyUser
 from gateway.ports.api_key_format_port import ApiKeyFormatPort, Malformed, Misdirected
 from gateway.ports.billing_port import BillingPort
+from gateway.ports.code_execution_policy_port import CodeExecutionPolicyPort
 from gateway.ports.code_execution_port import CodeExecutionPort
 from gateway.ports.entitlement_port import EntitlementPort
 from gateway.ports.file_storage_port import FileStoragePort
@@ -28,36 +30,50 @@ from gateway.ports.growth_signal_port import GrowthSignalPort
 from gateway.ports.identity_provider_port import IdentityProviderPort
 from gateway.ports.mcp_server_port import McpServerPort
 from gateway.ports.model_provider_port import ModelProviderPort
+from gateway.ports.provider_file_port import ProviderFilePort
 from gateway.ports.telemetry_storage_port import TelemetryStoragePort
 from gateway.ports.web_search_policy_port import WebSearchPolicyPort
 from gateway.repositories.api_keys import ApiKeyRepository
 from gateway.repositories.budgets import BudgetRepositories
+from gateway.repositories.code_execution import WorkspaceCodeExecutionPolicyRepository
 from gateway.repositories.files import FileRepositories
 from gateway.repositories.inference import InferenceRepositories
 from gateway.repositories.overview.overview_repository import OverviewRepository
-from gateway.repositories.providers import OrgProviderKeyModelRepository
-from gateway.repositories.tenancy import OrganizationGuardrailDefinitionRepository, OrgProviderKeyRepository
+from gateway.repositories.providers import OrgProviderKeyModelRepository, ProviderEndpointRepository
+from gateway.repositories.rate_limits import RateLimitRuleRepository
+from gateway.repositories.tenancy import (
+    OrganizationGuardrailDefinitionRepository,
+    OrgProviderKeyRepository,
+    WorkspaceRepository,
+)
+from gateway.repositories.tools import OrgWebSearchKeyRepository, WorkspaceWebSearchKeyOverrideRepository
+from gateway.repositories.users_repository import get_active_user
 from gateway.services.api_keys import ApiKeyService
-from gateway.services.budgets import BudgetService, WorkspaceBudgetDefaultService
-from gateway.services.code_execution import SandboxContainerRegistry
+from gateway.services.budgets import BudgetMembershipListener, BudgetService
+from gateway.services.code_execution import CodeExecutionWorkspaceDefaults, SandboxContainerRegistry
 from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME, resolve_dashboard_session
 from gateway.services.feedback import FeedbackService
-from gateway.services.files import FileService, SandboxFileBridge, StagedFile
+from gateway.services.files import FileBackends, FileService, SandboxFileBridge, StagedFile
 from gateway.services.inference import IdempotencyService
 from gateway.services.log_writer import LogWriter
 from gateway.services.master_key_service import hash_master_key, is_generated_master_key, load_master_key_hash
 from gateway.services.organization_pricing_service import OrganizationPricingService
-from gateway.services.overview.overview_service import OverviewService
-from gateway.services.providers import OrgProviderModelService
+from gateway.services.overview import OverviewService
+from gateway.services.providers import OrgProviderModelService, ProviderEndpointService, refresh_provider_endpoint_cache
+from gateway.services.rate_limits import RateLimitService
 from gateway.services.routing import clear_router_backend_cache
 from gateway.services.tenancy import OrganizationService, organization_guardrail_runner
+from gateway.services.tenancy.authorization import WorkspaceAccess
 from gateway.services.tenancy.deployment_user_service import DeploymentUserService
+from gateway.services.tenancy.membership_listener import MembershipListener
 from gateway.services.tenancy.org_provider_key_service import OrgProviderKeyService, refresh_org_provider_cache
 from gateway.services.tenancy.organization_guardrail_definition_service import (
     OrganizationGuardrailDefinitionService,
 )
 from gateway.services.tenancy.provisioning_service import ensure_bootstrap_identity
+from gateway.services.tenancy.workspace_listener import WorkspaceListener
 from gateway.services.tenancy.workspace_service import WorkspaceService
+from gateway.services.tools import WebSearchKeyService, WorkspaceSearchKeys
 from gateway.services.workspace_scope import default_workspace_id
 
 # Legacy module-level fallback. Config now lives on ``app.state.config`` (set in
@@ -284,6 +300,7 @@ async def _bump_last_used_at(api_key_id: str, now: datetime) -> None:
         # Widened past SQLAlchemyError for the same reason as the arms above:
         # this one promises never to fail the request, and a connect timeout
         # raises a bare TimeoutError.
+        # codeql[py/clear-text-logging-sensitive-data]
         logger.warning("Failed to update last_used_at for API key %s", api_key_id, exc_info=True)
 
 
@@ -521,9 +538,7 @@ async def require_deployment_operator(
     of its own, so admitting a non-operator is spelled at a router instead of
     hidden in one route's decorator.
     """
-    if session_identity is not None and not await DeploymentUserService(db).has_administration_access(
-        session_identity
-    ):
+    if session_identity is not None and not await DeploymentUserService(db).has_administration_access(session_identity):
         record_auth_failure("not_deployment_operator")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -663,13 +678,26 @@ async def get_db_if_needed(
             yield db
 
 
-def build_file_service(uow: UnitOfWork, file_store: FileStoragePort, config: GatewayConfig) -> FileService:
+def build_file_service(uow: UnitOfWork, backends: FileBackends, config: GatewayConfig) -> FileService:
     """Build Files operations for a scoped output request or cleanup job."""
 
     async def reject_unscoped_upload() -> uuid.UUID:
         raise RuntimeError("Unscoped uploads are not supported in this context; specify a workspace.")
 
-    return FileService(uow, FileRepositories.on(uow), file_store, config, reject_unscoped_upload)
+    return FileService(uow, FileRepositories.on(uow), backends, config, reject_unscoped_upload)
+
+
+def _file_backends(request: Request) -> FileBackends | None:
+    """The backends this build bound for files, or ``None`` where it has none.
+
+    Hybrid mode binds none, and a standalone deployment with files off starts
+    without a store it could not build.
+    """
+    storage: FileStoragePort | None = getattr(request.app.state, "file_store", None)
+    provider_files: ProviderFilePort | None = getattr(request.app.state, "provider_files", None)
+    if storage is None or provider_files is None:
+        return None
+    return FileBackends(storage=storage, provider_files=provider_files)
 
 
 def build_idempotency_service(uow: UnitOfWork, config: GatewayConfig) -> IdempotencyService:
@@ -693,14 +721,14 @@ def build_sandbox_file_bridge(
     Produced files are announced under ``public_base_url`` where the deployment knows its address,
     and otherwise under the one the request arrived on.
     """
-    file_store = getattr(raw_request.app.state, "file_store", None)
-    if uow is None or not config.files_enabled or file_store is None or user_id is None or workspace_id is None:
+    backends = _file_backends(raw_request)
+    if uow is None or not config.files_enabled or backends is None or user_id is None or workspace_id is None:
         return None
     base = (config.public_base_url or str(raw_request.base_url)).rstrip("/")
     return SandboxFileBridge(
-        file_store=file_store,
+        backends=backends,
         config=config,
-        files=build_file_service(uow, file_store, config),
+        files=build_file_service(uow, backends, config),
         user_id=user_id,
         workspace_id=workspace_id,
         inputs=inputs,
@@ -766,10 +794,42 @@ def get_unit_of_work_if_needed(
     return None if db is None else get_unit_of_work(db)
 
 
+UnitOfWorkDep = Annotated[UnitOfWork, Depends(get_unit_of_work)]
+
+
+def get_membership_listener(uow: UnitOfWorkDep) -> MembershipListener:
+    """Return the listener that keeps members' budget ceilings in step with their memberships.
+
+    It writes through the request's Unit of Work, so a service that changes membership must be built on the same one.
+    """
+    return BudgetMembershipListener(BudgetRepositories.on(uow))
+
+
+MembershipListenerDep = Annotated[MembershipListener, Depends(get_membership_listener)]
+
+
+def get_workspace_listener(
+    uow: UnitOfWorkDep, config: Annotated[GatewayConfig, Depends(get_config)]
+) -> WorkspaceListener:
+    """Return what sets up a workspace this request creates: code execution on, where no policy reads as off.
+
+    It writes through the request's Unit of Work, so a service that creates workspaces must be built on the same one.
+    """
+    return CodeExecutionWorkspaceDefaults(
+        WorkspaceCodeExecutionPolicyRepository(uow), on_by_default=config.is_hosted_mode
+    )
+
+
+WorkspaceListenerDep = Annotated[WorkspaceListener, Depends(get_workspace_listener)]
+
+
 async def get_current_identity(
     db: Annotated[AsyncSession, Depends(get_db)],
     session_identity: Annotated[TenancyUser | None, Depends(get_session_identity)],
     _master_key: Annotated[str | None, Depends(verify_master_key)],
+    uow: UnitOfWorkDep,
+    membership_listener: MembershipListenerDep,
+    workspace_listener: WorkspaceListenerDep,
 ) -> TenancyUser:
     """Resolve the tenancy identity acting on this request.
 
@@ -792,7 +852,12 @@ async def get_current_identity(
     """
     if session_identity is not None:
         return session_identity
-    return await ensure_bootstrap_identity(db, membership_listener=WorkspaceBudgetDefaultService(db))
+    return await ensure_bootstrap_identity(
+        db,
+        uow=uow,
+        membership_listener=membership_listener,
+        workspace_listener=workspace_listener,
+    )
 
 
 CurrentIdentity = Annotated[TenancyUser, Depends(get_current_identity)]
@@ -896,10 +961,11 @@ def get_growth_signal_port(
 # nobody does.
 def get_identity_provider_port(
     db: Annotated[AsyncSession, Depends(get_db)],
+    uow: UnitOfWorkDep,
     container: ContainerDep,
 ) -> IdentityProviderPort:
-    """Resolve the identity adapter this build bound at startup."""
-    return container.resolve(IdentityProviderPort, db)
+    """Resolve the identity adapter this build bound at startup, on the request's session and Unit of Work."""
+    return container.resolve(IdentityProviderPort, db, uow=uow)
 
 
 def get_mcp_server_port(db: PortSessionDep, container: ContainerDep) -> McpServerPort:
@@ -930,12 +996,21 @@ def get_telemetry_storage_port(
     return container.resolve(TelemetryStoragePort, db)
 
 
+def get_code_execution_policy_port(db: PortSessionDep, container: ContainerDep) -> CodeExecutionPolicyPort:
+    """Resolve the code execution policy adapter this build bound at startup."""
+    return container.resolve(CodeExecutionPolicyPort, db)
+
+
 def get_web_search_policy_port(db: PortSessionDep, container: ContainerDep) -> WebSearchPolicyPort:
     """Resolve the web search policy adapter this build bound at startup."""
     return container.resolve(WebSearchPolicyPort, db)
 
 
-def get_overview_service(db: Annotated[AsyncSession, Depends(get_db)]) -> OverviewService:
+def get_overview_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    uow: UnitOfWorkDep,
+    membership_listener: MembershipListenerDep,
+) -> OverviewService:
     """Build the dashboard overview's summary service on the request's session.
 
     Assembled here rather than in the route, because a route does not name a
@@ -947,7 +1022,7 @@ def get_overview_service(db: Annotated[AsyncSession, Depends(get_db)]) -> Overvi
         DeploymentUserService(db),
         # The listener is for writes; this service only reads, and the same
         # pairing is what `routes/workspaces.py` builds.
-        WorkspaceService(db, membership_listener=WorkspaceBudgetDefaultService(db)),
+        WorkspaceService(db, uow=uow, membership_listener=membership_listener),
     )
 
 
@@ -970,11 +1045,13 @@ def get_budget_service(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> BudgetService:
     """Build the request's budget service on the request's Unit of Work."""
+    organizations = OrganizationService(db, membership_listener=None)
     return BudgetService(
         uow,
         BudgetRepositories.on(uow),
-        OrganizationService(db, membership_listener=None),
+        organizations,
         ApiKeyService(ApiKeyRepository(uow)),
+        WorkspaceAccess(db, organizations),
     )
 
 
@@ -1017,6 +1094,7 @@ OrganizationGuardrailDefinitionServiceDep = Annotated[
 
 ApiKeyFormatPortDep = Annotated[ApiKeyFormatPort, Depends(get_api_key_format_port)]
 BillingPortDep = Annotated[BillingPort, Depends(get_billing_port)]
+CodeExecutionPolicyPortDep = Annotated[CodeExecutionPolicyPort, Depends(get_code_execution_policy_port)]
 EntitlementPortDep = Annotated[EntitlementPort, Depends(get_entitlement_port)]
 GrowthSignalPortDep = Annotated[GrowthSignalPort, Depends(get_growth_signal_port)]
 IdentityProviderPortDep = Annotated[IdentityProviderPort, Depends(get_identity_provider_port)]
@@ -1050,8 +1128,107 @@ def get_org_provider_model_service(
 
 
 OrgProviderModelServiceDep = Annotated[OrgProviderModelService, Depends(get_org_provider_model_service)]
+
+
+def get_provider_endpoint_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    uow: Annotated[UnitOfWork, Depends(get_unit_of_work)],
+    config: Annotated[GatewayConfig, Depends(get_config)],
+) -> ProviderEndpointService:
+    """Build the owned provider endpoint service on the request's session and unit of work."""
+
+    async def resolve_workspace(workspace_id: uuid.UUID | None) -> uuid.UUID | None:
+        if workspace_id is None:
+            return await default_workspace_id(db)
+        return workspace_id if await WorkspaceRepository(db).get(workspace_id) is not None else None
+
+    async def user_is_active(user_id: str) -> bool:
+        return await get_active_user(db, user_id) is not None
+
+    return ProviderEndpointService(
+        uow,
+        config=config,
+        endpoints=ProviderEndpointRepository(uow),
+        resolve_workspace=resolve_workspace,
+        user_is_active=user_is_active,
+        refresh_cache=lambda: refresh_provider_endpoint_cache(uow),
+    )
+
+
+ProviderEndpointServiceDep = Annotated[ProviderEndpointService, Depends(get_provider_endpoint_service)]
+
+
+def get_web_search_key_service(
+    uow: Annotated[UnitOfWork, Depends(get_unit_of_work)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> WebSearchKeyService:
+    """Build the organization web search key service on the request's Unit of Work."""
+    organizations = OrganizationService(db, membership_listener=None)
+    return WebSearchKeyService(
+        uow,
+        keys=OrgWebSearchKeyRepository(uow),
+        overrides=WorkspaceWebSearchKeyOverrideRepository(uow),
+        organizations=organizations,
+        workspaces=WorkspaceAccess(db, organizations),
+        lock_workspace=WorkspaceRepository(db).lock,
+    )
+
+
+WebSearchKeyServiceDep = Annotated[WebSearchKeyService, Depends(get_web_search_key_service)]
+
+
+def get_workspace_search_keys(db: Annotated[AsyncSession, Depends(get_db)]) -> WorkspaceSearchKeys:
+    """Build the resolver of the key a workspace searches with, on the request's session.
+
+    Also the builder the container's stored web search policy takes, which is why it takes a bare session.
+    """
+    return WorkspaceSearchKeys(
+        workspaces=WorkspaceRepository(db), overrides=WorkspaceWebSearchKeyOverrideRepository(db)
+    )
+
+
+WorkspaceSearchKeysDep = Annotated[WorkspaceSearchKeys, Depends(get_workspace_search_keys)]
+
+
+def get_rate_limit_service(
+    uow: Annotated[UnitOfWork, Depends(get_unit_of_work)],
+    config: Annotated[GatewayConfig, Depends(get_config)],
+) -> RateLimitService:
+    """Build the rate-limit rules service on the request's unit of work."""
+    return RateLimitService(uow, RateLimitRuleRepository(uow), config)
+
+
+RateLimitServiceDep = Annotated[RateLimitService, Depends(get_rate_limit_service)]
 TelemetryStoragePortDep = Annotated[TelemetryStoragePort, Depends(get_telemetry_storage_port)]
 WebSearchPolicyPortDep = Annotated[WebSearchPolicyPort, Depends(get_web_search_policy_port)]
+
+
+@dataclass(frozen=True, kw_only=True)
+class ToolPorts:
+    """The ports a request's tools reach."""
+
+    code_execution: CodeExecutionPort | None
+    code_execution_policy: CodeExecutionPolicyPort
+    mcp_server: McpServerPort
+    web_search_policy: WebSearchPolicyPort
+
+
+def get_tool_ports(
+    code_execution: CodeExecutionPortDep,
+    code_execution_policy: CodeExecutionPolicyPortDep,
+    mcp_server: McpServerPortDep,
+    web_search_policy: WebSearchPolicyPortDep,
+) -> ToolPorts:
+    """Resolve the ports a request's tools reach."""
+    return ToolPorts(
+        code_execution=code_execution,
+        code_execution_policy=code_execution_policy,
+        mcp_server=mcp_server,
+        web_search_policy=web_search_policy,
+    )
+
+
+ToolPortsDep = Annotated[ToolPorts, Depends(get_tool_ports)]
 
 
 def require_capability(capability: str) -> Callable[[EntitlementPort], Awaitable[None]]:
@@ -1086,33 +1263,26 @@ def get_file_store(request: Request) -> FileStoragePort:
 
 
 def get_file_service(
+    request: Request,
     uow: Annotated[UnitOfWork, Depends(get_unit_of_work)],
     db: Annotated[AsyncSession, Depends(get_db)],
     config: Annotated[GatewayConfig, Depends(get_config)],
-    file_store: Annotated[FileStoragePort, Depends(get_file_store)],
 ) -> FileService:
     """Build the request's files service on the request's Unit of Work."""
-    return FileService(uow, FileRepositories.on(uow), file_store, config, lambda: default_workspace_id(db))
+    backends = _file_backends(request)
+    if backends is None:
+        raise RuntimeError("Files are served only where this build binds a file store")
+    return FileService(uow, FileRepositories.on(uow), backends, config, lambda: default_workspace_id(db))
 
 
 FileServiceDep = Annotated[FileService, Depends(get_file_service)]
 
 
-def get_file_store_if_needed(request: Request) -> FileStoragePort | None:
-    """Return the configured blob store in standalone mode, otherwise ``None``.
-
-    The counterpart of ``get_file_store``, for a route that serves both modes. A
-    hybrid gateway binds none, so the attribute is absent rather than set to None.
-    """
-    store: FileStoragePort | None = getattr(request.app.state, "file_store", None)
-    return store
-
-
 def get_file_service_if_needed(
+    request: Request,
     config: Annotated[GatewayConfig, Depends(get_config)],
     db: Annotated[AsyncSession | None, Depends(get_db_if_needed)],
     uow: Annotated[UnitOfWork | None, Depends(get_unit_of_work_if_needed)],
-    file_store: Annotated[FileStoragePort | None, Depends(get_file_store_if_needed)],
 ) -> FileService | None:
     """Return the request's files service in standalone mode, otherwise ``None``.
 
@@ -1123,9 +1293,10 @@ def get_file_service_if_needed(
     NOTE: a route must take its session from ``get_db_if_needed`` as well, for the
     reason ``get_unit_of_work_if_needed`` gives.
     """
-    if uow is None or db is None or file_store is None:
+    backends = _file_backends(request)
+    if uow is None or db is None or backends is None:
         return None
-    return FileService(uow, FileRepositories.on(uow), file_store, config, lambda: default_workspace_id(db))
+    return FileService(uow, FileRepositories.on(uow), backends, config, lambda: default_workspace_id(db))
 
 
 OptionalFileServiceDep = Annotated[FileService | None, Depends(get_file_service_if_needed)]
@@ -1165,6 +1336,7 @@ async def get_feedback_service(
 
 __all__ = [
     "BillingPortDep",
+    "CodeExecutionPolicyPortDep",
     "ContainerDep",
     "CallerOrganization",
     "CurrentIdentity",
@@ -1177,7 +1349,10 @@ __all__ = [
     "McpServerPortDep",
     "ModelProviderPortDep",
     "OrgProviderModelServiceDep",
+    "RateLimitServiceDep",
     "TelemetryStoragePortDep",
+    "ToolPorts",
+    "ToolPortsDep",
     "WebSearchPolicyPortDep",
     "get_config",
     "get_container",

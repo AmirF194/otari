@@ -53,6 +53,7 @@ import {
 } from "@/shared/api/budgets"
 import {
   useBulkInviteOrganizationMembers,
+  useDeploymentOperator,
   useInviteOrganizationMember,
   useOrganizationContext,
   useOrganizationMembersPage,
@@ -76,8 +77,7 @@ import { useDeployment } from "@/shared/hooks/useDeployment"
 import {
   asMembershipRole,
   canManage,
-  isDeploymentOperator,
-  MEMBERSHIP_ROLES,
+  MEMBERSHIP_ROLE_OPTIONS,
   memberLabel,
   memberRowKey,
   membershipChangeBlockedReason,
@@ -130,11 +130,6 @@ interface WorkspacePlacement {
 // gated at that cell instead; the entry stays so the two places that withhold
 // the same fact are findable from one another.
 const DEPLOYMENT_WIDE_COLUMNS = new Set(["access", "spend"])
-
-const ROLE_OPTIONS = MEMBERSHIP_ROLES.map((role) => ({
-  value: role,
-  label: membershipLabel(role),
-}))
 
 /**
  * The frozen dot-and-word: a square mark, an uppercase word in mono, and ink
@@ -408,7 +403,7 @@ function InviteMemberForm({
           label="Role"
           value={role}
           onChange={(value) => setRole(asMembershipRole(value) ?? "member")}
-          options={ROLE_OPTIONS}
+          options={MEMBERSHIP_ROLE_OPTIONS}
           shouldReserveMessage={false}
         />
       </div>
@@ -753,7 +748,7 @@ function MemberEditor({
                         onChange={(next) =>
                           setRow(workspace.id, { role: next })
                         }
-                        options={ROLE_OPTIONS}
+                        options={MEMBERSHIP_ROLE_OPTIONS}
                         disabled={!row.member}
                       />
                     </td>
@@ -812,7 +807,7 @@ export function OrganizationMembersPage() {
   // (otari#838). What those reads feed is withheld with them rather than left
   // rendering an em dash, which on this table cannot be told apart from "this
   // member has no gateway identity yet".
-  const isOperator = isDeploymentOperator(context.data)
+  const { isOperator } = useDeploymentOperator()
   const updateUser = useUpdateUser()
   // The roster row carries where its member is and what they may spend there,
   // and the operator-only spend figures with it (otari#1381). The page used to
@@ -973,7 +968,7 @@ export function OrganizationMembersPage() {
                 }
                 value={member.role}
                 disabled={Boolean(blocked) || update.isPending}
-                options={ROLE_OPTIONS}
+                options={MEMBERSHIP_ROLE_OPTIONS}
                 onChange={(value) => {
                   const role = asMembershipRole(value)
                   if (member.organization_member_id && role) {

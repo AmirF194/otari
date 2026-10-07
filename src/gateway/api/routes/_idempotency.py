@@ -5,8 +5,9 @@ is reserved. A retry with the same key and body is answered with the stored
 response (and its original request ID and cost) without calling the provider or
 billing again, or is answered 409 while the request holding the key still runs.
 Streaming requests and hybrid mode ignore the header: a stream the client
-dropped is already refunded, and a hybrid gateway has no database to hold the
-key in. So does a deployment without ``OTARI_SECRET_KEY``, since the stored
+dropped left no complete response to replay (it is billed only for the tokens
+the provider reported), and a hybrid gateway has no database to hold the key
+in. So does a deployment without ``OTARI_SECRET_KEY``, since the stored
 response is encrypted with it.
 """
 
@@ -22,9 +23,9 @@ from fastapi.encoders import jsonable_encoder
 
 from gateway.api.deps import build_idempotency_service, get_config, get_unit_of_work_if_needed
 from gateway.api.routes._helpers import GUARDRAILS_RESULT_HEADER
-from gateway.api.routes._tools import CODE_EXECUTION_HEADER, WEB_SEARCH_HEADER
 from gateway.core.config import (
     CONVERSATION_HEADER,
+    END_USER_BUDGET_HEADER,
     REQUEST_ID_HEADER,
     ROUTER_HEADER,
     ROUTER_TASK_HEADER,
@@ -41,12 +42,19 @@ from gateway.services.inference import (
     Replay,
     keep_claim_alive,
 )
+from gateway.services.tools import CODE_EXECUTION_HEADER, WEB_SEARCH_HEADER
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 IDEMPOTENT_REPLAYED_HEADER = "Otari-Idempotent-Replayed"
 # The response headers a replay repeats: the ones that describe this request
 # rather than the moment it was answered, which rate-limit headers do.
-_REPLAYED_HEADERS = (REQUEST_ID_HEADER, "Otari-Container-Id", "Otari-Container-Expires-At", GUARDRAILS_RESULT_HEADER)
+_REPLAYED_HEADERS = (
+    REQUEST_ID_HEADER,
+    "Otari-Container-Id",
+    "Otari-Container-Expires-At",
+    GUARDRAILS_RESULT_HEADER,
+    END_USER_BUDGET_HEADER,
+)
 # The request headers that change what a request does, so they count toward
 # whether a retry is the same request.
 _REQUEST_SHAPING_HEADERS = (
@@ -56,6 +64,7 @@ _REQUEST_SHAPING_HEADERS = (
     "anthropic-beta",
     ROUTER_TASK_HEADER,
     CONVERSATION_HEADER,
+    END_USER_BUDGET_HEADER,
 )
 
 INVALID_IDEMPOTENCY_KEY_DETAIL = (

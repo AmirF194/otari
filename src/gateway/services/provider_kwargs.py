@@ -22,6 +22,12 @@ organization-scoped keys, by construction: the two addressing schemes occupy
 disjoint selector shapes rather than one layering over the other. See
 ``services/tenancy/org_provider_key_service.py`` for the overlay this reads.
 
+A third source sits ahead of both for the completion routes alone: an
+endpoint the caller's workspace or the caller owns, reached as
+``<name>:<model>`` (``services/providers``). It is consulted only when a caller
+asks for it with ``owned_endpoints=True``, because what reaches one must skip
+budgets and re-check its address before dispatch, and only those routes do.
+
 ``workspace_id`` is per-request, not per-deployment: which organization's keys
 a master-key request's bare selector can reach is the default workspace's
 organization, not every organization the gateway holds. See
@@ -29,21 +35,36 @@ organization, not every organization the gateway holds. See
 one workspace at all.
 """
 
+import hashlib
+import hmac
+import json
 import os
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from any_llm import AnyLLM, LLMProvider
 from any_llm.exceptions import AnyLLMError
 
 from gateway.auth.vertex_auth import setup_vertex_environment
-from gateway.core.config import KEYLESS_SELF_HOSTED_PROVIDERS, GatewayConfig, provider_credential_env_names
+from gateway.core.config import (
+    KEYLESS_SELF_HOSTED_PROVIDERS,
+    PROVIDER_TYPE_ALIASES,
+    RESERVED_PROVIDER_INSTANCE_NAMES,
+    GatewayConfig,
+    provider_credential_env_names,
+)
+from gateway.core.provider_params import FORBIDDEN_ENDPOINT_DEFAULTS
 from gateway.log_config import logger
 from gateway.services.alias_service import resolve_effective_alias
 from gateway.services.catalog_selectors import resolve_catalog_selector
 from gateway.services.policy_store import resolve_effective_policy
 from gateway.services.tenancy.org_provider_key_service import cached_org_provider_kwargs
+from gateway.types.provider_account import ProviderAccount, ResolvedCredential
+
+if TYPE_CHECKING:
+    from gateway.services.providers import OwnedEndpoint
 
 # Keys that describe an instance to otari but are not credentials any-llm
 # understands, so they must be stripped before the provider call.
@@ -67,6 +88,12 @@ _KEYLESS_PLACEHOLDER_API_KEY = "otari-no-key-required"
 # The self-hosted ones are ``KEYLESS_SELF_HOSTED_PROVIDERS``; this set is drift-guarded
 # alongside it in ``tests/unit/test_provider_instances.py``.
 #
+# Selector prefixes that name a provider whatever the deployment configures, so
+# an owned endpoint never resolves under one.
+_PROVIDER_NAMES: frozenset[str] = frozenset(
+    {provider.value for provider in LLMProvider} | set(PROVIDER_TYPE_ALIASES) | RESERVED_PROVIDER_INSTANCE_NAMES
+)
+
 # Providers authenticating from cloud SDK credentials this gateway cannot see:
 # an EC2 instance profile, an SSO session, or an ambient boto3 chain. They are
 # the same category as Vertex AI's application default credentials, which
@@ -138,8 +165,10 @@ def _warn_undeclared_env_provider(config: GatewayConfig, provider: LLMProvider) 
         "not listed meanwhile. Declare it in config.yml (providers: {%s: {api_key: ${%s}}}) or on the "
         "dashboard's Providers page.",
         provider.value,
+        # codeql[py/clear-text-logging-sensitive-data]
         env_name,
         provider.value,
+        # codeql[py/clear-text-logging-sensitive-data]
         env_name,
     )
 
@@ -254,11 +283,77 @@ def get_provider_kwargs(
     else:
         _warn_undeclared_env_provider(config, provider)
 
+    # boto3 reads AWS_DEFAULT_REGION, while some AWS runtimes expose only AWS_REGION.
+    if provider == LLMProvider.BEDROCK:
+        region = (os.getenv("AWS_REGION") or "").strip()
+        default_region = (os.getenv("AWS_DEFAULT_REGION") or "").strip()
+        client_args = kwargs.get("client_args")
+        if region and not default_region:
+            if client_args is None:
+                kwargs["client_args"] = {"region_name": region}
+            elif isinstance(client_args, dict) and "region_name" not in client_args:
+                kwargs["client_args"] = {**client_args, "region_name": region}
+
     placeholder = keyless_placeholder_api_key(provider, kwargs.get("api_base"), kwargs.get("api_key"))
     if placeholder is not None:
         kwargs["api_key"] = placeholder
 
     return kwargs
+
+
+def effective_credential(provider: LLMProvider, kwargs: Mapping[str, Any]) -> ResolvedCredential:
+    """The credential a call made with ``kwargs`` authenticates with.
+
+    That is the key the kwargs carry, or else the provider SDK's own environment
+    variable, which a call carrying no key authenticates with.
+
+    Raises:
+        LookupError: neither holds a key.
+    """
+    api_key = kwargs.get("api_key")
+    if not api_key:
+        api_key = next(
+            (value for name in provider_credential_env_names(provider.value) or () if (value := os.getenv(name))),
+            None,
+        )
+    if not api_key:
+        raise LookupError(f"no credential configured for provider '{provider.value}'")
+    return ResolvedCredential(
+        api_key=str(api_key), api_base=kwargs.get("api_base"), client_args=dict(kwargs.get("client_args") or {})
+    )
+
+
+class ProviderAccounts:
+    """Names the provider accounts one workspace's dispatch credentials reach.
+
+    The name is a keyed digest, HMAC-SHA256 under a pepper kept for this one
+    purpose, so a copy of the database cannot confirm a guessed credential.
+    It is derived rather than stored, so a changed credential names a different
+    account at once and nothing has to notice the change.
+    """
+
+    def __init__(self, *, pepper: str, workspace_id: uuid.UUID) -> None:
+        self._pepper = pepper.encode()
+        self._workspace_id = workspace_id
+
+    def name(self, provider: LLMProvider, instance: str, credential: ResolvedCredential) -> ProviderAccount:
+        """The account ``credential`` reaches.
+
+        The instance is left out of the digest, because renaming one does not
+        move its account.
+        """
+        canonical = json.dumps(
+            {"provider": provider.value, "api_base": credential.api_base, "api_key": credential.api_key},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return ProviderAccount(
+            provider=provider,
+            instance=instance,
+            workspace_id=self._workspace_id,
+            # codeql[py/weak-sensitive-data-hashing]
+            identity=hmac.new(self._pepper, canonical.encode(), hashlib.sha256).hexdigest(),
+        )
 
 
 @dataclass(frozen=True)
@@ -279,6 +374,11 @@ class ResolvedProvider:
     ``None`` for an ordinary selector. When set, response ``model`` fields are
     relabeled to this so the underlying provider/model stays hidden; pricing,
     budgets, and usage logs still key on the resolved target.
+    """
+    owned_endpoint: "OwnedEndpoint | None" = None
+    """The caller's own endpoint when the selector named one, else ``None``.
+
+    Its owner pays the upstream, so such a request never counts toward a budget.
     """
 
     @property
@@ -316,12 +416,69 @@ def split_selector(model_selector: str) -> tuple[str, str] | None:
     return prefix, remainder
 
 
+def owned_endpoint_kwargs(endpoint: "OwnedEndpoint") -> dict[str, Any]:
+    """The any-llm kwargs for an owned endpoint: its base URL and its key.
+
+    With no key of its own it gets the keyless placeholder unconditionally. The
+    provider's environment variable is never a fallback here, because that is the
+    operator's key and the base URL is somebody else's server.
+    """
+    return {"api_base": endpoint.api_base, "api_key": endpoint.api_key or _KEYLESS_PLACEHOLDER_API_KEY}
+
+
+def apply_endpoint_defaults(call_kwargs: dict[str, Any], resolved: ResolvedProvider) -> dict[str, Any]:
+    """Add an owned endpoint's default request fields beneath the ones the call already sets.
+
+    They travel as ``extra_body``, which the provider SDKs merge into the JSON
+    body, so a field any-llm does not model (vLLM's ``chat_template_kwargs``)
+    reaches the server too. A default is dropped when the call already carries
+    that field, because the body merge would otherwise put it over the caller's.
+    """
+    endpoint = resolved.owned_endpoint
+    if endpoint is None or not endpoint.default_params:
+        return call_kwargs
+    defaults = {
+        key: value
+        for key, value in endpoint.default_params.items()
+        if key not in call_kwargs and key not in FORBIDDEN_ENDPOINT_DEFAULTS
+    }
+    if not defaults:
+        return call_kwargs
+    return {**call_kwargs, "extra_body": {**defaults, **(call_kwargs.get("extra_body") or {})}}
+
+
+def _resolve_owned_endpoint(
+    config: GatewayConfig,
+    split: tuple[str, str] | None,
+    user_id: str | None,
+    workspace_id: uuid.UUID | None,
+) -> tuple[str, "OwnedEndpoint", str] | None:
+    """``(name, endpoint, model)`` when the selector's prefix names one of the caller's endpoints.
+
+    A prefix that already names an instance or a provider keeps that meaning.
+    Saving an endpoint refuses such names too, but an instance added at runtime
+    or a provider a later any-llm adds would otherwise be taken over by an
+    endpoint saved before it.
+    """
+    if split is None or workspace_id is None or not config.provider_endpoints_enabled:
+        return None
+    name, model = split
+    if name in config.providers or name in _PROVIDER_NAMES:
+        return None
+    # Imported here: the providers package imports this module through model discovery.
+    from gateway.services.providers import cached_owned_endpoint
+
+    endpoint = cached_owned_endpoint(name, workspace_id=workspace_id, user_id=user_id)
+    return (name, endpoint, model) if endpoint is not None else None
+
+
 def resolve_provider_selector(
     config: GatewayConfig,
     model_selector: str,
     user_id: str | None = None,
     *,
     workspace_id: uuid.UUID | None = None,
+    owned_endpoints: bool = False,
 ) -> ResolvedProvider:
     """Resolve a request model selector into instance, implementation, and kwargs.
 
@@ -348,6 +505,11 @@ def resolve_provider_selector(
     leave it unset for an operator-configured or otherwise workspace-less
     resolution, which then reads the deployment's default workspace's aliases
     and policies.
+
+    ``owned_endpoints`` lets a ``<name>:<model>`` selector reach an endpoint the
+    caller or its workspace owns, ahead of every other source. Only a caller that
+    exempts the request from budgets and re-checks the endpoint's address before
+    dispatch may pass it; everywhere else such a name is an unknown provider.
 
     Raises ``ValueError`` / ``AnyLLMError`` (from any-llm) for a selector that
     names neither a configured instance nor a known provider, mirroring the
@@ -377,6 +539,17 @@ def resolve_provider_selector(
     selector = alias if alias is not None else model_selector
 
     split = split_selector(selector)
+    owned = _resolve_owned_endpoint(config, split, user_id, workspace_id) if owned_endpoints else None
+    if owned is not None:
+        name, endpoint, model = owned
+        return ResolvedProvider(
+            instance=name,
+            provider=LLMProvider(endpoint.provider),
+            model=model,
+            kwargs=owned_endpoint_kwargs(endpoint),
+            alias=model_selector if alias is not None else None,
+            owned_endpoint=endpoint,
+        )
     if split is not None and split[0] in config.providers:
         instance, model = split
         provider = LLMProvider(config.provider_instance_type(instance))

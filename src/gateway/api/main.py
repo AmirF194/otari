@@ -18,6 +18,7 @@ from gateway.api.routes import (
     budgets,
     catalog,
     chat,
+    decisions,
     embeddings,
     files,
     health,
@@ -46,7 +47,9 @@ from gateway.api.routes import (
     overview,
     playground,
     pricing,
+    provider_endpoints,
     providers,
+    rate_limits,
     rerank,
     responses,
     routing,
@@ -60,6 +63,7 @@ from gateway.api.routes import (
     usage,
     users,
     web_search_backend,
+    web_search_keys,
     workspace_activation,
     workspace_code_execution_policy,
     workspace_mcp_servers,
@@ -164,6 +168,7 @@ _CORE_ROUTERS: tuple[RouterMount, ...] = (
     RouterMount(audio.router, Plane.DATA | Plane.CONTROL),
     RouterMount(files.router, Plane.DATA | Plane.CONTROL),
     RouterMount(rerank.router, Plane.DATA | Plane.CONTROL),
+    RouterMount(decisions.router, Plane.DATA | Plane.CONTROL),
     RouterMount(search.router, Plane.DATA | Plane.CONTROL),
     RouterMount(batches.router, Plane.DATA | Plane.CONTROL),
     RouterMount(moderations.router, Plane.DATA | Plane.CONTROL),
@@ -213,24 +218,29 @@ _CORE_ROUTERS: tuple[RouterMount, ...] = (
     RouterMount(workspace_mcp_servers.router, Plane.CONTROL),
     RouterMount(workspace_code_execution_policy.router, Plane.CONTROL),
     RouterMount(workspace_web_search.router, Plane.CONTROL),
+    RouterMount(web_search_keys.org_router, Plane.CONTROL),
+    RouterMount(web_search_keys.workspace_router, Plane.CONTROL),
     RouterMount(org_provider_keys.org_router, Plane.CONTROL),
     RouterMount(org_provider_keys.workspace_router, Plane.CONTROL),
     RouterMount(budgets.router, Plane.CONTROL),
     RouterMount(scoped_budgets.router, Plane.CONTROL),
     RouterMount(overview.router, Plane.CONTROL),
     RouterMount(aliases.router, Plane.CONTROL),
+    RouterMount(provider_endpoints.router, Plane.CONTROL),
     RouterMount(routing.router, Plane.CONTROL),
     RouterMount(routing_memory.router, Plane.CONTROL),
     # Both prefixed /pricing, split by who may call them; operator first, so
     # its DELETE /{model_key:path} does not sit behind the catalog catch-all.
     RouterMount(pricing.operator_router, Plane.CONTROL),
     RouterMount(pricing.catalog_router, Plane.CONTROL),
-    # Both prefixed /usage. POST /external-events authenticates with an API
-    # key rather than operator standing, so it is mounted on its own router.
+    # Both prefixed /usage. POST /external-events and GET /requests/{id}
+    # authenticate with an API key rather than operator standing, so they are
+    # mounted on their own router.
     RouterMount(usage.operator_router, Plane.CONTROL),
-    RouterMount(usage.ingest_router, Plane.CONTROL),
+    RouterMount(usage.key_router, Plane.CONTROL),
     RouterMount(agent_telemetry.router, Plane.CONTROL),
     RouterMount(settings.router, Plane.CONTROL),
+    RouterMount(rate_limits.router, Plane.CONTROL),
     RouterMount(mail.router, Plane.CONTROL),
     RouterMount(maintenance_mode.router, Plane.CONTROL),
     # All three prefixed /tool-settings, split by who may call them. Operator

@@ -146,8 +146,7 @@ async def warn_if_router_candidates_lack_pricing(config: GatewayConfig, db: Asyn
     gateway down over an optimization that has a safe fallback; refusing a write
     costs an operator one corrected request, with the policy in front of them.
     """
-    from gateway.services.routing.backends import backend_requires_pricing
-    from gateway.services.routing.knn import unpriced_router_candidates
+    from gateway.services.routing import backend_requires_pricing, unpriced_router_candidates
 
     for name, spec in config.routing.policies.items():
         if not backend_requires_pricing(spec.router_backend):
@@ -178,7 +177,11 @@ async def initialize_pricing_from_config(config: GatewayConfig, db: AsyncSession
         model_key = normalize_pricing_key(config, raw_model_key)
         instance = model_key.split(":", 1)[0] if ":" in model_key else model_key
 
-        if instance not in config.providers and instance != GATEWAY_TOOL_PRICING_PROVIDER:
+        if (
+            instance not in config.providers
+            and instance not in config.decision_providers
+            and instance != GATEWAY_TOOL_PRICING_PROVIDER
+        ):
             logger.warning(
                 "Skipping pricing for '%s': provider '%s' is not listed in the providers section. "
                 "The provider may still work if its credentials come from the environment, but its "

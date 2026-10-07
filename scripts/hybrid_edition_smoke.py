@@ -11,11 +11,11 @@ gateway **sends**: a request body the deployed peer would reject merges green.
 
 This is that gate. It boots the packaged CLI as a subprocess with a platform
 token set, so hybrid mode is selected the way a deployment selects it, and
-stands up four standard-library fakes: the control plane, an OpenAI- and
-Anthropic-compatible provider, a streamable-HTTP MCP server, and a search
-service. Every fake records what it was asked, and the assertions are on those
-records as much as on the responses, because the record is the half of the wire
-contract no other test reads.
+stands up five standard-library fakes: the control plane, an OpenAI- and
+Anthropic-compatible provider, a streamable-HTTP MCP server, a search service,
+and a sandbox speaking the code-execution protocol. Every fake records what it
+was asked, and the assertions are on those records as much as on the responses,
+because the record is the half of the wire contract no other test reads.
 
 It walks:
 
@@ -35,14 +35,21 @@ It walks:
 6. MCP through the managed tool loop, inline and by workspace id: the id resolve
    carries the ids, the server sees initialize, tools/list and tools/call, and
    the tool result feeds the model's second turn.
-7. Provider-native code execution is forwarded untouched when no sandbox is
-   configured: Anthropic's dated tool on Messages, OpenAI's ``code_interpreter``
-   on Responses, each answered in its own native result blocks.
+7. Code execution in the gateway's sandbox: the control plane is asked whether
+   the workspace may run code, the code runs in the sandbox with no caller
+   token on it, and the output feeds the model's second turn. A workspace the
+   control plane refuses gets a 403, and one whose policy is malformed gets a
+   502, and neither reaches the provider or the sandbox.
+8. Provider-native code execution is forwarded untouched under the default
+   executor, although a sandbox is configured: Anthropic's dated tool on
+   Messages, OpenAI's ``code_interpreter`` on Responses, each answered in its
+   own native result blocks. The workspace's policy is still asked for each,
+   because its executor could bring the code here, and no sandbox is called.
 
-8. Provider-native web search is forwarded the same way (``web_search_intercept``
+9. Provider-native web search is forwarded the same way (``web_search_intercept``
    is off by default): Anthropic's ``web_search_20250305`` on Messages, OpenAI's
    ``web_search_preview`` on Responses, each answered in its own result blocks.
-9. A streamed completion, which is how most callers actually read a model: the
+10. A streamed completion, which is how most callers actually read a model: the
    gateway injects ``stream_options.include_usage`` so a cost can be settled, the
    frames reach the caller as ``text/event-stream``, and the usage report carries
    the ``ttft_ms`` that only a streamed attempt produces.
@@ -119,6 +126,8 @@ USER_TOKEN_OK = f"tk_ok_{secrets.token_hex(8)}"
 USER_TOKEN_BROKE = f"tk_broke_{secrets.token_hex(8)}"
 USER_TOKEN_THROTTLED = f"tk_throttled_{secrets.token_hex(8)}"
 USER_TOKEN_UNKNOWN = f"tk_unknown_{secrets.token_hex(8)}"
+USER_TOKEN_CODE_DISABLED = f"tk_code_disabled_{secrets.token_hex(8)}"
+USER_TOKEN_CODE_MALFORMED = f"tk_code_malformed_{secrets.token_hex(8)}"
 
 OPENAI_KEY = f"sk-hybrid-smoke-{secrets.token_hex(8)}"
 ANTHROPIC_KEY = f"sk-ant-hybrid-smoke-{secrets.token_hex(8)}"
@@ -134,12 +143,25 @@ MCP_TOOL = "smoke_lookup"
 MCP_RESULT = "hybrid-smoke-mcp-result"
 MCP_SERVER_ID = "8f2c1a1e-0000-4000-8000-000000000001"
 CODE_STDOUT = "hybrid-smoke-code-stdout"
+SANDBOX_STDOUT = "hybrid-smoke-sandbox-stdout"
+# The function the gateway offers the model for its own sandbox. A unit test pins
+# it against the app's constant.
+SANDBOX_TOOL = "code_execution"
+SANDBOX_CODE = "print('hybrid smoke')"
 # Delivered before the first frame so the gateway's time-to-first-token is a
 # measurable number rather than a rounding artifact.
 STREAM_FIRST_FRAME_DELAY_SECONDS = 0.05
 
 RETRY_AFTER_SECONDS = "7"
 BROKE_DETAIL = "Wallet is empty"
+CODE_PURPOSE_HINT = "hybrid-smoke-workspace-purpose-hint"
+# Each workspace's code-execution policy. A token missing here is unknown to the control plane.
+CODE_EXECUTION_POLICIES: dict[str, dict[str, Any]] = {
+    USER_TOKEN_OK: {"enabled": True, "default_purpose_hint": CODE_PURPOSE_HINT, "max_iterations": 4},
+    USER_TOKEN_CODE_DISABLED: {"enabled": False},
+    # Not a boolean, so the gateway must fail closed rather than read it as disabled.
+    USER_TOKEN_CODE_MALFORMED: {"enabled": "yes"},
+}
 
 # Read by the script before the environment is scrubbed for the gateway, so a
 # key reaches the gateway only the way a deployment's would: in a resolve answer.
@@ -402,7 +424,8 @@ class _ControlPlaneHandler(_RecordingHandler):
         if user_token == USER_TOKEN_THROTTLED:
             self._respond(429, {"detail": "Too many requests"}, {"Retry-After": RETRY_AFTER_SECONDS})
             return
-        if user_token != USER_TOKEN_OK:
+        code_execution_policy = CODE_EXECUTION_POLICIES.get(user_token or "")
+        if code_execution_policy is None:
             self._respond(401, {"detail": "unknown user token"})
             return
 
@@ -430,6 +453,8 @@ class _ControlPlaneHandler(_RecordingHandler):
                     ]
                 },
             )
+        elif route == "code-execution/resolve":
+            self._respond(200, code_execution_policy)
         else:
             self._respond(404, {"detail": f"fake control plane has no route {route}"})
 
@@ -533,6 +558,8 @@ class _ProviderHandler(_RecordingHandler):
             return {"name": "web_search", "arguments": json.dumps({"query": SEARCH_QUERY})}
         if MCP_TOOL in names:
             return {"name": MCP_TOOL, "arguments": json.dumps({"term": "smoke"})}
+        if SANDBOX_TOOL in names:
+            return {"name": SANDBOX_TOOL, "arguments": json.dumps({"code": SANDBOX_CODE})}
         return None
 
     @classmethod
@@ -584,10 +611,7 @@ class _ProviderHandler(_RecordingHandler):
 
         A tool call arrives split across fragments, with the name in the first
         and the arguments in a later one, because that is what a real provider
-        sends and what the gateway's slot accumulator has to survive. Nothing
-        walks that branch yet: the leg that does is held back by otari#1504,
-        where a streamed hybrid tool loop truncates its own stream, and lands
-        with that fix.
+        sends and what the gateway's slot accumulator has to survive.
         """
         base = {
             "id": "chatcmpl-hybrid-smoke-stream",
@@ -830,6 +854,93 @@ class _SearchHandler(_RecordingHandler):
         )
 
 
+class FakeSandbox(_FakeServer):
+    """A backend speaking docs/code-execution-protocol.md.
+
+    It serves the three required operations and records each under its contract name.
+    """
+
+    def __init__(self, bind_host: str = LOOPBACK) -> None:
+        super().__init__(_SandboxHandler, bind_host)
+        self._sessions: set[str] = set()
+        self._created = 0
+        self._lock = threading.Lock()
+
+    def create_session(self) -> str:
+        with self._lock:
+            self._created += 1
+            session_id = f"sbx_{self._created:04d}"
+            self._sessions.add(session_id)
+        return session_id
+
+    def has_session(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self._sessions
+
+    def destroy_session(self, session_id: str) -> None:
+        with self._lock:
+            self._sessions.discard(session_id)
+
+    @property
+    def open_sessions(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+
+class _SandboxHandler(_RecordingHandler):
+    server: FakeSandbox
+
+    def _session_route(self) -> tuple[str, str] | None:
+        """The session id and the operation suffix, for a path under ``/sessions/``."""
+        parts = self._path().split("/")
+        if len(parts) < 3 or parts[1] != "sessions":
+            return None
+        return parts[2], "/".join(parts[3:])
+
+    def do_POST(self) -> None:  # noqa: N802
+        body = self._read_json()
+        if self._path() == "/sessions":
+            self._record("CreateSession", body)
+            self._respond(201, {"session_id": self.server.create_session()})
+            return
+        route = self._session_route()
+        if route is None or route[1] != "exec":
+            self._respond(404, {"detail": f"fake sandbox has no POST {self._path()}"})
+            return
+        session_id, _ = route
+        self._record("Execute", body)
+        if not self.server.has_session(session_id):
+            self._respond(404, {"detail": "unknown session"})
+            return
+        tool_use_id = (body.get("tool_use_id") if isinstance(body, dict) else None) or "toolu_hybrid_smoke"
+        self._respond(
+            200,
+            {
+                "tool_use_id": tool_use_id,
+                "result_block": {
+                    "type": "code_execution_tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": {
+                        "type": "code_execution_result",
+                        "stdout": SANDBOX_STDOUT,
+                        "stderr": "",
+                        "return_code": 0,
+                        "content": [],
+                    },
+                },
+            },
+        )
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        route = self._session_route()
+        if route is None or route[1]:
+            self._respond(404)
+            return
+        self._record("DestroySession", None)
+        self.server.destroy_session(route[0])
+        self._respond(204)
+
+
 # --------------------------------------------------------------------------- #
 # Gateway configuration, environment and process
 # --------------------------------------------------------------------------- #
@@ -846,38 +957,51 @@ def hybrid_env(base_env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+@dataclass(frozen=True, kw_only=True)
+class PeerUrls:
+    """Where the gateway reaches each peer it depends on."""
+
+    platform_base_url: str
+    sandbox_url: str
+    search_base_url: str
+
+
 def hybrid_config(
     *,
-    port: int,
-    platform_base_url: str,
-    search_base_url: str,
-    tavily_key: str | None = None,
-    in_container: bool = False,
+    peers: PeerUrls,
+    port: int | None,
 ) -> dict[str, Any]:
     """The config a hybrid deployment writes: a platform block and no providers.
 
-    No ``database_url``: a hybrid gateway runs no database. No ``sandbox_url``,
-    so a provider-native code-execution declaration is forwarded untouched,
-    which is the path step 7 proves.
+    No ``database_url``: a hybrid gateway runs no database. ``sandbox_url`` names
+    a sandbox outside the control plane, which answers policy only.
     ``web_search_url`` names a service of its own, so a search query carries no Otari credential.
-    A live run adds Tavily, which the backend prefers over the URL.
-    ``in_container`` leaves out ``host`` and ``port``, which the image's own
-    environment owns and a config file cannot override.
+    A ``port`` of ``None`` leaves out ``host`` and ``port``, for a gateway whose
+    environment sets its listen address, as the published image does.
     """
     config: dict[str, Any] = {
-        "platform": {"base_url": platform_base_url, "resolve_timeout_ms": 5000},
+        "platform": {"base_url": peers.platform_base_url, "resolve_timeout_ms": 5000},
         # The gateway appends /search itself.
-        "web_search_url": search_base_url,
+        "web_search_url": peers.search_base_url,
+        "sandbox_url": peers.sandbox_url,
     }
-    if not in_container:
+    if port is not None:
         config["host"] = LOOPBACK
         config["port"] = port
-    if tavily_key:
-        config["web_search_provider"] = "tavily"
-        config["web_search_provider_api_key"] = tavily_key
-        # Real pages are retrieved through the pinned transport; keep it short.
-        config["web_search_max_results"] = 2
     return config
+
+
+def get_tavily_settings(api_key: str) -> dict[str, Any]:
+    """The settings that send managed search to Tavily.
+
+    The backend prefers a provider over ``web_search_url``, so a config keeps its URL.
+    """
+    return {
+        "web_search_provider": "tavily",
+        "web_search_provider_api_key": api_key,
+        # Real pages are retrieved through the pinned transport; keep it short.
+        "web_search_max_results": 2,
+    }
 
 
 def write_config(path: Path, config: dict[str, Any]) -> None:
@@ -1102,6 +1226,7 @@ class Fakes:
     provider: MockProvider
     mcp: FakeMcpServer
     search: FakeSearchService
+    sandbox: FakeSandbox
     # Real providers: the mock provider records nothing, and prompts force tools.
     live: LiveProviders | None = None
     # Otari-Attempt-ID of every 200 the caller received: the attempts that were
@@ -1361,8 +1486,83 @@ def run_mcp(base_url: str, fakes: Fakes) -> None:
     log("MCP ran through the managed loop, inline and by workspace id, with the id resolve as documented")
 
 
+def run_gateway_code_execution(base_url: str, fakes: Fakes) -> None:
+    """The code-execution resolve, the sandbox run, and the two ways the control plane stops it."""
+    chats_before = len(fakes.provider.recorder.all("chat"))
+    resolves_before = len(fakes.control_plane.recorder.all("code-execution/resolve"))
+    sandbox_before = len(fakes.sandbox.recorder.all())
+    destroyed_before = len(fakes.sandbox.recorder.all("DestroySession"))
+    status, body, headers = _request(
+        "POST",
+        f"{base_url}{API_ROOT}/chat/completions",
+        headers={KEY_HEADER: USER_TOKEN_OK},
+        payload={
+            "model": f"openai:{fakes.openai_model}",
+            "messages": [{"role": "user", "content": f"Use the {SANDBOX_TOOL} tool to run: {SANDBOX_CODE}"}],
+            "tools": [{"type": "otari_code_execution"}],
+            "tool_choice": {"type": "function", "function": {"name": SANDBOX_TOOL}},
+        },
+    )
+    _expect(status, 200, "a completion declaring otari_code_execution", body)
+    fakes.note_dispatched(headers, "the sandbox-assisted completion")
+    _check(bool(_content_of(body).strip()), f"the sandbox-assisted completion came back empty: {body!r}")
+
+    resolves = fakes.control_plane.recorder.all("code-execution/resolve")[resolves_before:]
+    _check(len(resolves) == 1, f"expected one code-execution resolve, got {len(resolves)}")
+    _check(resolves[0].body == {}, f"code-execution resolve body: {resolves[0].body!r}")
+    _check(resolves[0].headers.get("x-gateway-token") == GATEWAY_TOKEN, "code-execution resolve had no gateway token")
+    _check(resolves[0].headers.get("x-user-token") == USER_TOKEN_OK, "code-execution resolve had no user token")
+
+    sandbox_run = fakes.sandbox.recorder.all()[sandbox_before:]
+    executions = [item for item in sandbox_run if item.route == "Execute"]
+    created = [item for item in sandbox_run if item.route == "CreateSession"]
+    _check(len(created) == 1, "the sandbox did not see exactly one session")
+    _check(len(executions) >= 1, "the sandbox never ran the code")
+    _check(executions[0].body.get("tool") == SANDBOX_TOOL, f"the sandbox was asked for {executions[0].body!r}")
+    fakes.sandbox.recorder.wait_for("DestroySession", destroyed_before + 1)
+    _check(fakes.sandbox.open_sessions == 0, "the sandbox session outlived its request")
+    for item in fakes.sandbox.recorder.all()[sandbox_before:]:
+        sent = json.dumps(item.headers)
+        _check(USER_TOKEN_OK not in sent and GATEWAY_TOKEN not in sent, "a platform token reached the sandbox")
+
+    if not fakes.live:
+        _check(len(executions) == 1, f"expected one sandbox run, got {len(executions)}")
+        _check(executions[0].body.get("input") == {"code": SANDBOX_CODE}, f"sandbox input: {executions[0].body!r}")
+        _check(REPLY in _content_of(body), f"the sandbox-assisted completion did not finish: {body!r}")
+        chats = fakes.provider.recorder.all("chat")[chats_before:]
+        _check(len(chats) == 2, f"expected two model turns around the sandbox run, got {len(chats)}")
+        _check(CODE_PURPOSE_HINT in json.dumps(chats[0].body), "the workspace's purpose hint did not reach the model")
+        _check(SANDBOX_STDOUT in json.dumps(chats[1].body.get("messages")), "the sandbox output missed the model")
+
+    provider_calls = len(fakes.provider.recorder.all())
+    sandbox_calls = len(fakes.sandbox.recorder.all())
+    for token, expected, what in (
+        (USER_TOKEN_CODE_DISABLED, 403, "a workspace the control plane does not let run code"),
+        (USER_TOKEN_CODE_MALFORMED, 502, "a workspace whose code-execution policy is malformed"),
+    ):
+        status, body, _ = _request(
+            "POST",
+            f"{base_url}{API_ROOT}/chat/completions",
+            headers={KEY_HEADER: token},
+            payload={
+                "model": f"openai:{fakes.openai_model}",
+                "messages": [{"role": "user", "content": "run some code"}],
+                "tools": [{"type": "otari_code_execution"}],
+            },
+        )
+        _expect(status, expected, what, body)
+        code_resolves = fakes.control_plane.recorder.all("code-execution/resolve")
+        asked = [item.headers.get("x-user-token") for item in code_resolves]
+        _check(token in asked, f"{what} was refused without asking the control plane")
+    _check(len(fakes.provider.recorder.all()) == provider_calls, "a refused sandbox request still reached the provider")
+    _check(len(fakes.sandbox.recorder.all()) == sandbox_calls, "a refused sandbox request still reached the sandbox")
+    log("Code execution resolved its policy, ran in the sandbox with no caller token, and fed the model; refusals held")
+
+
 def run_native_code_execution(base_url: str, fakes: Fakes) -> None:
     """A provider-native code-execution declaration is forwarded and answered natively."""
+    code_resolves = len(fakes.control_plane.recorder.all("code-execution/resolve"))
+    sandbox_calls = len(fakes.sandbox.recorder.all())
     # Anthropic's dated server tool on Messages.
     prompt = "Use the code execution tool to compute 2**10 in Python and report the printed result."
     status, body, headers = _request(
@@ -1417,6 +1617,12 @@ def run_native_code_execution(base_url: str, fakes: Fakes) -> None:
         _check(len(responses) == 1, f"expected one Responses call, got {len(responses)}")
         forwarded = {tool.get("type") for tool in responses[0].body.get("tools") or [] if isinstance(tool, dict)}
         _check("code_interpreter" in forwarded, f"the declaration did not reach OpenAI: {forwarded!r}")
+    # The policy is asked before the executor decision, so each native call asks once.
+    _check(
+        len(fakes.control_plane.recorder.all("code-execution/resolve")) == code_resolves + 2,
+        "a native declaration was not resolved before the executor decision",
+    )
+    _check(len(fakes.sandbox.recorder.all()) == sandbox_calls, "a native declaration reached the gateway's sandbox")
     where = "against the real APIs" if fakes.live else "and answered natively"
     log(f"Provider-native code execution was forwarded on Messages and Responses {where}")
 
@@ -1522,6 +1728,47 @@ def run_streaming_completion(base_url: str, fakes: Fakes) -> None:
     log(f"A streamed completion delivered SSE, injected include_usage, and reported ttft_ms={ttft}")
 
 
+def run_streaming_tool_loop(base_url: str, fakes: Fakes) -> None:
+    """A streamed request whose tool the gateway runs, on one unbroken stream.
+
+    Chat Completions has no vocabulary for a server-side tool call, so the
+    gateway's own call is filtered out of the caller's stream (docs/tools.md).
+    The caller must therefore see the answer and no tool call at all, which is
+    the opposite of what a leaked internal turn would look like.
+    """
+    calls_before = len(fakes.mcp.recorder.all("tools/call"))
+    status, headers, raw, frames = _stream_request(
+        f"{base_url}{API_ROOT}/chat/completions",
+        headers={KEY_HEADER: USER_TOKEN_OK},
+        payload={
+            "model": f"openai:{fakes.openai_model}",
+            "messages": [{"role": "user", "content": f"Use the {MCP_TOOL} tool with term 'smoke'."}],
+            "tool_choice": {"type": "function", "function": {"name": MCP_TOOL}},
+            "mcp_servers": [{"name": "smoke", "url": fakes.mcp.mcp_url}],
+            "stream": True,
+        },
+    )
+    _expect(status, 200, f"POST {API_ROOT}/chat/completions streaming an MCP tool", frames)
+    _check("text/event-stream" in headers.get("content-type", ""), f"not an SSE response: {headers!r}")
+    _check(bool(raw) and raw[-1] == "[DONE]", f"the streamed tool loop did not terminate with [DONE]: {raw[-3:]!r}")
+    fakes.note_dispatched(headers, "the streamed MCP completion")
+
+    calls = fakes.mcp.recorder.all("tools/call")[calls_before:]
+    _check(len(calls) >= 1, "the gateway did not run the tool during the stream")
+    _check(calls[0].body.get("name") == MCP_TOOL, f"tools/call named {calls[0].body.get('name')!r}")
+
+    leaked = [
+        choice
+        for frame in frames
+        for choice in frame.get("choices") or []
+        if (choice.get("delta") or {}).get("tool_calls")
+    ]
+    _check(not leaked, f"the gateway's own tool call reached the caller's stream: {leaked!r}")
+    if not fakes.live:
+        _check(REPLY == _streamed_content(frames), f"the stream did not carry the answer: {raw!r}")
+    log("A streamed tool loop ran the tool mid-stream and kept the gateway's own call off the wire")
+
+
 def check_every_attempt_was_reported(fakes: Fakes) -> None:
     """Exactly one usage report per dispatched attempt, and none for anything else.
 
@@ -1563,9 +1810,11 @@ STEPS: tuple[Callable[[str, Fakes], None], ...] = (
     run_web_search,
     check_web_fetch_is_off_by_default,
     run_mcp,
+    run_gateway_code_execution,
     run_native_code_execution,
     run_native_web_search,
     run_streaming_completion,
+    run_streaming_tool_loop,
     lambda base_url, fakes: check_every_attempt_was_reported(fakes),
 )
 
@@ -1612,18 +1861,29 @@ def main(argv: list[str] | None = None) -> int:
                 serve(MockProvider(bind_host), "mock-provider") as provider,
                 serve(FakeMcpServer(bind_host), "fake-mcp") as mcp,
                 serve(FakeSearchService(bind_host), "fake-search") as search,
+                serve(FakeSandbox(bind_host), "fake-sandbox") as sandbox,
             ):
                 state = ControlPlaneState(provider_base_url=provider.base_url, mcp_url=mcp.mcp_url, live=live)
                 with serve(FakeControlPlane(state, bind_host), "fake-control-plane") as control_plane:
-                    fakes = Fakes(control_plane=control_plane, provider=provider, mcp=mcp, search=search, live=live)
-                    platform_base_url = f"{control_plane.base_url}{PLATFORM_PREFIX}"
-                    config = hybrid_config(
-                        port=port,
-                        platform_base_url=platform_base_url,
-                        search_base_url=search.base_url,
-                        tavily_key=live.tavily_key if live else None,
-                        in_container=bool(args.image),
+                    fakes = Fakes(
+                        control_plane=control_plane,
+                        provider=provider,
+                        mcp=mcp,
+                        search=search,
+                        sandbox=sandbox,
+                        live=live,
                     )
+                    peers = PeerUrls(
+                        platform_base_url=f"{control_plane.base_url}{PLATFORM_PREFIX}",
+                        sandbox_url=sandbox.base_url,
+                        search_base_url=search.base_url,
+                    )
+                    config = hybrid_config(
+                        peers=peers,
+                        port=None if args.image else port,
+                    )
+                    if live is not None and live.tavily_key:
+                        config.update(get_tavily_settings(live.tavily_key))
                     write_config(config_path, config)
                     # World-readable: the container runs as its own user and has
                     # to read the mount. The file holds this run's fixtures.

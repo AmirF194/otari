@@ -269,6 +269,11 @@ export type PricingTier = Schemas["PricingTier"]
 // The catalog folded by model (`/v1/catalog`): one summary per model in the
 // list, and one detail carrying every offering of it the caller may use.
 export type CatalogResponse = Schemas["CatalogResponse"]
+export type CatalogFacets = Schemas["CatalogFacets"]
+export type CatalogVendorFacet = Schemas["CatalogVendorFacet"]
+export type CatalogQueryParams = NonNullable<
+  operations["catalog-list_catalog"]["parameters"]["query"]
+>
 export type CatalogModelSummary = Schemas["CatalogModelSummary"]
 export type CatalogModelDetail = Schemas["CatalogModelDetail"]
 export type CatalogOffering = Schemas["CatalogOffering"]
@@ -436,6 +441,14 @@ export type BuiltInGuardrailCatalog = Schemas["BuiltInGuardrailCatalog"]
 export type BuiltInGuardrailSpec = Schemas["BuiltInGuardrailSpec"]
 export type GuardrailCategory = Schemas["GuardrailCategory"]
 export type RequirementGroup = Schemas["RequirementGroup"]
+
+// ---------------------------------------------------------------------------
+// Rate limit rules
+// ---------------------------------------------------------------------------
+export type RateLimitRule = Schemas["RateLimitRulePublic"]
+export type RateLimitRules = Schemas["RateLimitRulesPublic"]
+export type CreateRateLimitRuleRequest = Schemas["RateLimitRuleCreate"]
+export type UpdateRateLimitRuleRequest = Schemas["RateLimitRuleUpdate"]
 
 // ---------------------------------------------------------------------------
 // Search tools
@@ -688,6 +701,12 @@ export type SavePlaygroundConversationRequest =
   Schemas["PlaygroundConversationCreate"]
 export type PlaygroundMessage = Schemas["PlaygroundMessagePublic"]
 export type PlaygroundMessages = Schemas["PlaygroundMessagesPublic"]
+export type PlaygroundAttachment = Schemas["PlaygroundAttachment"]
+
+// A file the caller uploaded, in OpenAI's file object shape, which is what the
+// Playground's own upload and listing answer in.
+export type PlaygroundFile = Schemas["OpenAIFileObject"]
+export type PlaygroundFiles = Schemas["OpenAIFileList"]
 
 // A rated A/B exchange. The summary deliberately carries no answer bodies;
 // there is no endpoint that reads one back, because a comparison is a recorded

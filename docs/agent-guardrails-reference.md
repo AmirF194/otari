@@ -343,19 +343,12 @@ alone, since it joins a descriptor to a target rather than ending a command.
 A comment is stripped before any of that, at the same word boundaries Bash
 uses, so `ls;# npm install` is a comment in full and matches nothing.
 
+A heredoc body is stripped too, with its terminator line, because it is data the command reads and not a command. A commit message passed as `git commit -F - <<'MSG'` can therefore name a forbidden phrase, the same as a quoted `-m` argument can. A `<<` whose terminator line never appears does not open a body here, so the lines after it are still checked. Neither does an unquoted heredoc with a body line that ends in a backslash, because Bash joins that line to the next and its terminator is not certain. A `<<` inside arithmetic (`$((1<<2))`), a parameter expansion, a subscript or a compound array assignment is a shift, as Bash reads it, and opens no body.
+
 Two things this gate does not do, on purpose, for now:
 
-- It sees only the literal command text of one tool call. It does not, and
-  cannot, see what a script or program that command invokes does internally:
-  `./deploy.sh` is one opaque token to this gate even if the script itself
-  runs `git push --force`. This is a footgun-catcher for a cooperative agent,
-  not a sandbox against one deliberately working around it.
-- A command it cannot tokenize as a shell command (an unbalanced quote, or a
-  heredoc carrying another language) falls back to a plain whitespace split.
-  That still catches a forbidden phrase spelled as bare words, and it can
-  report a phrase that only appears inside what would have been a quoted
-  argument. The alternative, refusing to judge, blocks every heredoc a real
-  session runs.
+- It sees only the literal command text of one tool call. It does not, and cannot, see what a script or program that command invokes does internally: `./deploy.sh` is one opaque token to this gate even if the script itself runs `git push --force`. A heredoc piped to a shell is the same case, so `bash <<'EOF'` with a forbidden command in its body passes. This is a footgun-catcher for a cooperative agent, not a sandbox against one deliberately working around it.
+- A command it cannot tokenize as a shell command (an unbalanced quote, such as a double quote in a heredoc inside a double-quoted command substitution) falls back to a plain whitespace split. That still catches a forbidden phrase spelled as bare words, and it can report a phrase that only appears inside what would have been a quoted argument. The alternative, refusing to judge, blocks every such command a real session runs.
 
 ### `command_if_changed`
 
@@ -379,6 +372,8 @@ of the other two gate types can: each checks one independent condition.
       scripts/generate_openapi.py, then run `make postman` to keep the
       Postman collection in sync (see AGENTS.md, "Generated Artifacts").
 ```
+
+A heredoc body is not command text here either, so a required command that only appears inside one does not satisfy `require`.
 
 This gate resolves for real only when both a changed-path list and a command
 list were actually collected: either being missing resolves `unknown`, not a
@@ -937,7 +932,17 @@ session's own JSONL file, which the payload does carry) for command
 evidence. It walks every line of that file looking for a `Bash` tool call
 (`message.content[]` blocks with `type: "tool_use"`, `name: "Bash"`) and
 collects each one's `input.command`, skipping a record marked
-`isSidechain: true` (a subagent's own turn, not this policy's own agent).
+`isSidechain: true` (a subagent's own turn, not this policy's own agent). A
+command that ran before the session's last `Edit`/`Write`/`NotebookEdit`
+call is dropped from the evidence it submits: `command_if_changed` reads
+"the required command is in this list" as "the required command validated
+the current working tree", which a command run before a later edit did
+not do. Without this, running `make lint` once and then editing the file
+again with no re-run would still read as satisfied. Only an edit tool moves
+that cutoff: a `Bash` call can write to the tree too, but the transcript
+does not say which ones did, and the command a gate requires is often the
+writer itself (`make postman` writes the collection its own gate asks for),
+so counting one would leave that gate unsatisfiable.
 If the transcript cannot be read at all, `otari hook` collects no command
 evidence at all, rather than an empty list: the difference between "collected,
 and there is none" and "could not collect" is what keeps a required

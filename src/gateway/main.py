@@ -1,4 +1,6 @@
 import asyncio
+import functools
+import importlib.util
 from collections.abc import AsyncGenerator, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -6,20 +8,31 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, Response, status
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from typing_extensions import override
 
 from gateway import features
-from gateway.api.deps import build_file_service, build_idempotency_service, set_config
+from gateway.api.deps import (
+    build_file_service,
+    build_idempotency_service,
+    get_membership_listener,
+    get_workspace_listener,
+    get_workspace_search_keys,
+    set_config,
+)
 from gateway.api.main import register_routers
 from gateway.container import Container, build_container
+from gateway.context_propagation import TraceContextPropagationMiddleware
 from gateway.core.config import API_KEY_HEADER, API_ROOT, GATEWAY_TOKEN_HEADER, X_API_KEY_HEADER, GatewayConfig
 from gateway.core.database import create_session, dispose_db, init_db
+from gateway.core.error_codes import error_code_of, error_headers
 from gateway.core.feature import Worker
 from gateway.dashboard import DASHBOARD_PACKAGE_PATH, get_dashboard_build_id, get_dashboard_dir
 from gateway.exceptions import TenancyError
@@ -29,7 +42,9 @@ from gateway.log_config import logger
 from gateway.ports.api_key_format_port import ApiKeyFormatPort
 from gateway.ports.file_storage_port import FileStoragePort
 from gateway.ports.model_provider_port import ModelProviderPort
-from gateway.rate_limit import RateLimiter
+from gateway.ports.provider_file_port import ProviderFilePort
+from gateway.ports.rate_limit_store_port import RateLimitStorePort
+from gateway.rate_limit import RateLimiter, RateLimitGrantMiddleware, RateLimitRules, UserRateLimiter
 from gateway.root_page import FAVICON_SVG, ROOT_TUTORIAL_HTML
 from gateway.services.alias_service import load_aliases_at_startup, reset_alias_cache, run_alias_refresher
 from gateway.services.bootstrap_service import bootstrap_first_api_key
@@ -38,8 +53,8 @@ from gateway.services.catalog_selectors import reset_selector_index
 from gateway.services.code_execution.container_sweeper import run_sandbox_container_sweeper
 from gateway.services.dashboard_session_service import revoke_sessions_on_master_key_change
 from gateway.services.feedback import new_feedback_rate_limiter
-from gateway.services.files import run_file_sweeper
-from gateway.services.inference import run_idempotency_sweeper
+from gateway.services.files import FileBackends, run_file_sweeper
+from gateway.services.inference import close_decision_client, run_idempotency_sweeper
 from gateway.services.log_writer import LogWriter, NoopLogWriter, create_log_writer
 from gateway.services.master_key_service import ensure_master_key
 from gateway.services.model_catalog_service import (
@@ -74,6 +89,12 @@ from gateway.services.provider_store_service import (
     reset_provider_cache,
     run_provider_refresher,
 )
+from gateway.services.providers import (
+    load_provider_endpoints_at_startup,
+    reset_provider_endpoint_cache,
+    run_provider_endpoint_refresher,
+)
+from gateway.services.rate_limits import load_rate_limit_rules_at_startup, run_rate_limit_refresher
 from gateway.services.runtime_settings_service import apply_overrides_from_db
 from gateway.services.search_backend import close_search_client
 from gateway.services.search_tool_store_service import (
@@ -81,7 +102,7 @@ from gateway.services.search_tool_store_service import (
     reset_search_tool_cache,
     run_search_tool_refresher,
 )
-from gateway.services.secret_box import validate_secret_key
+from gateway.services.secret_box import shares_secret_key, validate_secret_key
 from gateway.services.selector_index_service import run_selector_index_refresher
 from gateway.services.tenancy.org_provider_key_service import (
     load_org_provider_keys_at_startup,
@@ -178,6 +199,27 @@ def _start_reservation_sweeper(config: GatewayConfig, _container: Container) -> 
     )
 
 
+def _resolve_file_store(config: GatewayConfig, container: Container) -> FileStoragePort | None:
+    """Build the file store, or start without one where files are off and it cannot be built.
+
+    A store that cannot be built stops the boot while files are on, because every
+    upload would fail. With files off the same fault only means a stored
+    ``file_id`` no longer resolves, so the deployment starts and says so rather
+    than locking out an operator who turned files off and removed the bucket
+    the settings still point at.
+    """
+    try:
+        return container.resolve(FileStoragePort, None)
+    except ValueError as exc:
+        if config.files_enabled:
+            raise
+        logger.warning(
+            "Files are disabled and the files backend cannot be built, so stored file references will not resolve: %s",
+            exc,
+        )
+        return None
+
+
 def _start_file_sweeper(config: GatewayConfig, container: Container) -> Coroutine[Any, Any, None] | None:
     """Return the file retention sweep, or None when files or the interval disable it.
 
@@ -186,10 +228,10 @@ def _start_file_sweeper(config: GatewayConfig, container: Container) -> Coroutin
     """
     if not config.files_enabled or config.files_sweep_interval_sec <= 0:
         return None
-    file_store = container.resolve(FileStoragePort, None)
-    return run_file_sweeper(
-        config.files_sweep_interval_sec, lambda uow: build_file_service(uow, file_store, config)
+    backends = FileBackends(
+        storage=container.resolve(FileStoragePort, None), provider_files=container.resolve(ProviderFilePort, None)
     )
+    return run_file_sweeper(config.files_sweep_interval_sec, lambda uow: build_file_service(uow, backends, config))
 
 
 def _start_idempotency_sweeper(config: GatewayConfig, _container: Container) -> Coroutine[Any, Any, None]:
@@ -223,6 +265,11 @@ _LIFESPAN_WORKERS: tuple[_LifespanWorker, ...] = (
         lambda _config, _container: run_org_provider_refresher(),
         reset_org_provider_cache,
     ),
+    _LifespanWorker(
+        "provider endpoint",
+        lambda _config, _container: run_provider_endpoint_refresher(),
+        reset_provider_endpoint_cache,
+    ),
     # Not a cache of rows like its neighbours: this holds constructed vendor
     # clients, so its tick rebuilds only what a write moved and its reset gives
     # the threads back as well as dropping what was built.
@@ -234,6 +281,8 @@ _LIFESPAN_WORKERS: tuple[_LifespanWorker, ...] = (
     _LifespanWorker(
         "search tool", lambda config, _container: run_search_tool_refresher(config), reset_search_tool_cache
     ),
+    # No reset: the stored rules live on the config, which the startup load rebuilds.
+    _LifespanWorker("rate limit rule", lambda config, _container: run_rate_limit_refresher(config)),
     _LifespanWorker("price snapshot", lambda _config, _container: run_price_snapshot_refresher()),
     # Started whatever ``pricing_refresh`` says, because that policy is
     # runtime-settable and each tick re-reads it.
@@ -361,6 +410,92 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             vary_values.add("Authorization")
             response.headers["Vary"] = ", ".join(sorted(vary_values))
         return response
+
+
+def _validate_metrics_support(config: GatewayConfig) -> None:
+    """Refuse to start when metrics are asked for but the extra is not installed.
+
+    ``prometheus-client`` is an optional extra, and without it the metric objects
+    in :mod:`gateway.metrics` fall back to no-ops. Registering ``/metrics`` on top
+    of those would answer a scrape with an empty body, which reads as a broken
+    exporter rather than a missing install, so say which it is here instead.
+    """
+    if not config.enable_metrics:
+        return
+
+    from gateway.metrics import PROMETHEUS_AVAILABLE
+
+    if not PROMETHEUS_AVAILABLE:
+        msg = (
+            "enable_metrics is set but prometheus-client is not installed. "
+            "Install it with: pip install gateway[metrics]"
+        )
+        raise ValueError(msg)
+
+
+def install_rate_limits(app: FastAPI, config: GatewayConfig) -> None:
+    """Put the per-user limit and the ``rate_limits`` rules on the app, counting in the container's store.
+
+    A standalone gateway always holds the rules, because the dashboard can add
+    one at runtime; a hybrid one, which refuses ``rate_limits``, holds them only
+    for ``rate_limit_rpm``. Resolving the store opens no connection.
+    """
+    rules_possible = not config.is_hybrid_mode
+    store: RateLimitStorePort | None = (
+        app.state.container.resolve(RateLimitStorePort, None)
+        if config.rate_limit_rpm is not None or rules_possible
+        else None
+    )
+    app.state.rate_limit_store = store
+    rpm = config.rate_limit_rpm
+    app.state.rate_limiter = UserRateLimiter(store, rpm) if store is not None and rpm is not None else None
+    app.state.rate_limit_rules = RateLimitRules(store, config) if store is not None and rules_possible else None
+
+
+def _validate_rate_limit_store(config: GatewayConfig) -> None:
+    """Refuse to start a shared rate-limit store that has nowhere to count.
+
+    Falling back to counting per process would quietly multiply the limit by
+    the number of replicas, which is the thing a shared store was asked for to
+    prevent, so a missing URL or client library stops startup instead.
+    ``rate_limits`` is refused in hybrid mode, which does not enforce it yet.
+    """
+    if config.rate_limits and config.is_hybrid_mode:
+        msg = "rate_limits is not supported in hybrid mode yet"
+        raise ValueError(msg)
+    if config.rate_limit_store != "redis":
+        return
+    if not config.rate_limit_redis_url:
+        msg = "rate_limit_store is 'redis' but rate_limit_redis_url is not set"
+        raise ValueError(msg)
+    if importlib.util.find_spec("redis") is None:
+        msg = "rate_limit_store is 'redis' but redis is not installed. Install it with: pip install gateway[redis]"
+        raise ValueError(msg)
+
+
+def _validate_provider_account_pepper(config: GatewayConfig) -> None:
+    """Refuse to start a deployment that makes provider copies without its own pepper.
+
+    The pepper keys the digest that names a provider account, so it must be set
+    and must share no value with another secret. A shared value would let a leak
+    of one secret expose the other, and tie their rotations together.
+    """
+    makes_copies = config.files_enabled and config.files_provider_upload_enabled
+    if not makes_copies or config.is_hybrid_mode or config.is_hosted_mode:
+        return
+    pepper = config.provider_account_pepper
+    if pepper is None:
+        msg = (
+            "OTARI_PROVIDER_ACCOUNT_PEPPER must be set while files_provider_upload_enabled is on; "
+            "set it to a random value of at least 32 characters, or turn provider copies off"
+        )
+        raise ValueError(msg)
+    if pepper == config.master_key:
+        msg = "OTARI_PROVIDER_ACCOUNT_PEPPER must differ from the master key"
+        raise ValueError(msg)
+    if shares_secret_key(pepper):
+        msg = "OTARI_PROVIDER_ACCOUNT_PEPPER must differ from every OTARI_SECRET_KEY key"
+        raise ValueError(msg)
 
 
 def _validate_platform_config(config: GatewayConfig) -> None:
@@ -510,6 +645,10 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
                 # Persisted dashboard overrides win over config/env; apply them
                 # before pricing init so default-pricing behavior is consistent.
                 await apply_overrides_from_db(config, session)
+                # Checked when serving starts rather than when the app is built,
+                # so a tool that only reads the schema needs no pepper, and after
+                # the overrides, so it sees the copy setting this process serves.
+                _validate_provider_account_pepper(config)
                 await load_persisted_price_snapshot(session)
                 # Persisted tool/guardrail overrides (service URLs + web-search
                 # knobs) win over config/env too; apply them so the running worker
@@ -519,6 +658,8 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
                 # so a tool added through the dashboard is one the backend-URL
                 # warning and the flat-pricing warning can see.
                 await load_search_tools_at_startup(session, config)
+                # Before the first request, so a stored rule never lets a burst through at boot.
+                await load_rate_limit_rules_at_startup(config)
                 # After the overrides, not at config load: the web-search URL a
                 # searxng search tool inherits can be the dashboard-stored one
                 # applied just above, and that tool is only broken if nothing
@@ -548,9 +689,7 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
                 # a fresh database (no workspace or key exists yet), the same
                 # posture load_providers_at_startup takes.
                 await load_org_provider_keys_at_startup(session)
-                await bootstrap_first_api_key(
-                    config, session, app.state.container.resolve(ApiKeyFormatPort, session)
-                )
+                await bootstrap_first_api_key(config, session, app.state.container.resolve(ApiKeyFormatPort, session))
                 await initialize_pricing_from_config(config, session)
                 await warn_if_require_pricing_without_pricing(config, session)
                 await warn_if_search_tools_lack_flat_pricing(config, session)
@@ -564,11 +703,13 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
             # client here so the first request to need one does not wait for a
             # vendor handshake.
             await load_guardrail_runner_at_startup()
+            await load_provider_endpoints_at_startup()
             log_writer = create_log_writer(config.log_writer_strategy)
             container: Container = app.state.container
             # The retention sweep below resolves this same port, so both it and
             # the request path use whatever store this build bound.
-            app.state.file_store = container.resolve(FileStoragePort, None)
+            app.state.file_store = _resolve_file_store(config, container)
+            app.state.provider_files = container.resolve(ProviderFilePort, None)
             workers = _start_lifespan_workers(config, container)
             # Workers of the enabled features. Same supervisor as the registry
             # above: created here, cancelled together in ``finally`` under one
@@ -591,9 +732,7 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
             app.state.log_writer = log_writer
             yield
         finally:
-            await _stop_refreshers(
-                [(task, f"{worker.name} refresher") for task, worker in workers] + feature_workers
-            )
+            await _stop_refreshers([(task, f"{worker.name} refresher") for task, worker in workers] + feature_workers)
             for _task, worker in workers:
                 if worker.reset is not None:
                     worker.reset()
@@ -601,14 +740,37 @@ def _create_lifespan() -> Callable[[FastAPI], Any]:
             # nothing to stop, but the refreshers above still needed cancelling.
             if log_writer_started:
                 await log_writer.stop()
-            # POST /api/v1/search dispatches on one pooled client for the process, so
-            # shutdown owns closing it. A no-op when no search was ever served.
+            # POST /api/v1/search and /api/v1/decisions each dispatch on one pooled
+            # client for the process, so shutdown owns closing them. Each is a no-op
+            # when that endpoint was never served.
             await close_search_client()
+            await close_decision_client()
+            rate_limit_store: RateLimitStorePort | None = getattr(app.state, "rate_limit_store", None)
+            if rate_limit_store is not None:
+                await rate_limit_store.aclose()
             # After the log writer, whose final flush is the last thing to need
             # a session. Hybrid mode never opened an engine, so this is a no-op there.
             await dispose_db()
 
     return lifespan
+
+
+async def _http_exception_handler(request: Request, exc: Exception) -> Response:
+    """FastAPI's own HTTPException response, with the refusal's ``Otari-Error-Code`` as ``code`` in the body too.
+
+    A body field survives where a header does not (a proxy that drops it, an SDK
+    that surfaces only the body), so a client can map the refusal from either.
+    """
+    if not isinstance(exc, StarletteHTTPException):
+        raise exc
+    code = error_code_of(exc.headers)
+    if code is None:
+        return await http_exception_handler(request, exc)
+    return JSONResponse(
+        {"detail": exc.detail, "code": code},
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
 
 
 async def _tenancy_error_handler(_: Request, exc: Exception) -> Response:
@@ -635,7 +797,13 @@ async def _tenancy_error_handler(_: Request, exc: Exception) -> Response:
             status_code=exc.status_code,
             content={"detail": "Internal server error"},
         )
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    if exc.error_code is None:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.message, "code": exc.error_code},
+        headers=error_headers(exc.error_code),
+    )
 
 
 async def _control_plane_error_handler(_: Request, exc: Exception) -> Response:
@@ -691,6 +859,8 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     _validate_platform_config(config)
     _warn_if_hosted_has_no_data_plane(config)
+    _validate_metrics_support(config)
+    _validate_rate_limit_store(config)
     # A set-but-invalid OTARI_SECRET_KEY must not silently pass startup and then
     # break provider-credential storage at request time. Fail fast here instead.
     validate_secret_key()
@@ -875,7 +1045,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
         async def root_index() -> str:
             return ROOT_TUTORIAL_HTML
 
+    # Middleware stack is registered in reverse order (last-added runs first)
     app.add_middleware(SecurityHeadersMiddleware)
+    if config.accept_incoming_trace_context:
+        app.add_middleware(TraceContextPropagationMiddleware)
 
     if config.cors_allow_origins:
         allow_credentials = "*" not in config.cors_allow_origins
@@ -883,7 +1056,16 @@ def create_app(config: GatewayConfig) -> FastAPI:
             CORSMiddleware,
             allow_origins=config.cors_allow_origins,
             allow_credentials=allow_credentials,
-            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+            # A hybrid deployment mounts the platform's own routes behind this
+            # same app (see the platform's OTARI_CORS_ALLOW_ORIGINS, enabled
+            # wherever a shared dashboard needs its session cookie honored
+            # cross-origin), so this list has to cover every method the
+            # platform's own routes use too, not just the gateway's. A
+            # workspace's web-search config is PUT, and was rejected with
+            # "Disallowed CORS method" everywhere this middleware was enabled
+            # (mozilla-ai/infrastructure -- reported from both EU stacks,
+            # which are the only ones that set cors_allow_origins at all).
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=[
                 "Content-Type",
                 "Authorization",
@@ -898,16 +1080,13 @@ def create_app(config: GatewayConfig) -> FastAPI:
     # an entry never outlives its response (see gateway.inflight).
     app.state.inflight = InFlightRegistry()
     app.add_middleware(InFlightMiddleware, registry=app.state.inflight)
+    if not config.is_hybrid_mode:
+        app.add_middleware(RateLimitGrantMiddleware)
 
     if config.enable_metrics:
         from gateway.metrics import MetricsMiddleware
 
         app.add_middleware(MetricsMiddleware)
-
-    if config.rate_limit_rpm is not None:
-        app.state.rate_limiter = RateLimiter(config.rate_limit_rpm)
-    else:
-        app.state.rate_limiter = None
 
     if config.dashboard_login_rate_limit_per_minute is not None:
         app.state.login_rate_limiter = RateLimiter(config.dashboard_login_rate_limit_per_minute)
@@ -932,9 +1111,17 @@ def create_app(config: GatewayConfig) -> FastAPI:
     # reason config is: two apps in one process must not share one. A bootstrap
     # that cannot be loaded raises here, so a deployment that named one and got
     # it wrong fails to start instead of quietly running the plain build.
-    app.state.container = build_container(config.bootstrap, config=config)
+    app.state.container = build_container(
+        config.bootstrap,
+        config=config,
+        membership_listener=get_membership_listener,
+        workspace_listener=functools.partial(get_workspace_listener, config=config),
+        search_keys=get_workspace_search_keys,
+    )
+    install_rate_limits(app, config)
 
     register_routers(app, config)
+    app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
     app.add_exception_handler(TenancyError, _tenancy_error_handler)
     app.add_exception_handler(ControlPlaneError, _control_plane_error_handler)
     app.add_exception_handler(RequestValidationError, _validation_error_handler)

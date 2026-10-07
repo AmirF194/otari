@@ -274,6 +274,34 @@ def test_gateway_internal_fields_are_stripped_from_upstream_kwargs(
         assert field not in captured, f"gateway-internal field {field!r} leaked to upstream"
 
 
+def test_client_cannot_smuggle_sdk_request_options(
+    client: TestClient,
+    api_key_header: dict[str, str],
+) -> None:
+    """The provider SDK's per-request headers and query string stay the gateway's to set."""
+    captured: dict[str, Any] = {}
+
+    async def fake_aresponses(**kwargs: Any) -> Response:
+        captured.update(kwargs)
+        return _response()
+
+    with patch("gateway.api.routes.responses.aresponses", new=fake_aresponses):
+        resp = client.post(
+            f"{API_ROOT}/responses",
+            json={
+                "model": _MODEL,
+                "input": "hi",
+                "extra_headers": {"OpenAI-Project": "proj_other"},
+                "extra_query": {"api-version": "preview"},
+            },
+            headers=api_key_header,
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert "extra_headers" not in captured
+    assert "extra_query" not in captured
+
+
 def test_user_supplied_chat_shape_tools_get_flattened_to_responses_shape(
     client: TestClient,
     api_key_header: dict[str, str],
@@ -920,6 +948,78 @@ def test_stream_mcp_servers_dispatches_through_tool_loop_stream(
     assert resp.headers["content-type"].startswith("text/event-stream")
     assert seen.get("pool") is not None, "responses_tool_loop_stream was not invoked"
     assert plain_aresponses_called is False
+
+
+def _assert_stream_ended_cleanly(resp: Any) -> None:
+    assert resp.status_code == 200, resp.text
+    lines = [line for line in resp.text.splitlines() if line]
+    assert "event: error" not in lines, resp.text
+    assert lines[-1] == "data: [DONE]", resp.text
+    assert any('"response.completed"' in line for line in lines), resp.text
+
+
+def test_stream_mcp_pool_close_failure_does_not_cut_off_the_stream(
+    client: TestClient,
+    api_key_header: dict[str, str],
+) -> None:
+    async def fake_loop_stream(
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        yield _stream_completed_event()
+
+    with (
+        patch("gateway.api.routes.responses.responses_tool_loop_stream", new=fake_loop_stream),
+        patch(
+            "gateway.services.mcp_client.MCPClientPool.__aenter__",
+            new=AsyncMock(return_value=AsyncMock(purpose_hints=lambda: [])),
+        ),
+        patch(
+            "gateway.services.mcp_client.MCPClientPool.__aexit__",
+            new=AsyncMock(side_effect=RuntimeError("the MCP server hung up")),
+        ),
+    ):
+        resp = client.post(
+            f"{API_ROOT}/responses",
+            json={
+                "model": _MODEL,
+                "input": "hi",
+                "stream": True,
+                "mcp_servers": [{"name": "test", "url": "http://127.0.0.1:9999/mcp"}],
+            },
+            headers=api_key_header,
+        )
+
+    _assert_stream_ended_cleanly(resp)
+
+
+def test_stream_sandbox_close_failure_does_not_cut_off_the_stream(
+    client: TestClient,
+    api_key_header: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTARI_SANDBOX_URL", "http://127.0.0.1:9999/sandbox")
+
+    async def fake_loop_stream(
+        *, completion_kwargs: Any, pool: Any, max_iterations: int, native_tools: frozenset[str] = frozenset()
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        yield _stream_completed_event()
+
+    fake_backend = AsyncMock()
+    fake_backend.purpose_hints = lambda: []
+    fake_backend.__aenter__ = AsyncMock(return_value=fake_backend)
+    fake_backend.__aexit__ = AsyncMock(side_effect=RuntimeError("the sandbox hung up"))
+
+    with (
+        patch("gateway.api.routes.responses.responses_tool_loop_stream", new=fake_loop_stream),
+        patch("gateway.api.routes._pipeline.SandboxBackend", return_value=fake_backend),
+    ):
+        resp = client.post(
+            f"{API_ROOT}/responses",
+            json={"model": _MODEL, "input": "compute", "stream": True, "tools": [{"type": "otari_code_execution"}]},
+            headers=api_key_header,
+        )
+
+    _assert_stream_ended_cleanly(resp)
 
 
 def test_stream_code_execution_dispatches_through_sandbox(

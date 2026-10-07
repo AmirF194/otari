@@ -42,7 +42,8 @@ default workspace.
 Otari maintains identities for dashboard sign-in and user records for request
 attribution and per-user budgets. Management flows connect them where needed.
 Client-provided `user` values are never trusted to move spend away from the API
-key's bound user.
+key's bound user. The one exception is a [service key](#service-keys-and-end-users),
+which bills end users that belong to its own user.
 
 A user's `allowed_models` is inherited by newly created keys unless the key
 defines its own list. A missing list allows any model, an empty list allows none,
@@ -61,6 +62,7 @@ may also define:
 - budget exemption
 - whether mismatched client `user` fields are accepted
 - whether content-free agent telemetry is captured
+- whether it is a service key, which may name end users
 - application metadata
 
 The plaintext key is returned only when it is created or rotated. Store it then.
@@ -74,6 +76,125 @@ deployment operator's standing. A signed-in member without it manages their own
 keys at `/api/v1/organizations/me/keys`, which derives the owner rather than
 accepting one, mints only into a workspace the caller may see, and never issues
 a budget-exempt key.
+
+## Service keys and end users
+
+A service key lets one application track spend per end user without sharing
+the master key or minting a key per end user. Mark a key with `is_service_key`
+on `POST` or `PATCH /api/v1/keys`; only a deployment operator can.
+
+A request on a service key names its end user the way any client names a user:
+the `user` field on `/v1/chat/completions`, `/v1/responses` and `/v1/search`,
+and `metadata.user_id` on `/v1/messages`. Otari then:
+
+- Bills the request to that end user, creating it on first use. An end user is
+  a user record owned by the key's user, so a key can only bill end users of
+  its own user: two services that both name `alice` get two separate end users,
+  and naming another key's user creates an end user of your own rather than
+  reaching theirs.
+- Caps each end user at a budget copied onto it when it is created: the one
+  the request names in the `Otari-End-User-Budget` header, or else the key's
+  `end_user_budget_id`. Each end user gets the full limit and its own reset
+  period. Changing the key's setting affects end users created afterwards. See
+  [Several budgets on one key](#several-budgets-on-one-key) and
+  [Managing end users](#managing-end-users).
+- Applies the per-minute limits of the end user's budget (`rpm_limit`,
+  `tpm_limit`), and any `per: user` rate limit rule, each counting every end
+  user on its own. Since the limits live on the budget, two service keys with
+  different end-user budgets give their end users different limits, and moving
+  an end user to another budget moves its limits too.
+- Checks the key's own ceiling as well, so a scoped budget on the API key pools
+  every end user behind it. The key's user's per-user budget is not checked for
+  an end user's request; use the key's ceiling as the pool.
+- Keeps the key's user's rate limit and model allow-list, and any member
+  ceiling of the key's user, in force for every end user. The rate limit is
+  shared by all of them and is checked before an end user is created.
+
+A request that names nobody, or the key's own user, bills the key's user as it
+would on any other key. Blocking the key's user stops its end users too.
+
+Each distinct `user` value creates an end user, whether or not the request is
+then admitted, and nothing else caps how many a key can create. Set a rate
+limit on a deployment that issues service keys, and send a stable id per end
+user rather than a per-session or per-request value. An id is at most 256
+characters, and a new one may not contain `/` or be `.` or `..`, so that it
+can be named in the path of the end user routes below.
+
+### Several budgets on one key
+
+One key can start its end users on different budgets, for a service whose
+features each carry their own per-user limits. List the budgets the key may
+assign in `end_user_budget_ids`, and keep `end_user_budget_id` as the default
+for a request that names none:
+
+```http
+POST /api/v1/keys
+{"user_id": "mlpa", "is_service_key": true,
+ "end_user_budget_ids": ["end-user-budget-ai", "end-user-budget-memories"],
+ "end_user_budget_id": "end-user-budget-ai"}
+```
+
+A key with a default and no list may assign the default alone, which is how
+every key behaves until it is given a list. When both are set, the default must
+be on the list. Each entry must be a deployment budget, not an organization's.
+Deleting a budget takes it off every list, but a budget that is some key's
+default cannot be deleted until that key's default changes: without one, the
+key's new end users would start uncapped.
+
+A request then names the budget for a new end user in a header:
+
+```http
+POST /v1/chat/completions
+Otari-End-User-Budget: end-user-budget-memories
+
+{"model": "...", "user": "fxa123:memories", "messages": [...]}
+```
+
+The header applies only when the request creates the end user. An existing end
+user keeps its budget, whatever a later request names, so a request cannot undo
+a move an operator made. A budget that is not on the key's list is refused with
+403 and the code `end_user_budget_not_allowed`, even for an end user that
+already exists. The response carries `Otari-End-User-Budget` with the budget
+the end user is on, so a caller can see when it differs from the one it named.
+
+Give budgets ids of your own with `PUT /api/v1/budgets/{budget_id}`, which
+creates the budget under that id or replaces it, so the same request can run
+at every deploy. An id is up to 128 letters, digits, `.`, `_` and `-`, and
+starts with a letter or digit.
+`POST /api/v1/budgets` still generates an id, and `GET /api/v1/budgets`
+reports how many users are on each budget in `user_count`.
+
+### Managing end users
+
+An end user is addressed by the key and the id the service named it by:
+
+| Request | Does |
+|---|---|
+| `GET /api/v1/keys/{key_id}/end-users/{external_id}` | Reads the end user: its budget, counters and whether it is blocked |
+| `PUT /api/v1/keys/{key_id}/end-users/{external_id}` `{"budget_id": ...}` | Puts the end user on a budget, creating it first if it has not made a request yet (201) |
+| `PATCH /api/v1/keys/{key_id}/end-users/{external_id}` `{"blocked": true}` or `{"budget_id": ...}` | Blocks, unblocks or moves the end user |
+
+A budget set this way must be on the key's list too. Moving an end user
+restarts its period on the new budget and applies that budget's per-minute
+limits, but keeps its spend, tokens and requests so far, as moving a user
+through `/api/v1/users` does: an end user that used up one budget can be over
+the next one's limits until that period resets. End users belong to the key's
+user, so every service key of one user reaches the same end users.
+
+To list end users, use `/api/v1/users`, where each one carries
+`parent_user_id` (the key's user) and `external_id`.
+`GET /api/v1/users?parent_user_id=...&external_id=...` filters on them, and
+`include_total=true` counts every match in the `Otari-Total-Count` header. The
+users API can also put an end user on any deployment budget, not only one on a
+key's list.
+
+### Where end users apply
+
+End users are supported on the endpoints above. The other endpoints
+(embeddings, files, batches and the other pass-through
+routes) treat a service key as an ordinary key, so a `user` naming someone else
+is handled by the `reject_user_mismatch` setting there. Hybrid mode resolves
+users on the platform and does not support service keys.
 
 ## Budgets
 
@@ -98,6 +219,14 @@ Endpoints that hold no token estimate (embeddings, rerank, and the other
 pass-through routes) are refused once a token cap is exhausted rather than
 reserving headroom for themselves, so a token cap can be passed by the requests
 already in flight when it runs out.
+
+A budget can also limit each user on it per minute: `rpm_limit` requests and
+`tpm_limit` tokens. These are counted in `rate_limit_store`, so with Redis they
+hold across replicas, and tokens are counted on what each request used, as
+LiteLLM counts them: a request is admitted while the user's minute is under the
+limit. They apply to a user's own budget on chat completions, messages,
+responses and search, not to a scoped ceiling, and a refusal is a 429 naming the
+rule `budget`.
 
 Scoped budgets can use a rolling duration or a UTC calendar boundary. A key with
 `exclude_from_budget`, or a deployment with `budget_strategy: disabled`,
@@ -182,8 +311,9 @@ The gateway answers that path itself and redirects the browser into the
 dashboard to finish. Where an edge serves the dashboard elsewhere, set
 `ui_base_url` too; see [Configuration](configuration.md#the-interface-address).
 
-OAuth signs in an existing Otari identity whose email the provider verifies. It
-does not provision arbitrary provider accounts.
+OAuth signs in the account that holds the address the provider verified. If no account holds that address, the result depends on `open_signup`, as it does for [signup](#signup). When `open_signup` is disabled, the sign-in is refused. When it is enabled, Otari creates an account with its own organization and workspace, and sends no verification email, because the provider has already verified the address. A sign-in is always refused if the provider did not verify the address, or if the account for it is deactivated.
+
+A provider sign-in on an address that is not yet verified marks it verified. It also removes any password and verification link set on that address before then: the provider confirms who owns the address, not who chose that password. The person can set a new password from their account page once signed in. A password on an address that was already verified is kept.
 
 ### Signup
 
@@ -197,10 +327,14 @@ unknown address does depends on `open_signup`:
 - `true`: an unknown address is registered, with an organization and workspace of
   its own. Use it where the deployment serves many tenants.
 
+Signup never sets a password on an address that is already verified. That is the
+state a Google or GitHub sign-in leaves, and the person who signs in that way
+adds a password from Account settings while signed in.
+
 Either way the response says the same thing whether the address was unknown,
-already claimed, or genuinely just claimed, so its body discloses nothing about
-the address. Response *timing* still does, because the eligible path sends mail
-before it answers; that is [otari#720](https://github.com/mozilla-ai/otari/issues/720)
+already claimed, already verified, or genuinely just claimed, so its body
+discloses nothing about the address. Response *timing* still does, because the
+eligible path sends mail before it answers; that is [otari#720](https://github.com/mozilla-ai/otari/issues/720)
 and it applies to both postures.
 
 Signup needs mail configured, because an account that cannot verify its address

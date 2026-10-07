@@ -18,7 +18,9 @@ from otari_agent.cli import SERVER_COMMANDS, OtariGroup, cli
 
 # Spelled out rather than read from either side, so a command dropped from
 # SERVER_COMMANDS or from the gateway group fails here instead of vanishing.
-_EXPECTED_SERVER_COMMANDS = frozenset({"serve", "init-db", "migrate", "gen-secret-key", "routing"})
+_EXPECTED_SERVER_COMMANDS = frozenset(
+    {"serve", "init-db", "migrate", "gen-secret-key", "gen-provider-account-pepper", "routing"}
+)
 
 # What a Homebrew install of the light CLI does not have. The gateway is the
 # reason the split exists; the rest is what gateway.core.config drags in.
@@ -45,10 +47,22 @@ _VERSION_CODE = (
 def test_importing_the_light_cli_loads_no_server_stack() -> None:
     code = (
         "import sys\n"
-        "import otari_agent.cli, otari_agent.hook, otari_agent.usage_import, otari_agent.settings\n"
+        "import otari_agent.cli, otari_agent.hook, otari_agent.usage_import\n"
         f"loaded = {{name.split('.')[0] for name in sys.modules}} & set({_SERVER_STACK!r})\n"
         "assert not loaded, sorted(loaded)\n"
     )
+    result = _run_isolated(code)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_hook_path_loads_no_http_client() -> None:
+    """`otari hook` evaluates in process, so importing it must not even load httpx.
+
+    httpx stays a dependency of this distribution for `otari import`, which
+    does talk to a gateway; this is what keeps it out of the path that runs
+    on every tool call of a coding agent.
+    """
+    code = "import sys\nimport otari_agent.hook\nassert 'httpx' not in sys.modules, sorted(sys.modules)\n"
     result = _run_isolated(code)
     assert result.returncode == 0, result.stdout + result.stderr
 

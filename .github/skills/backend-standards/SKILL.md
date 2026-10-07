@@ -69,7 +69,8 @@ domain fits together and the domain test, says what each domain owns, and gives 
 moving one domain into the shape. This section adds the house style for code in those layers.
 
 **New and moved code follows the target shape. Most existing code does not, so never copy the
-module beside yours.** `SERVICE_DATABASE_IMPORT_BASELINE`, `ROUTE_DATABASE_IMPORT_BASELINE` and `FLAT_MODULE_BASELINE` in
+module beside yours.** `SERVICE_DATABASE_IMPORT_BASELINE`, `ROUTE_DATABASE_IMPORT_BASELINE`, `FLAT_MODULE_BASELINE`,
+`SERVICE_MODE_READ_BASELINE` and the baseline on each `MODEL_ACCESS` entry in
 `scripts/check_architecture.py` name the code still in the old shape. A baseline only shrinks:
 remove a name when you move its code, and never add one.
 
@@ -90,6 +91,10 @@ remove a name when you move its code, and never add one.
   `TenancyError` and the four status bases under it, defined in `exceptions/_base.py`, imported
   from `gateway.exceptions` and rendered by `_tenancy_error_handler` in `gateway.main`. A
   domain's own error module subclasses those bases, as `exceptions/budget_exceptions.py` does.
+  The completion routes are the one place that renders the family itself, through
+  `domain_error` in `api/routes/_pipeline.py`, because each completion dialect answers in an
+  error envelope of its own that the registered handler cannot know. It follows the handler's
+  rule for a 5xx message.
 
 Catch specific exceptions, not a broad `except Exception`.
 

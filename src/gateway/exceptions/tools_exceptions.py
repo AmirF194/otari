@@ -55,19 +55,53 @@ class WorkspaceMcpServerLimitReachedError(TenancyValidationError):
         super().__init__(f"Workspace {workspace_id} already has the maximum of {limit} MCP servers")
 
 
+class ContainerOnManagedCredentialError(TenancyValidationError):
+    """A request named a container on a provider account this gateway shares across workspaces."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "container cannot be used on this route: it resolves to a provider account this gateway "
+            "manages on behalf of many workspaces, and a container id addresses state on that account "
+            "rather than on your workspace. Use a model served by your own provider key."
+        )
+
+
+class McpServerDeclarationError(TenancyValidationError):
+    """A request's MCP servers cannot be reached as it declared them."""
+
+
+class McpServerConfigurationError(TenancyError):
+    """A workspace's stored MCP servers cannot be used, which is the operator's to fix and not the caller's."""
+
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+
+
+class CodeExecutionDeclarationError(TenancyValidationError):
+    """A request's code execution declaration or container cannot be served as written."""
+
+
+class CodeExecutionRefusedError(TenancyForbiddenError):
+    """A workspace's code execution policy refuses the code execution a request declared."""
+
+
+class CodeExecutionContainerBusyError(TenancyConflictError):
+    """The container a request resumes is serving another request, so a retry can succeed."""
+
+
+class WebToolDeclarationError(TenancyValidationError):
+    """A request's managed web tool declaration cannot be served as written."""
+
+
+class WebSearchInterceptedError(TenancyForbiddenError):
+    """A request asked the provider to run a web search this deployment runs on its own backend."""
+
+
 class WebAccessRefusedError(Exception):
     """A workspace's web search policy refuses the web access a request declared."""
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
-
-
-class WebAccessDomainsExcludedError(WebAccessRefusedError):
-    """A request's Fetch domains share nothing with its workspace's."""
-
-    def __init__(self) -> None:
-        super().__init__("The request and workspace web-access domain policies do not overlap")
 
 
 class WebAccessNotEnabledError(WebAccessRefusedError):
@@ -175,6 +209,44 @@ class SandboxImageNotAllowedError(TenancyValidationError):
     """
 
 
+class CodeExecutionPolicyResolutionFailure(StrEnum):
+    """Why a workspace's code execution policy could not be resolved.
+
+    A member carries the message a caller sees.
+    Its value names the cause, which a caller never sees.
+    """
+
+    def __new__(cls, cause: str, message: str) -> "CodeExecutionPolicyResolutionFailure":
+        member = str.__new__(cls, cause)
+        member._value_ = cause
+        member.message = message
+        return member
+
+    message: str
+
+    ANSWER_UNREADABLE = (
+        "the answer could not be read",
+        "Authorization service returned a malformed code-execution policy",
+    )
+    NO_CALLER_CREDENTIAL = (
+        "the request carried no caller credential",
+        "Code execution policy could not be resolved for this request",
+    )
+    NO_WORKSPACE = (
+        "the request named no workspace",
+        "Code execution policy could not be resolved for this request",
+    )
+
+
+class CodeExecutionPolicyResolutionFailedError(Exception):
+    """A workspace's code execution policy could not be resolved."""
+
+    def __init__(self, reason: CodeExecutionPolicyResolutionFailure) -> None:
+        super().__init__(reason.message)
+        self.message = reason.message
+        self.reason = reason
+
+
 class McpResolutionFailure(StrEnum):
     """Why an MCP server could not be resolved.
 
@@ -206,12 +278,76 @@ class McpServerResolutionFailedError(TenancyError):
         self.reason = reason
 
 
+class McpSessionsInterruptedError(Exception):
+    """A request's MCP sessions were canceled while they opened, by something other than the request."""
+
+    def __init__(self) -> None:
+        super().__init__("MCP sessions were canceled before they opened")
+
+
+class WebSearchKeyNotFoundError(TenancyNotFoundError):
+    """No web search key with this id in the caller's organization."""
+
+    def __init__(self, key_id: object):
+        super().__init__(f"Web search key {key_id} not found")
+
+
+class WebSearchKeyUnknownProviderError(TenancyValidationError):
+    """A key named a search provider the managed search tool cannot call."""
+
+    def __init__(self, provider: str, known: tuple[str, ...]):
+        super().__init__(f"Unknown web search provider '{provider}'. Use one of: {', '.join(known)}")
+
+
+class WebSearchKeyNameRequiredError(TenancyValidationError):
+    def __init__(self) -> None:
+        super().__init__("A web search key needs a name")
+
+
+class WebSearchKeyMalformedError(TenancyValidationError):
+    def __init__(self) -> None:
+        super().__init__("A web search key cannot contain whitespace or control characters")
+
+
+class WebSearchKeyAlreadyExistsError(TenancyConflictError):
+    def __init__(self, provider: str, name: str):
+        super().__init__(f"The organization already has a {provider} web search key named '{name}'")
+
+
+class WebSearchKeyArchivedError(TenancyValidationError):
+    """An archived key cannot be changed, made a default or pinned until it is restored."""
+
+    def __init__(self, key_id: object):
+        super().__init__(f"Web search key {key_id} is archived; restore it first")
+
+
+class WebSearchKeyNotArchivedError(TenancyValidationError):
+    """A key in use is archived before it is deleted, so a deletion is never a surprise."""
+
+    def __init__(self, key_id: object):
+        super().__init__(f"Web search key {key_id} is not archived; archive it before deleting it")
+
+
+class WebSearchKeyDefaultConflictError(TenancyConflictError):
+    """Another key became the provider's default at the same time."""
+
+    def __init__(self, provider: str):
+        super().__init__(f"Another {provider} web search key became the default at the same time; retry")
+
+
+class WorkspaceWebSearchKeyOverrideConflictError(TenancyValidationError):
+    def __init__(self) -> None:
+        super().__init__("A web search key cannot be both pinned and turned off for a workspace")
+
+
 __all__ = [
+    "CodeExecutionPolicyResolutionFailedError",
+    "CodeExecutionPolicyResolutionFailure",
     "McpResolutionFailure",
     "McpServerResolutionFailedError",
+    "McpSessionsInterruptedError",
     "SandboxImageNotAllowedError",
     "SandboxToolsUnrunnableError",
-    "WebAccessDomainsExcludedError",
     "WebAccessNotEnabledError",
     "WebAccessRefusedError",
     "WebAccessToolNotAuthorizedError",
