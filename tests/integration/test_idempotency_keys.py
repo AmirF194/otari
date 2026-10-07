@@ -34,8 +34,11 @@ from gateway.api.routes._idempotency import (
 from gateway.core.config import (
     API_KEY_HEADER,
     API_ROOT,
+    ATTEMPTED_FALLBACKS_HEADER,
+    BACKEND_HEADER,
     CONVERSATION_HEADER,
     REQUEST_ID_HEADER,
+    RESPONSE_COST_HEADER,
     ROUTER_TASK_HEADER,
     GatewayConfig,
 )
@@ -138,6 +141,9 @@ def test_retry_replays_the_original_response_without_billing_again(
     assert second.json() == first.json()
     assert second.json()["usage"]["cost_usd"] == first.json()["usage"]["cost_usd"]
     assert second.headers[REQUEST_ID_HEADER] == first.headers[REQUEST_ID_HEADER]
+    for name in (BACKEND_HEADER, ATTEMPTED_FALLBACKS_HEADER, RESPONSE_COST_HEADER):
+        assert second.headers.get(name) == first.headers.get(name)
+    assert first.headers.get(RESPONSE_COST_HEADER) == first.json()["usage"].get("cost_usd")
     assert second.headers[IDEMPOTENT_REPLAYED_HEADER] == "true"
     assert IDEMPOTENT_REPLAYED_HEADER not in first.headers
     assert _usage_rows(db_session_factory) == 1

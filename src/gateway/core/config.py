@@ -83,6 +83,13 @@ ATTEMPT_ID_HEADER = "Otari-Attempt-ID"
 # Request header naming the budget a service key's new end user starts on, and
 # response header naming the budget that end user is on.
 END_USER_BUDGET_HEADER = "Otari-End-User-Budget"
+# Response headers a standalone non-streaming completion carries: the provider
+# instance that served it (withheld behind an alias, which hides its target), how
+# many routing-policy candidates it fell over from, and its cost in the inline
+# ``usage.cost_usd`` format when priced.
+BACKEND_HEADER = "Otari-Backend"
+ATTEMPTED_FALLBACKS_HEADER = "Otari-Attempted-Fallbacks"
+RESPONSE_COST_HEADER = "Otari-Response-Cost"
 # The version this deployment's API is served under. The root is built from it
 # rather than parsed back out of it, so nothing has to guess where the version
 # segment sits in a path.

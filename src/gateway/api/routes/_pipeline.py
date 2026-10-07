@@ -99,7 +99,15 @@ from gateway.api.routes._platform import (
     default_attempt_kwargs as default_attempt_kwargs,  # explicit re-export for the route modules
 )
 from gateway.api.routes._tools import _build_web_retrieval_backend, _resolve_sandbox_purpose_hint
-from gateway.core.config import ATTEMPT_ID_HEADER, END_USER_BUDGET_HEADER, REQUEST_ID_HEADER, GatewayConfig
+from gateway.core.config import (
+    ATTEMPT_ID_HEADER,
+    ATTEMPTED_FALLBACKS_HEADER,
+    BACKEND_HEADER,
+    END_USER_BUDGET_HEADER,
+    REQUEST_ID_HEADER,
+    RESPONSE_COST_HEADER,
+    GatewayConfig,
+)
 from gateway.core.database import DATABASE_ERRORS, release_session
 from gateway.core.env import otari_env
 from gateway.core.error_codes import (
@@ -5449,11 +5457,12 @@ async def run_standalone_non_stream(
                 response.headers[key] = value
         for key, value in _container_headers(tool_ctx.container_lease).items():
             response.headers[key] = value
-        # ``position`` is 1-indexed, so ``position - 1`` is how many earlier
-        # candidates fell over before this one. No attribution is zero fallbacks
-        # (no policy routed the request), not an unknown count.
-        response.headers["otari-backend"] = str(provider or "")
-        response.headers["otari-attempted-fallbacks"] = str(attribution.position - 1 if attribution else 0)
+        # An alias (a display name with no policy behind it) hides its target, so
+        # it hides the backend too; a policy does not hide its candidates.
+        if provider and (display_model is None or attribution is not None):
+            response.headers[BACKEND_HEADER] = str(provider)
+        # ``position`` is 1-based; no attribution means no policy routed the request.
+        response.headers[ATTEMPTED_FALLBACKS_HEADER] = str(attribution.position - 1 if attribution else 0)
         if ctx.db is not None:
             usage_data = adapter.extract_usage(result)
             if ctx.rate_limit_grant is not None:
@@ -5480,8 +5489,8 @@ async def run_standalone_non_stream(
                     workspace_id=ctx.workspace_id,
                     request_id=ctx.request_id,
                 )
-            if logged.cost is not None:
-                response.headers["otari-response-cost"] = str(logged.cost)
+            if (settlement := standalone_settlement(logged)) is not None:
+                response.headers[RESPONSE_COST_HEADER] = settlement.cost_usd
             if ctx.reservation is not None:
                 await reconcile_reservation(
                     ctx.db, ctx.reservation, logged.cost or Decimal(0), actual_tokens=_settled_tokens(usage_data)

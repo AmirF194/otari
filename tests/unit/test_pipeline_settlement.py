@@ -64,7 +64,12 @@ from gateway.api.routes._pipeline import (
     stream_first_chunk_timeout_seconds,
 )
 from gateway.api.routes._platform import ResolvedAttempt, ResolvedRoute, SettledCost
-from gateway.core.config import GatewayConfig
+from gateway.core.config import (
+    ATTEMPTED_FALLBACKS_HEADER,
+    BACKEND_HEADER,
+    RESPONSE_COST_HEADER,
+    GatewayConfig,
+)
 from gateway.exceptions import TenancyValidationError
 from gateway.exceptions.tools_exceptions import (
     CodeExecutionPolicyResolutionFailure,
@@ -2827,35 +2832,56 @@ async def test_standalone_non_stream_sets_routing_and_cost_headers(monkeypatch: 
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
-    _, response = await _run_standalone(monkeypatch, result=_completion(usage=_usage()), reservation=_reservation())
+    returned, response = await _run_standalone(
+        monkeypatch, result=_completion(usage=_usage()), reservation=_reservation()
+    )
 
-    assert response.headers["otari-backend"] == str(LLMProvider.OPENAI)
-    assert response.headers["otari-response-cost"] == "0.25"
-    assert response.headers["otari-attempted-fallbacks"] == "0"
+    assert response.headers[BACKEND_HEADER] == str(LLMProvider.OPENAI)
+    assert response.headers[ATTEMPTED_FALLBACKS_HEADER] == "0"
+    # The header carries the same six-decimal string as the body's inline cost.
+    assert response.headers[RESPONSE_COST_HEADER] == "0.250000"
+    assert response.headers[RESPONSE_COST_HEADER] == returned.usage.cost_usd
 
 
 @pytest.mark.asyncio
-async def test_standalone_non_stream_omits_cost_header_when_nothing_settled(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("usage", "pricing_source"),
+    [pytest.param(None, "deployment", id="no-usage"), pytest.param(_usage(), None, id="unpriced")],
+)
+async def test_standalone_non_stream_omits_cost_header_when_unpriced(
+    monkeypatch: pytest.MonkeyPatch, usage: CompletionUsage | None, pricing_source: PriceSource | None
 ) -> None:
-    """Chat's ``log_success_without_usage`` still writes a row for a usage-less
-    result, but the fake settlement (like the real one) returns no cost for
-    it, so the header must not claim a cost of zero for an unknown one."""
+    """The header follows the inline ``usage.cost_usd`` rule: no priced cost, no header."""
+    settlement = _Settlement(pricing_source=pricing_source)
+    settlement.install(monkeypatch)
+
+    _, response = await _run_standalone(monkeypatch, result=_completion(usage=usage), reservation=_reservation())
+
+    assert RESPONSE_COST_HEADER not in response.headers
+    assert response.headers[BACKEND_HEADER] == str(LLMProvider.OPENAI)
+
+
+@pytest.mark.asyncio
+async def test_standalone_non_stream_withholds_backend_behind_an_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
-    _, response = await _run_standalone(monkeypatch, result=_completion(usage=None), reservation=_reservation())
+    _, response = await _run_standalone(
+        monkeypatch, result=_completion(usage=_usage()), reservation=_reservation(), display_model="fast"
+    )
 
-    assert "otari-response-cost" not in response.headers
-    assert response.headers["otari-backend"] == str(LLMProvider.OPENAI)
+    assert BACKEND_HEADER not in response.headers
+    assert response.headers[ATTEMPTED_FALLBACKS_HEADER] == "0"
 
 
 @pytest.mark.asyncio
 async def test_standalone_non_stream_reports_fallback_count_from_attribution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``position`` is 1-indexed (the primary candidate is 1), so a request
-    served by the third candidate fell over twice before it landed."""
+    """``position`` is 1-based, so a request served by the third candidate fell over twice.
+
+    A policy, unlike an alias, does not hide its candidates, so the backend is named.
+    """
     settlement = _Settlement()
     settlement.install(monkeypatch)
 
@@ -2865,17 +2891,16 @@ async def test_standalone_non_stream_reports_fallback_count_from_attribution(
         )
 
     monkeypatch.setattr(pipeline, "_attribution_for", fake_attribution_for)
-
-    # A single-candidate plan still routes through the patched `_attribution_for`;
-    # the plan's own attempt position is irrelevant, the patch controls the value.
     plan = CompiledPlan(
         policy_name="p", attempts=[Attempt(position=1, instance="openai", provider=LLMProvider.OPENAI, model="gpt-4")]
     )
+
     _, response = await _run_standalone(
-        monkeypatch, result=_completion(usage=_usage()), reservation=_reservation(), plan=plan
+        monkeypatch, result=_completion(usage=_usage()), reservation=_reservation(), display_model="p", plan=plan
     )
 
-    assert response.headers["otari-attempted-fallbacks"] == "2"
+    assert response.headers[ATTEMPTED_FALLBACKS_HEADER] == "2"
+    assert response.headers[BACKEND_HEADER] == str(LLMProvider.OPENAI)
 
 
 @pytest.mark.asyncio

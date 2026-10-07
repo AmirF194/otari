@@ -24,9 +24,12 @@ from fastapi.encoders import jsonable_encoder
 from gateway.api.deps import build_idempotency_service, get_config, get_unit_of_work_if_needed
 from gateway.api.routes._helpers import GUARDRAILS_RESULT_HEADER
 from gateway.core.config import (
+    ATTEMPTED_FALLBACKS_HEADER,
+    BACKEND_HEADER,
     CONVERSATION_HEADER,
     END_USER_BUDGET_HEADER,
     REQUEST_ID_HEADER,
+    RESPONSE_COST_HEADER,
     ROUTER_HEADER,
     ROUTER_TASK_HEADER,
     GatewayConfig,
@@ -50,6 +53,9 @@ IDEMPOTENT_REPLAYED_HEADER = "Otari-Idempotent-Replayed"
 # rather than the moment it was answered, which rate-limit headers do.
 _REPLAYED_HEADERS = (
     REQUEST_ID_HEADER,
+    BACKEND_HEADER,
+    ATTEMPTED_FALLBACKS_HEADER,
+    RESPONSE_COST_HEADER,
     "Otari-Container-Id",
     "Otari-Container-Expires-At",
     GUARDRAILS_RESULT_HEADER,

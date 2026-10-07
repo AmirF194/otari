@@ -83,6 +83,22 @@ rate that priced the model: `organization` (an organization's override),
 genai-prices dataset). Hybrid mode attaches the platform's settlement instead;
 see [Hybrid mode protocol](hybrid-mode-protocol.md#inline-response-fields).
 
+A standalone gateway also describes a non-streaming Chat, Messages, or
+Responses response in headers, for a client or proxy that reads headers rather
+than bodies:
+
+- `Otari-Backend`: the provider instance that served the request. It is
+  withheld when the caller named an alias, since an alias hides its target; a
+  routing policy does not hide its candidates, so a policy-routed response
+  carries it.
+- `Otari-Attempted-Fallbacks`: how many routing-policy candidates failed before
+  the one that served, `0` when no policy routed the request.
+- `Otari-Response-Cost`: the same string as `usage.cost_usd`, under the same
+  rule, so an unpriced request carries none.
+
+A stream commits its headers before any usage exists, so a streamed response
+carries none of the three, and neither does a hybrid one yet.
+
 ### Provider-specific fields
 
 A field a provider adds to a chat completion's message beyond the OpenAI schema
