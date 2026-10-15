@@ -26,7 +26,8 @@ from gateway.api.routes._platform import (
     record_abandoned_attempt,
     run_platform_attempts,
 )
-from gateway.core.config import GatewayConfig
+from gateway.core.config import ATTEMPT_ID_HEADER, GatewayConfig
+from gateway.core.error_codes import ALL_CANDIDATES_REJECTED, error_code_of
 from gateway.metrics import REGISTRY
 from gateway.services.mcp_loop import MaxToolIterationsExceeded
 from gateway.services.sandbox_backend import SandboxNotReachableError, SandboxUnavailableError
@@ -817,3 +818,100 @@ async def test_report_platform_usage_forwards_final_attempt_marker(
     )
 
     assert post_mock.call_args.kwargs["body"]["is_final_attempt"] is True
+
+
+class _Rejection(Exception):
+    """A provider rejection that carries its status and its own message."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+async def _exhaust(failures: list[Exception]) -> HTTPException:
+    attempts = [
+        ResolvedAttempt(
+            attempt_id=f"a{index}", position=index, provider="openai", model="m", api_key="k", managed=False
+        )
+        for index in range(len(failures))
+    ]
+    route = ResolvedRoute(request_id="r", fallback_enabled=True, attempts=attempts)
+    remaining = iter(failures)
+
+    async def _run_attempt(_kwargs: dict[str, Any], _on_first_response: Any) -> str:
+        raise next(remaining)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await run_platform_attempts(
+            route=route,
+            attempts=attempts,
+            base_request_fields={},
+            run_attempt=_run_attempt,
+            extract_usage=lambda _result: None,
+            classify_error=lambda _exc: (True, "http_400"),
+            report_attempt_outcome=lambda *args: None,
+            on_success=lambda _attempt: None,
+            max_tool_iterations=1,
+        )
+    return exc_info.value
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_where_every_attempt_rejected_alike_returns_that_rejection() -> None:
+    exc = await _exhaust([_Rejection(400, "first rejection"), _Rejection(400, "max_tokens is too large")])
+
+    assert exc.status_code == 400
+    assert exc.detail == _platform.all_attempts_rejected_detail(2)
+    assert (exc.headers or {})[ATTEMPT_ID_HEADER] == "a1"
+    assert error_code_of(exc.headers) == ALL_CANDIDATES_REJECTED
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_where_no_attempt_knew_the_model_is_a_502() -> None:
+    exc = await _exhaust([_Rejection(404, "no such model"), _Rejection(404, "no such model")])
+
+    assert exc.status_code == 502
+    assert exc.detail == _platform.no_attempt_served_detail(2)
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_where_attempts_failed_differently_is_a_generic_502() -> None:
+    exc = await _exhaust([_Rejection(400, "bad request"), _Rejection(404, "no such model")])
+
+    assert exc.status_code == 502
+    assert exc.detail == "All upstream providers failed"
+
+
+@pytest.mark.asyncio
+async def test_each_attempt_is_sent_the_fields_prepared_for_it() -> None:
+    attempts = [_single_attempt("anthropic", "claude-primary"), _single_attempt("vertexai", "claude-fallback")]
+    prepared: list[str] = []
+    sent: list[dict[str, Any]] = []
+
+    def _prepare(attempt: ResolvedAttempt) -> dict[str, Any]:
+        prepared.append(attempt.provider)
+        return {"tools": [{"type": f"for-{attempt.provider}"}]}
+
+    async def _run_attempt(kwargs: dict[str, Any], _on_first_response: Any) -> Any:
+        sent.append(kwargs)
+        if len(sent) == 1:
+            raise RuntimeError("primary down")
+        return "ok"
+
+    result = await run_platform_attempts(
+        route=ResolvedRoute(request_id="r", fallback_enabled=True, attempts=attempts),
+        attempts=attempts,
+        base_request_fields={"tools": [{"type": "shared"}]},
+        run_attempt=_run_attempt,
+        extract_usage=lambda _r: None,
+        classify_error=lambda _exc: (True, "unknown"),
+        report_attempt_outcome=lambda *_args: None,
+        on_success=lambda _attempt: None,
+        max_tool_iterations=1,
+        prepare_attempt=_prepare,
+    )
+
+    assert result == "ok"
+    assert prepared == ["anthropic", "vertexai"]
+    assert [kwargs["tools"] for kwargs in sent] == [[{"type": "for-anthropic"}], [{"type": "for-vertexai"}]]

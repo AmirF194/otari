@@ -7,14 +7,22 @@ from typing import Any
 import pytest
 
 from gateway.adapters.code_execution_adapter import ProtocolCodeExecutionAdapter
-from gateway.api.routes._tools import Tool
 from gateway.api.routes.tools import _managed_tools
 from gateway.api.routes.usage import GATEWAY_TOOL_NAMES
 from gateway.core.config import GatewayConfig
 from gateway.services._tool_loop import ToolBackend
 from gateway.services.sandbox_backend import CODE_EXECUTION_TOOL_NAME, SandboxBackend
-from gateway.services.tools import BUILTIN_TOOLS, BuiltinTool, Dialect, native_rendering
-from gateway.services.web_retrieval_backend import WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME, WebRetrievalBackend
+from gateway.services.tools import (
+    BUILTIN_TOOLS,
+    WEB_FETCH_TOOL_NAME,
+    WEB_SEARCH_TOOL_NAME,
+    BuiltinTool,
+    Dialect,
+    NativeCall,
+    Tool,
+    native_rendering,
+)
+from gateway.services.web_retrieval_backend import WebRetrievalBackend
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = REPO_ROOT / "src" / "gateway" / "services" / "tools" / "_registry.py"
@@ -103,6 +111,42 @@ def test_a_listed_tool_is_reachable_by_name_in_every_dialect_it_renders(tool: Bu
     for dialect in Dialect:
         if dialect not in tool.native:
             assert native_rendering(tool.name, dialect) is None
+
+
+def test_chat_completions_reports_the_web_tools_and_not_code_execution() -> None:
+    assert native_rendering(WEB_SEARCH_TOOL_NAME, Dialect.CHAT) is not None
+    assert native_rendering(WEB_FETCH_TOOL_NAME, Dialect.CHAT) is not None
+    assert native_rendering(CODE_EXECUTION_TOOL_NAME, Dialect.CHAT) is None
+
+
+@pytest.mark.parametrize("tool", BUILTIN_TOOLS, ids=lambda tool: tool.name)
+def test_only_chat_completions_announces_a_call_as_it_starts(tool: BuiltinTool) -> None:
+    """Messages and Responses describe a call once it ended; Chat Completions reports it running too."""
+    call = NativeCall(tool.name, "call_1", {})
+    for dialect, rendering in tool.native.items():
+        assert bool(rendering.started(call)) is (dialect is Dialect.CHAT)
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "expected"),
+    [
+        ("code_execution_20250825", {Dialect.MESSAGES}),
+        ("code_interpreter", {Dialect.RESPONSES}),
+        ("code_execution", set()),
+        ("otari_code_execution", set()),
+    ],
+)
+def test_code_execution_is_rendered_only_in_the_dialect_whose_keyword_declared_it(
+    declared_type: str, expected: set[Dialect]
+) -> None:
+    """A provider's keyword asks for that provider's blocks back; the gateway's own words ask for none."""
+    rendered = {
+        dialect
+        for dialect in Dialect
+        if (rendering := native_rendering(CODE_EXECUTION_TOOL_NAME, dialect)) is not None
+        and rendering.declared({"type": declared_type})
+    }
+    assert rendered == expected
 
 
 def test_a_name_the_registry_does_not_list_has_no_rendering() -> None:

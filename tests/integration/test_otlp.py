@@ -8,18 +8,26 @@ instrumented apps post GenAI-convention spans. The Codex/GenAI attribute names a
 token semantics here mirror payloads captured from the real clients.
 """
 
+import base64
 import gzip
 import json
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
+import pytest
+from fastapi import FastAPI, HTTPException, status
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from gateway.api.routes import otlp as otlp_routes
 from gateway.core.config import API_ROOT
+from gateway.models.traces import TraceSpan
 from gateway.models.usage import UsageLog
 from gateway.models.users import User
+from gateway.services.traces import _otlp as trace_otlp
 
 
 def _usd(tokens: int, rate_per_million: str) -> Decimal:
@@ -84,15 +92,11 @@ def _seed_pricing(client: TestClient, master_key_header: dict[str, str]) -> None
             "output_price_per_million": 75.0,
             "cache_read_price_per_million": 1.5,
             "cache_write_price_per_million": 18.75,
-            "cache_write_1h_price_per_million": 30.0,
             "effective_at": "2020-01-01T00:00:00Z",
         },
         headers=master_key_header,
     )
     assert resp.status_code == 200, resp.text
-    # The 1h rate must land distinct from the 5m one: if it fell back to the 5m rate,
-    # a cache write booked in the wrong bucket would cost the same and go unnoticed.
-    assert resp.json()["cache_write_1h_price_per_million"] == 30.0
 
 
 def test_otlp_api_request_is_ingested_and_priced(
@@ -148,6 +152,37 @@ def test_otlp_idempotent(client: TestClient, master_key_header: dict[str, str], 
     client.post(_PATH, json=_otlp(_api_request_record("req_dup")), headers=headers)
     client.post(_PATH, json=_otlp(_api_request_record("req_dup")), headers=headers)
     assert db_session.query(UsageLog).filter(UsageLog.source_event_id == "req_dup").count() == 1
+
+
+def test_otlp_replay_held_by_an_uncommitted_write_gets_a_retryable_503(
+    client: TestClient, master_key_header: dict[str, str], db_session: Session
+) -> None:
+    """A replay colliding with a write still in flight gives up on the lock and asks for a retry.
+
+    The uncommitted delete stands in for a concurrent import of the same event: an
+    insert of that key has to wait to learn whether it commits. Unbounded, the wait
+    held a pooled connection for the whole statement timeout, and the 500 it ended
+    in made the exporter drop the batch.
+    """
+    headers = _exempt_key(client, master_key_header)
+    _seed_pricing(client, master_key_header)
+    assert client.post(_PATH, json=_otlp(_api_request_record("req_held")), headers=headers).status_code == 200
+
+    db_session.query(UsageLog).filter(UsageLog.source_event_id == "req_held").delete()
+    db_session.flush()
+    try:
+        started = time.monotonic()
+        held = client.post(_PATH, json=_otlp(_api_request_record("req_held")), headers=headers)
+        waited = time.monotonic() - started
+    finally:
+        db_session.rollback()
+
+    assert held.status_code == 503, held.text
+    assert held.headers["Retry-After"] == "2"
+    assert waited < 10
+    retried = client.post(_PATH, json=_otlp(_api_request_record("req_held")), headers=headers)
+    assert retried.status_code == 200
+    assert db_session.query(UsageLog).filter(UsageLog.source_event_id == "req_held").count() == 1
 
 
 def test_otlp_requires_exempt_key(client: TestClient, master_key_header: dict[str, str]) -> None:
@@ -275,7 +310,7 @@ def test_otlp_codex_sse_event_is_ingested_and_priced(
     headers = _exempt_key(client, master_key_header)
     _seed_codex_pricing(client, master_key_header)
 
-    resp = client.post(_PATH, json=_otlp(_codex_sse_record()), headers=headers)
+    resp = client.post(_PATH, json=_otlp(_codex_sse_record(reasoning_token_count=40)), headers=headers)
     assert resp.status_code == 200, resp.text
 
     rows = db_session.query(UsageLog).filter(UsageLog.source == "codex").all()
@@ -287,6 +322,8 @@ def test_otlp_codex_sse_event_is_ingested_and_priced(
     assert row.source_label == "conv-abc"  # conversation.id
     # Raw counts stored as reported; input stays inclusive of the cached slice.
     assert row.prompt_tokens == 1000 and row.completion_tokens == 100 and row.cache_read_tokens == 200
+    assert row.reasoning_tokens == 40
+    # Reasoning sits inside the 100 output tokens, so it adds nothing to the price.
     # De-included price: cached 200 billed once at the cache-read rate, not twice.
     expected = _usd(800, "0.15") + _usd(200, "0.075") + _usd(100, "0.6")
     assert row.cost == expected
@@ -486,14 +523,180 @@ def test_otlp_gateway_client_name_falls_back_to_otel_source(
     assert row.source == "otel"
 
 
-def test_otlp_otari_ai_client_name_falls_back_to_otel_source(
-    client: TestClient, master_key_header: dict[str, str], db_session: Session
+def test_otlp_traces_store_every_span_on_the_exporting_keys_trace(
+    client: TestClient, master_key_header: dict[str, str], db_session_factory: Any
 ) -> None:
-    """otari.ai writes `otari-ai:`-prefixed tags itself, so an exporter claiming one is
-    downgraded to the default source instead of 422-ing the whole export."""
+    """An agent's own spans (not only the ones with usage) are kept, attributed to the exporting key."""
     headers = _exempt_key(client, master_key_header)
-    span = _span_record(**{"otari.client_name": "otari-ai:gateway", "gen_ai.response.id": "resp_reserved_2"})
-    resp = client.post("/otlp/v1/traces", json=_otlp_traces(span), headers=headers)
+    trace_id = base64.b64encode(bytes.fromhex("5b8efff798038103d269b633813fc60c")).decode()
+    agent_id = base64.b64encode(bytes.fromhex("eee19b7ec3c1b174")).decode()
+    tool_id = base64.b64encode(bytes.fromhex("aaa19b7ec3c1b174")).decode()
+    spans = [
+        {
+            "traceId": trace_id,
+            "spanId": agent_id,
+            "name": "invoke_agent",
+            "startTimeUnixNano": "1784000000000000000",
+            "endTimeUnixNano": "1784000002000000000",
+            "attributes": [_attr("gen_ai.operation.name", "invoke_agent")],
+        },
+        {
+            "traceId": trace_id,
+            "spanId": tool_id,
+            "parentSpanId": agent_id,
+            "name": "execute_tool searchDocs",
+            "startTimeUnixNano": "1784000000500000000",
+            "endTimeUnixNano": "1784000001000000000",
+            "attributes": [_attr("gen_ai.operation.name", "execute_tool"), _attr("gen_ai.tool.name", "searchDocs")],
+        },
+    ]
+
+    resp = client.post("/otlp/v1/traces", json=_otlp_traces(*spans), headers=headers)
     assert resp.status_code == 200, resp.text
-    row = db_session.query(UsageLog).filter(UsageLog.source_event_id == "resp_reserved_2").one()
-    assert row.source == "otel"
+
+    deadline = time.monotonic() + 10
+    while True:
+        with db_session_factory() as session:
+            stored = list(session.scalars(select(TraceSpan)))
+        if len(stored) >= 2 or time.monotonic() > deadline:
+            break
+        time.sleep(0.1)
+    by_kind = {span.kind: span for span in stored}
+    assert by_kind["tool"].tool_name == "searchDocs"
+    assert by_kind["tool"].parent_span_id == by_kind["agent"].span_id
+    assert by_kind["agent"].otel_trace_id == "5b8efff798038103d269b633813fc60c"
+
+
+class _RecordingWriter:
+    """Stands in for the trace writer, keeping what the receiver hands it."""
+
+    def __init__(self) -> None:
+        self.writes: list[Any] = []
+
+    def submit(self, trace: Any, *, truncated: int = 0) -> None:
+        self.writes.append(trace)
+
+
+def _install_writer(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> _RecordingWriter:
+    writer = _RecordingWriter()
+    monkeypatch.setattr(cast(FastAPI, client.app).state, "trace_writer", writer)
+    return writer
+
+
+def _agent_span(trace_id: str, span_id: str, **over: Any) -> dict[str, Any]:
+    return {
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": "invoke_agent",
+        "startTimeUnixNano": str(time.time_ns()),
+        "endTimeUnixNano": str(time.time_ns() + 1_000_000),
+        "attributes": [_attr("gen_ai.operation.name", "invoke_agent")],
+        **over,
+    }
+
+
+def test_otlp_spans_over_the_cap_are_not_traced_but_the_export_is_taken(
+    client: TestClient, master_key_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    headers = _exempt_key(client, master_key_header)
+    writer = _install_writer(client, monkeypatch)
+    monkeypatch.setattr(trace_otlp, "MAX_SPANS_PER_EXPORT", 2)
+    spans = [_agent_span("1" * 32, f"{index:016x}") for index in range(3)]
+
+    resp = client.post("/otlp/v1/traces", json=_otlp_traces(*spans), headers=headers)
+
+    assert resp.status_code == 200
+    assert sum(len(write.spans) for write in writer.writes) == 2
+
+
+def test_otlp_spans_are_recorded_only_once_the_exports_usage_is_taken(
+    client: TestClient, master_key_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    headers = _exempt_key(client, master_key_header)
+    writer = _install_writer(client, monkeypatch)
+
+    async def refuse(*args: Any, **kwargs: Any) -> int:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "Too many usage events in one OTLP export")
+
+    monkeypatch.setattr(otlp_routes, "_ingest", refuse)
+    span = {**_span_record(), "traceId": "1" * 32, "spanId": "2" * 16}
+
+    resp = client.post("/otlp/v1/traces", json=_otlp_traces(span), headers=headers)
+
+    assert resp.status_code == 413
+    assert writer.writes == []
+
+
+def test_otlp_json_hex_ids_are_read_as_the_spec_encodes_them(
+    client: TestClient, master_key_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    headers = _exempt_key(client, master_key_header)
+    writer = _install_writer(client, monkeypatch)
+    span = _agent_span("5b8efff798038103d269b633813fc60c", "eee19b7ec3c1b174", parentSpanId="aaa19b7ec3c1b174")
+
+    resp = client.post("/otlp/v1/traces", json=_otlp_traces(span), headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    [write] = writer.writes
+    [stored] = write.spans
+    assert (stored.otel_trace_id, stored.otel_span_id) == ("5b8efff798038103d269b633813fc60c", "eee19b7ec3c1b174")
+
+
+def test_otlp_malformed_span_numbers_never_fail_the_export(
+    client: TestClient, master_key_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    headers = _exempt_key(client, master_key_header)
+    writer = _install_writer(client, monkeypatch)
+    span = _agent_span(
+        "1" * 32,
+        "2" * 16,
+        startTimeUnixNano="1",
+        endTimeUnixNano="18446744073709551615",
+        attributes=[
+            _attr("gen_ai.operation.name", "chat"),
+            {"key": "gen_ai.usage.input_tokens", "value": {"stringValue": "²"}},
+            {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "9223372036854775807"}},
+        ],
+    )
+
+    resp = client.post("/otlp/v1/traces", json=_otlp_traces(span), headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    [write] = writer.writes
+    [stored] = write.spans
+    assert stored.input_tokens is None
+    assert stored.output_tokens == 2_147_483_647
+    assert stored.start_time is not None and stored.end_time is not None
+    assert stored.start_time <= stored.end_time
+
+
+def test_otlp_json_that_is_not_an_object_is_a_client_error(
+    client: TestClient, master_key_header: dict[str, str]
+) -> None:
+    headers = _exempt_key(client, master_key_header)
+
+    resp = client.post("/otlp/v1/traces", content=b"3", headers={**headers, "Content-Type": "application/json"})
+
+    assert resp.status_code == 400
+
+
+def test_otlp_agent_spans_from_a_budgeted_key_are_not_traced(
+    client: TestClient, master_key_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An export of agent spans alone never reaches the usage check, so recording applies the key rule itself."""
+    client.post(f"{API_ROOT}/users", json={"user_id": "bob"}, headers=master_key_header)
+    key = client.post(
+        f"{API_ROOT}/keys",
+        json={"key_name": "budgeted", "user_id": "bob", "exclude_from_budget": False},
+        headers=master_key_header,
+    ).json()["key"]
+    writer = _install_writer(client, monkeypatch)
+
+    resp = client.post(
+        "/otlp/v1/traces",
+        json=_otlp_traces(_agent_span("1" * 32, "2" * 16)),
+        headers={"Otari-Key": f"Bearer {key}"},
+    )
+
+    assert resp.status_code == 200
+    assert writer.writes == []

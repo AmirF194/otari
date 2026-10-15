@@ -27,8 +27,10 @@ from fastapi.testclient import TestClient
 
 from conftest import InstallControlPlane
 from gateway.api.deps import reset_config
+from gateway.api.routes._platform import all_attempts_rejected_detail
 from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.core.database import reset_db
+from gateway.services.control_plane import UNAVAILABLE_DETAIL
 
 from .conftest import app_for
 
@@ -39,6 +41,8 @@ def platform_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient]:
     app = app_for(
         GatewayConfig(
             mode="hybrid",
+            # These resolve payloads name no tenant. The end-user identifier has its own tests.
+            provider_user_identifier_enabled=False,
             platform={"base_url": "http://platform.test/api/v1"},
         )
     )
@@ -492,7 +496,10 @@ def test_hybrid_mode_falls_through_on_provider_400(
     monkeypatch: pytest.MonkeyPatch,
     control_plane_transport: InstallControlPlane,
 ) -> None:
-    """A provider 400 advances to the next candidate like every pre-lock-in failure."""
+    """A provider 400 advances to the next candidate like every pre-lock-in failure.
+
+    Every attempt rejected the request alike, so the caller gets that rejection.
+    """
     calls: list[dict[str, Any]] = []
     usage_reports: list[dict[str, Any]] = []
 
@@ -536,9 +543,10 @@ def test_hybrid_mode_falls_through_on_provider_400(
         headers={"Authorization": "Bearer user_test_token"},
     )
 
-    assert response.status_code == 502
-    assert response.json() == {
-        "detail": {"type": "error", "error": {"type": "api_error", "message": "All upstream providers failed"}}
+    assert response.status_code == 400
+    assert response.json()["detail"] == {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": all_attempts_rejected_detail(2)},
     }
     assert len(calls) == 2
     assert sorted((r["correlation_id"], r["is_final_attempt"], r.get("error_class")) for r in usage_reports) == [
@@ -859,7 +867,7 @@ def test_hybrid_mode_tool_loop_streaming_sets_correlation_id_and_reports_usage(
     # streaming_generator triggers _on_complete.
     from unittest.mock import AsyncMock, patch
 
-    from any_llm.types.messages import MessageDelta, MessageDeltaEvent, MessageDeltaUsage
+    from any_llm.types.messages import MessageDelta, MessageDeltaEvent, MessageDeltaUsage, MessageStopEvent
 
     async def fake_loop_stream(**_kwargs: Any) -> Any:
         yield MessageDeltaEvent(
@@ -873,6 +881,7 @@ def test_hybrid_mode_tool_loop_streaming_sets_correlation_id_and_reports_usage(
                 server_tool_use=None,
             ),
         )
+        yield MessageStopEvent(type="message_stop")
 
     with (
         patch("gateway.api.routes.messages.anthropic_tool_loop_stream", new=fake_loop_stream),
@@ -930,7 +939,7 @@ def test_hybrid_mode_tool_loop_streaming_forwards_session_label(
 
     from unittest.mock import AsyncMock, patch
 
-    from any_llm.types.messages import MessageDelta, MessageDeltaEvent, MessageDeltaUsage
+    from any_llm.types.messages import MessageDelta, MessageDeltaEvent, MessageDeltaUsage, MessageStopEvent
 
     async def fake_loop_stream(**_kwargs: Any) -> Any:
         yield MessageDeltaEvent(
@@ -944,6 +953,7 @@ def test_hybrid_mode_tool_loop_streaming_forwards_session_label(
                 server_tool_use=None,
             ),
         )
+        yield MessageStopEvent(type="message_stop")
 
     with (
         patch("gateway.api.routes.messages.anthropic_tool_loop_stream", new=fake_loop_stream),
@@ -1159,6 +1169,116 @@ def test_hybrid_mode_preamble_rejection_uses_anthropic_envelope_and_keeps_retry_
     assert detail["error"]["type"] == "rate_limit_error"
 
 
+@pytest.mark.parametrize(
+    ("resolve_path", "request_fields", "peer_status", "peer_headers", "status", "error_type", "message"),
+    [
+        (
+            "/gateway/web-search/resolve",
+            {"tools": [{"type": "otari_web_search", "max_uses": 1}]},
+            429,
+            {"Retry-After": "30"},
+            429,
+            "rate_limit_error",
+            "peer says no",
+        ),
+        (
+            "/gateway/code-execution/resolve",
+            {"tools": [{"type": "otari_code_execution"}]},
+            404,
+            {},
+            404,
+            "not_found_error",
+            "peer says no",
+        ),
+        (
+            "/gateway/mcp-servers/resolve",
+            {"mcp_server_ids": ["7af2c39d-4eb8-4b3f-8242-46a97f7d5e68"]},
+            429,
+            {"Retry-After": "30"},
+            429,
+            "rate_limit_error",
+            "peer says no",
+        ),
+        # 503 is not a forwarded status, so the peer's own body is dropped and
+        # the resolve raises the `ControlPlaneError` base, which carries no
+        # `retry_after`.
+        (
+            "/gateway/mcp-servers/resolve",
+            {"mcp_server_ids": ["7af2c39d-4eb8-4b3f-8242-46a97f7d5e68"]},
+            503,
+            {},
+            502,
+            "api_error",
+            UNAVAILABLE_DETAIL,
+        ),
+    ],
+    ids=["web_search_429", "code_execution_404", "mcp_429", "mcp_unreachable"],
+)
+def test_hybrid_mode_tool_resolve_refusal_uses_anthropic_envelope(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+    resolve_path: str,
+    request_fields: dict[str, Any],
+    peer_status: int,
+    peer_headers: dict[str, str],
+    status: int,
+    error_type: str,
+    message: str,
+) -> None:
+    """A control-plane refusal of a tool resolve inside prepare_gateway_tools must reach
+    the /messages caller in the Anthropic envelope, not the bare {"detail": "..."} shape,
+    with its status and any Retry-After preserved (otari#1723).
+
+    All three hybrid resolves that block on a peer are covered: web search and
+    code execution, which the request declares as tools, and MCP servers, which
+    it names by id.
+    """
+    monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://searxng:8080")
+    monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
+
+    async def fake_post_platform(
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        timeout_seconds: float,
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return httpx.Response(
+                200,
+                json=_resolve_payload(
+                    [
+                        _attempt(
+                            0, "3f1b6a1e-0000-4000-8000-0000000000f1", "claude-3-5-sonnet-20241022", "sk-platform-key"
+                        )
+                    ]
+                ),
+            )
+        if url.endswith(resolve_path):
+            return httpx.Response(peer_status, json={"detail": "peer says no"}, headers=peer_headers)
+        return httpx.Response(204)
+
+    control_plane_transport(fake_post_platform)
+
+    response = platform_client.post(
+        f"{API_ROOT}/messages",
+        json={
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            **request_fields,
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == status, response.text
+    assert response.headers.get("Retry-After") == peer_headers.get("Retry-After")
+    detail = response.json()["detail"]
+    assert detail["type"] == "error"
+    assert detail["error"]["type"] == error_type
+    assert detail["error"]["message"] == message
+
+
 def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1168,7 +1288,7 @@ def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
     yielding any event, so the gateway falls through to the second attempt and
     streams its response (same pre-lock-in semantics as chat, which this
     format previously collapsed to a single attempt)."""
-    from any_llm.types.messages import MessageDelta, MessageDeltaEvent, MessageDeltaUsage
+    from any_llm.types.messages import MessageDelta, MessageDeltaEvent, MessageDeltaUsage, MessageStopEvent
 
     usage_reports: list[dict[str, Any]] = []
 
@@ -1201,6 +1321,7 @@ def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
                 server_tool_use=None,
             ),
         )
+        yield MessageStopEvent(type="message_stop")
 
     control_plane_transport(fake_post_platform)
     monkeypatch.setattr("gateway.api.routes._pipeline.MCPClientPool", _FakeMcpPool)
@@ -1494,3 +1615,125 @@ def test_container_auto_without_the_gateway_sandbox_is_still_refused(
     assert response.status_code == 400, response.text
     assert "container names a sandbox this gateway holds" in response.json()["detail"]["error"]["message"]
     assert calls == []
+
+
+def _native_code_execution_route(
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+    policy: dict[str, Any],
+    fallback_provider: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Route a Messages request to Anthropic under ``policy``, then to ``fallback_provider`` if one is named.
+
+    Returns the direct provider calls, the sandbox loop's calls, and the code execution resolves.
+    """
+    monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
+    direct: list[dict[str, Any]] = []
+    looped: list[dict[str, Any]] = []
+    resolved: list[str] = []
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            attempt = _attempt(0, "3f1b6a1e-0000-4000-8000-0000000000e2", "claude-3-5-sonnet-20241022", "sk-byo")
+            attempts = [attempt]
+            if fallback_provider is not None:
+                attempts.append(
+                    _attempt(
+                        1,
+                        "3f1b6a1e-0000-4000-8000-0000000000e3",
+                        "claude-3-5-sonnet-20241022",
+                        "sk-byo-2",
+                        provider=fallback_provider,
+                    )
+                )
+            for each in attempts:
+                each["managed"] = False
+            return httpx.Response(200, json=_resolve_payload(attempts))
+        if url.endswith("/gateway/code-execution/resolve"):
+            resolved.append(url)
+            return httpx.Response(200, json=policy)
+        return httpx.Response(204)
+
+    async def fake_amessages(**kwargs: Any) -> MessageResponse:
+        direct.append(kwargs)
+        return _message_response()
+
+    async def fake_loop_amessages(**kwargs: Any) -> MessageResponse:
+        looped.append(kwargs)
+        return _message_response()
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes.messages.amessages", fake_amessages)
+    monkeypatch.setattr("gateway.api.routes._pipeline.SandboxBackend", _FakeSandboxBackend)
+    monkeypatch.setattr("gateway.services.mcp_loop_messages.amessages", fake_loop_amessages)
+    return direct, looped, resolved
+
+
+def _post_native_code_execution(client: TestClient) -> Any:
+    return client.post(
+        f"{API_ROOT}/messages",
+        json={
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "tools": [{"type": "code_execution_20250825", "name": "code_execution"}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+
+def test_a_control_plane_executor_pin_brings_a_native_declaration_to_the_sandbox(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """The pin decides as a stored one does, so Anthropic's own tool runs here rather than at Anthropic."""
+    direct, looped, _ = _native_code_execution_route(
+        monkeypatch, control_plane_transport, {"enabled": True, "executor": "otari"}
+    )
+
+    response = _post_native_code_execution(platform_client)
+
+    assert response.status_code == 200, response.text
+    assert looped, "the sandbox loop never ran"
+    assert direct == []
+
+
+def test_a_disabled_workspace_still_has_its_native_declaration_served_by_the_provider(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """The policy is asked early, and its veto refuses only code that would run here."""
+    direct, looped, resolved = _native_code_execution_route(monkeypatch, control_plane_transport, {"enabled": False})
+
+    response = _post_native_code_execution(platform_client)
+
+    assert response.status_code == 200, response.text
+    assert len(resolved) == 1, "the policy was not asked before the executor decision"
+    assert looped == []
+    forwarded = {tool.get("type") for tool in direct[0].get("tools") or []}
+    assert "code_execution_20250825" in forwarded
+
+
+def test_a_route_whose_head_runs_the_code_itself_leaves_it_there_despite_its_fallback(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """Each attempt is decided on its own, so only a Bedrock fallback would run the code here.
+
+    The rest of the per-attempt contract is in ``test_hybrid_mode_tools_per_attempt.py``.
+    """
+    direct, looped, resolved = _native_code_execution_route(
+        monkeypatch, control_plane_transport, {"enabled": True}, fallback_provider="bedrock"
+    )
+
+    response = _post_native_code_execution(platform_client)
+
+    assert response.status_code == 200, response.text
+    assert looped == []
+    assert [{tool.get("type") for tool in call.get("tools") or []} for call in direct] == [{"code_execution_20250825"}]
+    assert len(resolved) == 1

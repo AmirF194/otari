@@ -764,8 +764,10 @@ def test_sweep_reclaims_expired_and_deleted_files(
     from sqlalchemy.engine import make_url
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+    from gateway.adapters.provider_file_adapter import AnyLlmProviderFiles
     from gateway.api.deps import build_file_service
     from gateway.core.unit_of_work import UnitOfWork
+    from gateway.services.files import FileBackends
 
     def _upload(name: str) -> str:
         resp = client.post(
@@ -795,7 +797,9 @@ def test_sweep_reclaims_expired_and_deleted_files(
         try:
             async with async_sessionmaker(engine)() as db:
                 uow = UnitOfWork(db)
-                files = build_file_service(uow, store, test_config)
+                files = build_file_service(
+                    uow, FileBackends(storage=store, provider_files=AnyLlmProviderFiles()), test_config
+                )
                 batch = await files.sweep(batch_size=10)
                 return batch.reclaimed
         finally:
@@ -824,8 +828,10 @@ def test_sweep_pages_past_rows_whose_blob_will_not_delete(
     from sqlalchemy.engine import make_url
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+    from gateway.adapters.provider_file_adapter import AnyLlmProviderFiles
     from gateway.api.deps import build_file_service
     from gateway.core.unit_of_work import UnitOfWork
+    from gateway.services.files import FileBackends
 
     ids = []
     for name in ("stuck-1.txt", "stuck-2.txt", "fine.txt"):
@@ -854,7 +860,9 @@ def test_sweep_pages_past_rows_whose_blob_will_not_delete(
         try:
             async with async_sessionmaker(engine)() as db:
                 uow = UnitOfWork(db)
-                files = build_file_service(uow, store, test_config)
+                files = build_file_service(
+                    uow, FileBackends(storage=store, provider_files=AnyLlmProviderFiles()), test_config
+                )
                 first = await files.sweep(batch_size=2)
                 second = await files.sweep(batch_size=2, after=first.cursor)
                 return [(first.seen, first.reclaimed), (second.seen, second.reclaimed)]
@@ -921,9 +929,7 @@ def test_a_storage_failure_answers_a_generic_500(
         def get_stream(self, storage_ref: str) -> Any:
             raise OSError("disk gone")
 
-    resp = client.post(
-        f"{API_ROOT}/files", headers=api_key_header, files={"file": ("a.txt", b"payload", "text/plain")}
-    )
+    resp = client.post(f"{API_ROOT}/files", headers=api_key_header, files={"file": ("a.txt", b"payload", "text/plain")})
     assert resp.status_code == 200, resp.text
     file_id = resp.json()["id"]
 
@@ -953,9 +959,7 @@ def test_one_unusable_id_does_not_fail_a_batch_lookup(
     from gateway.core.unit_of_work import UnitOfWork
     from gateway.repositories.files import FileRepository
 
-    resp = client.post(
-        f"{API_ROOT}/files", headers=api_key_header, files={"file": ("a.txt", b"payload", "text/plain")}
-    )
+    resp = client.post(f"{API_ROOT}/files", headers=api_key_header, files={"file": ("a.txt", b"payload", "text/plain")})
     assert resp.status_code == 200, resp.text
     stored = str(resp.json()["id"])
 
@@ -968,3 +972,42 @@ def test_one_unusable_id_does_not_fail_a_batch_lookup(
             await engine.dispose()
 
     assert asyncio.run(_lookup()) == {stored}
+
+
+def test_vision_describe_side_call_row_carries_the_request_tags(
+    client: TestClient,
+    master_key_header: dict[str, str],
+    tmp_file_store: None,
+    test_config: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The describe side-call's row is tagged like the request's own, so spend by tag includes it."""
+    from any_llm.types.completion import CompletionUsage
+
+    monkeypatch.setattr(test_config, "vision_strategy", "describe")
+    monkeypatch.setattr(test_config, "vision_describe_model", "openai:gpt-4o-mini")
+    client.post(f"{API_ROOT}/users", json={"user_id": "vision-tags-user"}, headers=master_key_header)
+
+    async def fake_describe(config: Any, data_url: str) -> tuple[str | None, CompletionUsage | None]:
+        return "a chart of revenue", CompletionUsage(prompt_tokens=1000, completion_tokens=500, total_tokens=1500)
+
+    monkeypatch.setattr("gateway.services.content_normalizer.describe_image", fake_describe)
+
+    async def mock_acompletion(**kwargs: Any) -> Any:
+        return _make_completion()
+
+    image = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n").decode("ascii")
+    body = {
+        "model": "ollama:llama3",
+        "user": "vision-tags-user",
+        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image}}]}],
+        "metadata": {"purpose": "vision"},
+    }
+
+    with patch("gateway.api.routes.chat.acompletion", new=mock_acompletion):
+        resp = client.post(f"{API_ROOT}/chat/completions", headers=master_key_header, json=body)
+
+    assert resp.status_code == 200, resp.text
+    rows = client.get(f"{API_ROOT}/usage", params={"user_id": "vision-tags-user"}, headers=master_key_header).json()
+    assert sorted(row["model"] for row in rows) == ["gpt-4o-mini", "llama3"]
+    assert all(row["tags"] == {"purpose": "vision"} for row in rows)

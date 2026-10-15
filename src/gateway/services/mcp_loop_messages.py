@@ -18,18 +18,10 @@ import json
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import aclosing
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
-from anthropic.types import (
-    CodeExecutionOutputBlock,
-    CodeExecutionResultBlock,
-    CodeExecutionToolResultBlock,
-    CodeExecutionToolResultError,
-    ServerToolUseBlock,
-)
 from anthropic.types.beta import BetaMCPToolResultBlock, BetaMCPToolUseBlock
 from anthropic.types.beta.beta_container import BetaContainer
-from any_llm import amessages
 from any_llm.types.messages import (
     BetaContextManagementResponse,
     ContentBlockStartEvent,
@@ -37,7 +29,13 @@ from any_llm.types.messages import (
 )
 
 from gateway.log_config import logger
-from gateway.services._tool_loop import StreamAction, run_tool_loop, run_tool_loop_stream
+from gateway.services._tool_loop import (
+    StreamAction,
+    log_tool_failure,
+    run_tool_loop,
+    run_tool_loop_stream,
+    tool_failure_detail,
+)
 from gateway.services.code_execution import ContainerLease
 from gateway.services.mcp_loop import (
     DEFAULT_MAX_TOOL_ITERATIONS,
@@ -45,17 +43,17 @@ from gateway.services.mcp_loop import (
     MaxToolIterationsExceeded,
     ToolBackend,
 )
-from gateway.services.sandbox_backend import CODE_EXECUTION_TOOL_NAME, CodeExecution
+from gateway.services.providers import amessages
 from gateway.services.tool_format import openai_to_anthropic_tools
 from gateway.services.tool_usage import is_tool_error
 from gateway.services.tools import (
     MAX_USES_EXCEEDED_ERROR,
-    SERVER_TOOL_USE_ID_PREFIX,
     Dialect,
     NativeCall,
     ToolUseBudget,
     is_capped_call,
     native_rendering,
+    owning_backend,
 )
 
 if TYPE_CHECKING:
@@ -126,59 +124,11 @@ def _max_uses_exceeded_result(call: NativeCall, native: _NativeSink | None) -> d
     return {"type": "tool_result", "tool_use_id": call.id, "content": MAX_USES_EXCEEDED_ERROR}
 
 
-def _native_code_execution_blocks(execution: CodeExecution) -> list[Any]:
-    """A ``server_tool_use`` / ``code_execution_tool_result`` pair for one gateway execution.
-
-    Emitted for a caller that declared code execution in Anthropic's own
-    vocabulary and whose request the gateway's sandbox ran instead. The result
-    block is the contract's own shape, which mirrors Anthropic's, so a client
-    parsing Anthropic responses reads it with no translation. A call the backend
-    never answered is reported in the vocabulary's error shape rather than
-    dropped, because the model was told about the failure and the client should
-    see the same story.
-    """
-    tool_use_id = f"{SERVER_TOOL_USE_ID_PREFIX}{uuid.uuid4().hex}"
-    content: CodeExecutionResultBlock | CodeExecutionToolResultError
-    if execution.result is None:
-        content = CodeExecutionToolResultError(type="code_execution_tool_result_error", error_code="unavailable")
-    else:
-        result = execution.result.content
-        content = CodeExecutionResultBlock(
-            type="code_execution_result",
-            stdout=result.stdout,
-            stderr=result.stderr,
-            return_code=result.return_code if result.return_code is not None else 0,
-            # The ids are the ones ``/v1/files`` serves, not the sandbox's own: a
-            # produced file that was not stored has no id the caller could use.
-            content=[
-                CodeExecutionOutputBlock(type="code_execution_output", file_id=file_id)
-                for file_id in execution.file_ids.values()
-            ],
-        )
-    return [
-        ServerToolUseBlock(
-            id=tool_use_id,
-            name=cast('Literal["code_execution"]', CODE_EXECUTION_TOOL_NAME),
-            input={"code": execution.code},
-            type="server_tool_use",
-        ),
-        CodeExecutionToolResultBlock(tool_use_id=tool_use_id, type="code_execution_tool_result", content=content),
-    ]
-
-
 def _native_blocks_for_call(pool: ToolBackend, call: NativeCall) -> list[Any]:
     """Native blocks describing one gateway tool call, if its tool has any in this dialect.
 
-    A code execution contributes blocks whether or not the program succeeded, because
-    a non-zero exit is a result the vocabulary can carry and a call the backend never
-    ran has an error shape of its own. An MCP call has no Anthropic block that would
-    be honest to emit and stays invisible.
+    An MCP call has no Anthropic block that would be honest to emit and stays invisible.
     """
-    if call.name == CODE_EXECUTION_TOOL_NAME:
-        take_executions = getattr(pool, "take_executions", None)
-        if take_executions is None:
-            return []
-        return [block for execution in take_executions() for block in _native_code_execution_blocks(execution)]
     rendering = native_rendering(call.name, Dialect.MESSAGES)
     return rendering.ran(call, pool) if rendering is not None else []
 
@@ -229,22 +179,24 @@ async def _execute_tool_uses(
     for block in blocks:
         arguments = dict(block.input or {})
         capped = is_capped_call(budget, pool, block.name)
-        if capped and budget is not None and budget.exhausted():
+        if capped and budget is not None and budget.exhausted(block.name):
             out.append(_max_uses_exceeded_result(NativeCall(block.name, block.id, arguments), native))
             continue
+        owner = owning_backend(pool, block.name)
         try:
-            text = await pool.call_tool(block.name, arguments)
+            text = await owner.call_tool(block.name, arguments)
         except MaxToolIterationsExceeded:
             raise
         except Exception as exc:  # noqa: BLE001 — see docstring
-            logger.warning("MCP tool %s execution failed: %s", block.name, exc)
-            text = f"[tool error] {exc}"
+            detail = tool_failure_detail(owner, block.name)
+            log_tool_failure(block.name, detail, exc)
+            text = f"[tool error] {detail}"
         else:
             if capped and budget is not None:
-                budget.record(text)
+                budget.record(block.name, text)
         if native is not None and native.wants(block.name):
             call = NativeCall(block.name, block.id, arguments, failed=is_tool_error(text))
-            native.extend(_native_blocks_for_call(pool, call))
+            native.extend(_native_blocks_for_call(owner, call))
         out.append({"type": "tool_result", "tool_use_id": block.id, "content": text})
     return out
 
@@ -324,9 +276,7 @@ def _maybe_fold_message_delta(event: Any, acc: _MessagesStreamAccumulator) -> An
             *(getattr(context_management, "applied_edits", None) or []),
         ]
         if context_management is not None and hasattr(context_management, "model_copy"):
-            event_update["context_management"] = context_management.model_copy(
-                update={"applied_edits": applied_edits}
-            )
+            event_update["context_management"] = context_management.model_copy(update={"applied_edits": applied_edits})
         else:
             event_update["context_management"] = BetaContextManagementResponse(applied_edits=applied_edits)
 
@@ -419,10 +369,8 @@ async def _call_stream_tool(
     except MaxToolIterationsExceeded:
         raise
     except Exception as exc:  # noqa: BLE001 - recoverable tool failure is model input
-        # An unexpected backend exception may include URLs, headers, or credentials.
-        # Neither logs, client events, nor the model-facing result receives its detail.
-        logger.warning("Gateway tool %s execution failed: %s", name, type(exc).__name__)
-        detail = "MCP tool execution failed" if mcp_backend is not None else "Gateway tool execution failed"
+        detail = tool_failure_detail(pool, name)
+        log_tool_failure(name, detail, exc)
         return f"[tool error] {detail}", detail, True, True
 
 
@@ -455,10 +403,11 @@ async def _execute_stream_owned_events(
         name = str(spec["name"])
         parsed_input = _parsed_stream_input(state, spec)
         capped = is_capped_call(budget, pool, name)
-        if capped and budget is not None and budget.exhausted():
+        if capped and budget is not None and budget.exhausted(name):
             results.append(_max_uses_exceeded_result(NativeCall(name, spec["id"], parsed_input), native))
             continue
-        mcp_backend = _as_mcp_tool_backend(pool)
+        owner = owning_backend(pool, name)
+        mcp_backend = _as_mcp_tool_backend(owner)
         server_name = _mcp_server_name(mcp_backend, name)
         activity_id: str | None = None
         if emit_mcp_activity and server_name is not None:
@@ -474,16 +423,16 @@ async def _execute_stream_owned_events(
                 yield event
 
         text, activity_content, is_error, transport_error = await _call_stream_tool(
-            pool,
+            owner,
             name,
             parsed_input,
             mcp_backend=mcp_backend if server_name is not None else None,
         )
         if capped and budget is not None:
-            budget.record(text)
+            budget.record(name, text)
         if native is not None and native.wants(name):
             call = NativeCall(name, spec["id"], parsed_input, failed=is_error)
-            native.extend(_native_blocks_for_call(pool, call))
+            native.extend(_native_blocks_for_call(owner, call))
         results.append({"type": "tool_result", "tool_use_id": spec["id"], "content": text})
 
         if activity_id is not None:
@@ -715,17 +664,11 @@ class _MessagesToolLoopStrategy:
             elif dtype == "text_delta":
                 block_dict["text"] = (block_dict.get("text") or "") + (getattr(delta, "text", "") or "")
             elif dtype == "compaction_delta":
-                block_dict["content"] = (block_dict.get("content") or "") + (
-                    getattr(delta, "content", "") or ""
-                )
+                block_dict["content"] = (block_dict.get("content") or "") + (getattr(delta, "content", "") or "")
             elif dtype == "thinking_delta":
-                block_dict["thinking"] = (block_dict.get("thinking") or "") + (
-                    getattr(delta, "thinking", "") or ""
-                )
+                block_dict["thinking"] = (block_dict.get("thinking") or "") + (getattr(delta, "thinking", "") or "")
             elif dtype == "signature_delta":
-                block_dict["signature"] = (block_dict.get("signature") or "") + (
-                    getattr(delta, "signature", "") or ""
-                )
+                block_dict["signature"] = (block_dict.get("signature") or "") + (getattr(delta, "signature", "") or "")
 
         elif event_type == "message_delta":
             state.stop_reason = getattr(event.delta, "stop_reason", None) or state.stop_reason  # type: ignore[union-attr]
@@ -834,9 +777,7 @@ class _MessagesToolLoopStrategy:
         """
         return [event for block in blocks for event in _content_block_events(block, acc)]
 
-    def synthetic_events(
-        self, state: _MessagesStreamState, acc: _MessagesStreamAccumulator
-    ) -> list[Any]:
+    def synthetic_events(self, state: _MessagesStreamState, acc: _MessagesStreamAccumulator) -> list[Any]:
         """Announce this iteration's gateway-run calls as native content blocks.
 
         The model's own ``tool_use`` events were swallowed, so each tool's native

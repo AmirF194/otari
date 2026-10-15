@@ -31,6 +31,7 @@ test("the deployment bootstrap is served unauthenticated", async ({
       "routing",
       "settings",
       "tools",
+      "traces",
       "usage",
       "users",
       "workspaces",
@@ -64,10 +65,9 @@ test("the deployment bootstrap is served unauthenticated", async ({
     // WebAuthn relying-party ID and the account page offers no passkey form.
     // Distinct from `passkey` in sign_in_methods above, which additionally
     // needs a registered passkey; see docs/access-control.md.
+    passkeys_enabled: true,
     passkeys_ready: false,
     oauth_providers: [],
-    // On by default; an operator turns it off. See
-    // docs/configuration.md#product-feedback.
     feedback_enabled: true,
     // No SMTP configured in this e2e environment, so invitations are
     // creatable but not emailed; see docs/configuration.md#mail.

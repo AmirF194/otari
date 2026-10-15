@@ -19,13 +19,14 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.adapters.file_storage_adapter import LocalDirFileStore
+from gateway.adapters.provider_file_adapter import AnyLlmProviderFiles
 from gateway.core.config import GatewayConfig
 from gateway.core.unit_of_work import UnitOfWork
 from gateway.exceptions.files_exceptions import FileNotServedError, FileStorageError, UploadTooLargeError
 from gateway.models.files import FileObject
 from gateway.models.users import User as SpendUser
 from gateway.repositories.files import FileRepositories
-from gateway.services.files import FileScope, FileService, NewFile, SweepBatch
+from gateway.services.files import FileBackends, FileScope, FileService, NewFile, SweepBatch
 
 from .tenancy_helpers import create_member, create_organization, create_workspace
 
@@ -91,7 +92,8 @@ def _service(db: AsyncSession, store: _LeakyStore, config: GatewayConfig) -> Fil
     async def no_default_workspace() -> uuid.UUID:
         raise AssertionError("This upload names its own workspace")
 
-    return FileService(uow, FileRepositories.on(uow), store, config, no_default_workspace)
+    backends = FileBackends(storage=store, provider_files=AnyLlmProviderFiles())
+    return FileService(uow, FileRepositories.on(uow), backends, config, no_default_workspace)
 
 
 def _oversized_upload(workspace_id: uuid.UUID) -> NewFile:
@@ -183,7 +185,6 @@ async def test_the_sweep_leaves_an_upload_still_within_its_grace(async_db: Async
     assert len(await _rows(async_db)) == 1
 
 
-
 async def test_a_pending_row_past_its_expiry_waits_for_its_grace(async_db: AsyncSession, tmp_path: Path) -> None:
     """Expiry does not reclaim a row still within its grace, because it may still be receiving its bytes."""
     store = _LeakyStore(tmp_path)
@@ -196,6 +197,7 @@ async def test_a_pending_row_past_its_expiry_waits_for_its_grace(async_db: Async
 
     assert batch == SweepBatch(reclaimed=0, seen=0, cursor=None)
     assert len(await _rows(async_db)) == 1
+
 
 async def test_a_stamp_that_lands_under_the_sweep_is_refused(async_db: AsyncSession, tmp_path: Path) -> None:
     """An upload that completes while the sweep is taking its row is told so, rather than told it succeeded."""

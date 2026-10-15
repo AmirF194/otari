@@ -61,7 +61,7 @@ from sqlalchemy import Select, false, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col
 
-from gateway.api.deps import CurrentIdentity, ModelProviderPortSharedDep, get_config, get_db, verify_master_key
+from gateway.api.deps import CurrentIdentity, RequestSessionModelProviderPortDep, get_config, get_db, verify_master_key
 from gateway.api.routes.aliases import (
     AliasRequest,
     AliasResponse,
@@ -93,6 +93,7 @@ from gateway.services.tenancy.authorization import (
     resolve_workspace_in_organization,
 )
 from gateway.services.tenancy.organization_model_access import resolve_session_model_allowlist
+from gateway.services.tenancy.workspace_listener import NullWorkspaceListener
 
 # Authentication only, like the rest of the ``/api/v1/organizations/me`` surface.
 # What the caller may read or write is decided per request below, which is the
@@ -133,7 +134,7 @@ async def _writable_workspace_id(
     caller's own organization, so another tenant's id is a 404 rather than a 403.
     Then the targets, against the organization's own reach.
     """
-    organizations = OrganizationService(db, membership_listener=None)
+    organizations = OrganizationService(db, membership_listener=None, workspace_listener=NullWorkspaceListener())
     organization = await organizations.get_active_organization_for_user(user)
     await organizations.require_active_organization_management_access(user=user, organization=organization)
     if workspace_id is None:
@@ -253,7 +254,9 @@ async def list_visible_routing_policies(
     ``workspace_id`` names one.
     """
     scope = await resolve_visible_workspace_scope(
-        db, user=current_identity, organizations=OrganizationService(db, membership_listener=None)
+        db,
+        user=current_identity,
+        organizations=OrganizationService(db, membership_listener=None, workspace_listener=NullWorkspaceListener()),
     )
     statement = select(RoutingPolicy).where(
         col(RoutingPolicy.workspace_id).in_(_visible_workspace_ids(scope)),
@@ -298,7 +301,7 @@ async def set_organization_routing_policy(
     db: Annotated[AsyncSession, Depends(get_db)],
     config: Annotated[GatewayConfig, Depends(get_config)],
     current_identity: CurrentIdentity,
-    model_provider: ModelProviderPortSharedDep,
+    model_provider: RequestSessionModelProviderPortDep,
 ) -> PolicyResponse:
     """Create or update a stored policy in one of the organization's workspaces.
 
@@ -357,7 +360,9 @@ async def list_visible_aliases(
     ``workspace_id`` names one.
     """
     scope = await resolve_visible_workspace_scope(
-        db, user=current_identity, organizations=OrganizationService(db, membership_listener=None)
+        db,
+        user=current_identity,
+        organizations=OrganizationService(db, membership_listener=None, workspace_listener=NullWorkspaceListener()),
     )
     statement = select(ModelAlias).where(
         col(ModelAlias.workspace_id).in_(_visible_workspace_ids(scope)),
@@ -380,7 +385,7 @@ async def set_organization_alias(
     db: Annotated[AsyncSession, Depends(get_db)],
     config: Annotated[GatewayConfig, Depends(get_config)],
     current_identity: CurrentIdentity,
-    model_provider: ModelProviderPortSharedDep,
+    model_provider: RequestSessionModelProviderPortDep,
 ) -> AliasResponse:
     """Create or update a stored alias in one of the organization's workspaces.
 

@@ -1,14 +1,19 @@
 import argparse
+import asyncio
+import contextlib
+import json
 import os
 import re
 import shutil
 import sys
 import zlib
-from collections.abc import Callable, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
+import anyio
 import httpx
 import pytest
 
@@ -18,6 +23,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 if "gateway" in sys.modules:
     del sys.modules["gateway"]
+
+if TYPE_CHECKING:
+    from gateway.services.pricing import ModelsDevPriceIndex
+
+MODELS_DEV_MINI = ROOT / "tests" / "fixtures" / "models_dev_mini.json"
 
 
 class ControlPlaneHandler(Protocol):
@@ -52,6 +62,11 @@ def parse_shard(value: str) -> Shard:
     if match is None or not 1 <= int(match[1]) <= int(match[2]):
         raise argparse.ArgumentTypeError(f"expected INDEX/COUNT with 1 <= INDEX <= COUNT, got {value!r}")
     return Shard(index=int(match[1]), count=int(match[2]))
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    # Apps start with provider copies on, which refuses to boot without a pepper of its own.
+    os.environ["OTARI_PROVIDER_ACCOUNT_PEPPER"] = "test-provider-account-pepper-0000"
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -93,7 +108,7 @@ def _no_background_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     ``TestClient(create_app(...))``). Scoping this to ``tests/integration`` left
     every one of those making live models.dev fetches on CI, which is both wrong
     on its own terms and what surfaced the unbounded-shutdown bug that
-    ``_stop_refresher`` now guards against. A test that wants the real refresher
+    ``_stop_refreshers`` now guards against. A test that wants the real refresher
     calls it directly rather than through the lifespan.
     """
 
@@ -102,6 +117,28 @@ def _no_background_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("gateway.main.run_discovery_refresher", _noop)
     monkeypatch.setattr("gateway.main.run_catalog_refresher", _noop)
+
+
+@pytest.fixture(autouse=True)
+def _no_models_dev_fetch(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """Answer every models.dev fetch as unreachable unless the test patches in a catalog.
+
+    The model listing joins models.dev, and with the refresher suppressed above
+    its cache starts empty, so every listing read would otherwise fetch the live
+    catalog: an outbound call from any test that lists a model, and limits that
+    move whenever models.dev does. A test that wants metadata patches
+    ``model_catalog_service._fetch`` itself. The cache is cleared on both sides,
+    so one test's answer, a failure included, is never the next one's.
+    """
+    from gateway.services import model_catalog_service
+
+    async def _unreachable() -> None:
+        return None
+
+    model_catalog_service.clear_catalog_cache()
+    monkeypatch.setattr(model_catalog_service, "_fetch", _unreachable)
+    yield
+    model_catalog_service.clear_catalog_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -129,8 +166,8 @@ def _reset_default_pricing() -> Generator[None, None, None]:
     later tests that call ``find_model_pricing`` directly. Reset to off, matching
     the config field's opt-in default; tests that need defaults enable explicitly.
 
-    Also clear the memoized genai-prices resolutions so a real price cached by one
-    test cannot mask another test that patches ``calc_price`` to fail.
+    Also drops the accepted price generations, so a snapshot accepted by one test
+    cannot price another's models.
     """
     from gateway.services.pricing_refresh_service import reset_price_refresh_state
     from gateway.services.pricing_service import configure_default_pricing, configure_provider_types
@@ -142,6 +179,27 @@ def _reset_default_pricing() -> Generator[None, None, None]:
     configure_default_pricing(False)
     configure_provider_types(None)
     reset_price_refresh_state()
+
+
+@pytest.fixture
+def install_models_dev() -> Callable[[dict[str, Any] | None], "ModelsDevPriceIndex"]:
+    """Serve a small models.dev catalog as the only accepted price generation.
+
+    Takes a parsed ``api.json`` document, the shared mini fixture by default, and
+    returns its index. The autouse reset above drops it after the test.
+    """
+
+    def install(catalog: dict[str, Any] | None = None) -> "ModelsDevPriceIndex":
+        from gateway.services.pricing import ModelsDevPriceIndex, PriceGeneration, set_accepted_generations
+
+        document = catalog if catalog is not None else json.loads(MODELS_DEV_MINI.read_text())
+        index = ModelsDevPriceIndex.from_catalog(document)
+        set_accepted_generations(
+            [PriceGeneration(effective_at=datetime(2020, 1, 1, tzinfo=UTC), index=index)], complete=False
+        )
+        return index
+
+    return install
 
 
 @pytest.fixture(scope="session")
@@ -209,6 +267,59 @@ def control_plane_transport(monkeypatch: pytest.MonkeyPatch) -> InstallControlPl
         monkeypatch.setattr("gateway.services.control_plane.transport.post", handler)
 
     return install
+
+
+class TaskGroupMcpTransport:
+    """A fake MCP transport that holds an anyio task group open, as the streamable HTTP client does.
+
+    ``may_open`` and ``may_close`` gate opening and closing.
+    ``ignore_cancel`` makes both gates outlast a cancellation.
+    """
+
+    def __init__(self) -> None:
+        self.may_open = asyncio.Event()
+        self.may_open.set()
+        self.may_close = asyncio.Event()
+        self.may_close.set()
+        self.ignore_cancel = False
+        self.close_error: BaseException | None = None
+        self.entered_in: asyncio.Task[Any] | None = None
+        self.exited_in: list[asyncio.Task[Any] | None] = []
+        # What the transport's block exited with, ``None`` for a clean exit.
+        self.exited_with: list[BaseException | None] = []
+
+    async def _pass(self, gate: asyncio.Event) -> None:
+        while True:
+            try:
+                await gate.wait()
+                return
+            except asyncio.CancelledError:
+                if not self.ignore_cancel:
+                    raise
+
+    @contextlib.asynccontextmanager
+    async def __call__(self, *args: Any, **kwargs: Any) -> AsyncIterator[tuple[object, object, object]]:
+        await self._pass(self.may_open)
+        async with anyio.create_task_group():
+            self.entered_in = asyncio.current_task()
+            try:
+                yield object(), object(), object()
+            except BaseException as exc:
+                self.exited_with.append(exc)
+                raise
+            self.exited_with.append(None)
+            await self._pass(self.may_close)
+            self.exited_in.append(asyncio.current_task())
+        if self.close_error is not None:
+            raise self.close_error
+
+
+@pytest.fixture
+def mcp_task_group_transport(monkeypatch: pytest.MonkeyPatch) -> TaskGroupMcpTransport:
+    """Serve every MCP connection through one :class:`TaskGroupMcpTransport`."""
+    transport = TaskGroupMcpTransport()
+    monkeypatch.setattr("gateway.services.mcp_client.streamablehttp_client", transport)
+    return transport
 
 
 def _new_sqlite_file(database_url: str) -> Path | None:

@@ -1,7 +1,7 @@
 import json
 from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import httpx2
@@ -10,16 +10,21 @@ from any_llm.types.completion import (
     ChatCompletion,
     ChatCompletionChunk,
     ChatCompletionMessage,
+    ChatCompletionMessageFunctionToolCall,
     Choice,
     CompletionUsage,
+    Function,
     PromptTokensDetails,
 )
 from fastapi.testclient import TestClient
+from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
-from conftest import InstallControlPlane
+from conftest import InstallControlPlane, TaskGroupMcpTransport
 from gateway.api.deps import reset_config
+from gateway.api.routes._platform import all_attempts_rejected_detail
 from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.core.database import reset_db
+from gateway.core.error_codes import ALL_CANDIDATES_REJECTED, ERROR_CODE_HEADER, PROVIDER_CREDENTIAL_REJECTED
 
 from .conftest import app_for
 
@@ -31,6 +36,8 @@ def platform_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient]:
         GatewayConfig(
             mode="hybrid",
             web_fetch_enabled=True,
+            # These resolve payloads name no tenant. The end-user identifier has its own tests.
+            provider_user_identifier_enabled=False,
             platform={"base_url": "http://platform.test/api/v1"},
         )
     )
@@ -760,6 +767,150 @@ def test_hybrid_mode_falls_through_when_a_provider_account_is_out_of_credit(
     assert error_reports[0]["error_class"] == "http_400_billing"
 
 
+def test_hybrid_mode_falls_through_on_an_empty_completion(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """A 200 with no choices is the first attempt's failure, reported as such, and the next attempt serves."""
+    usage_reports: list[dict[str, Any]] = []
+
+    async def fake_post_platform(
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        timeout_seconds: float,
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "empty-req-1",
+                    "fallback_enabled": True,
+                    "attempts": [
+                        {
+                            "attempt_id": "empty-att-blank",
+                            "position": 0,
+                            "provider": "gemini",
+                            "model": "gemini-2.5-flash",
+                            "api_key": "sk-blank",
+                            "api_base": None,
+                            "managed": False,
+                        },
+                        {
+                            "attempt_id": "empty-att-good",
+                            "position": 1,
+                            "provider": "openai",
+                            "model": "gpt-4o-mini",
+                            "api_key": "sk-good",
+                            "api_base": None,
+                            "managed": False,
+                        },
+                    ],
+                },
+            )
+        usage_reports.append(body)
+        return httpx.Response(204)
+
+    async def fake_acompletion(**kwargs: Any) -> ChatCompletion:
+        choices: list[Choice] = []
+        if kwargs["api_key"] == "sk-good":
+            choices = [
+                Choice(index=0, message=ChatCompletionMessage(role="assistant", content="hello"), finish_reason="stop")
+            ]
+        return ChatCompletion(
+            id="chatcmpl-empty",
+            object="chat.completion",
+            created=1700000000,
+            model=kwargs["model"],
+            choices=choices,
+            usage=CompletionUsage(prompt_tokens=5, completion_tokens=1, total_tokens=6),
+        )
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={"model": "anything", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["Otari-Attempt-ID"] == "empty-att-good"
+    error_reports = [r for r in usage_reports if r.get("status") == "error"]
+    assert len(error_reports) == 1
+    assert error_reports[0]["correlation_id"] == "empty-att-blank"
+    assert error_reports[0]["error_class"] == "empty_completion"
+
+
+def test_hybrid_mode_refuses_with_a_424_when_every_attempt_rejects_its_credential(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """Every attempt's provider refused the key the platform resolved, so no
+    retry can succeed: a 424 naming the code, not a retryable 502. Each attempt
+    is still reported to the platform with the provider's own status."""
+    import openai
+
+    usage_reports: list[dict[str, Any]] = []
+
+    async def fake_post_platform(
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        timeout_seconds: float,
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "revoked-req-1",
+                    "fallback_enabled": True,
+                    "attempts": [
+                        {
+                            "attempt_id": f"revoked-att-{position}",
+                            "position": position,
+                            "provider": "openai",
+                            "model": model,
+                            "api_key": "sk-revoked",
+                            "api_base": None,
+                            "managed": False,
+                        }
+                        for position, model in enumerate(("gpt-4o-mini", "gpt-4o"))
+                    ],
+                },
+            )
+        usage_reports.append(body)
+        return httpx.Response(204)
+
+    async def fake_acompletion(**kwargs: Any) -> ChatCompletion:
+        request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+        raise openai.AuthenticationError(
+            "Error code: 401 - Incorrect API key provided: sk-revoked",
+            response=httpx.Response(401, request=request),
+            body=None,
+        )
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={"model": "anything", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 424, response.text
+    assert response.headers[ERROR_CODE_HEADER] == PROVIDER_CREDENTIAL_REJECTED
+    assert "sk-revoked" not in response.text
+
+    error_reports = [r for r in usage_reports if r.get("status") == "error"]
+    assert sorted(r["correlation_id"] for r in error_reports) == ["revoked-att-0", "revoked-att-1"]
+    assert {r["error_class"] for r in error_reports} == {"http_401"}
+
+
 def test_hybrid_mode_propagates_resolve_rate_limit_retry_after(
     platform_client: TestClient,
     control_plane_transport: InstallControlPlane,
@@ -919,7 +1070,7 @@ def test_hybrid_mode_streaming_returns_inline_cost_and_forces_usage(
 ) -> None:
     from collections.abc import AsyncIterator
 
-    from any_llm.types.completion import ChatCompletionChunk
+    from any_llm.types.completion import ChatCompletionChunk, ChoiceDelta, ChunkChoice
 
     attempt_id = "3f1b6a1e-0000-4000-8000-000000000005"
 
@@ -966,7 +1117,7 @@ def test_hybrid_mode_streaming_returns_inline_cost_and_forces_usage(
         async def stream() -> AsyncIterator[ChatCompletionChunk]:
             yield ChatCompletionChunk(
                 id="chunk-usage",
-                choices=[],
+                choices=[ChunkChoice(delta=ChoiceDelta(), index=0, finish_reason="stop")],
                 created=0,
                 model="gpt-4o-mini",
                 object="chat.completion.chunk",
@@ -1340,7 +1491,10 @@ def test_hybrid_mode_streaming_returns_429_when_all_attempts_are_rate_limited(
     )
 
     assert response.status_code == 429
-    assert response.json() == {"detail": "All upstream providers rate-limited this request"}
+    assert response.json() == {
+        "detail": "All upstream providers rate-limited this request",
+        "code": "upstream_rate_limited",
+    }
     assert response.headers["Otari-Attempt-ID"] == "att-b"
     # A 429 advances the plan, so both attempts really ran: the aggregate is
     # reached by exhausting the route, not by one attempt failing outright.
@@ -1686,17 +1840,18 @@ class _CappedSearchBackend:
         return "results"
 
 
-def test_hybrid_mode_web_search_cap_is_not_refilled_by_a_streaming_fallover(
+def test_hybrid_mode_a_reported_search_commits_the_streamed_attempt(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     control_plane_transport: InstallControlPlane,
 ) -> None:
-    """``max_uses`` bounds the request, not each attempt of it.
+    """A search reported in ``otari_tool_calls`` commits the attempt that ran it.
 
-    A tool-loop stream whose swallowed first round runs a search and whose second
-    round dies is still pre-first-chunk, so the plan falls over. Both runs are
-    billed (``ToolUsageTally`` accumulates across attempts), so a cap the next
-    attempt started over on would bill up to ``max_uses`` per candidate.
+    The first round's tool-call chunks are swallowed, but the search's started and
+    ended entries reach the client while that round runs, so a provider failure in
+    the second round ends the stream with an error event rather than falling over
+    to a model the client was never told about. Messages and Responses commit on
+    their first event the same way.
     """
     monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://searxng:8080")
     _CappedSearchBackend.calls = 0
@@ -1782,14 +1937,83 @@ def test_hybrid_mode_web_search_cap_is_not_refilled_by_a_streaming_fallover(
     )
 
     assert response.status_code == 200
-    # The fallover happened, and the served attempt found the cap already spent.
-    assert calls == [
-        "anthropic:claude-haiku-4-5",
-        "anthropic:claude-haiku-4-5",
-        "openai:gpt-4o-mini",
-        "openai:gpt-4o-mini",
-    ]
+    assert calls == ["anthropic:claude-haiku-4-5", "anthropic:claude-haiku-4-5"]
     assert _CappedSearchBackend.calls == 1
+    events = [line.removeprefix("data: ") for line in response.text.splitlines() if line.startswith("data: ")]
+    payloads = [json.loads(event) for event in events if event != "[DONE]"]
+    entries = [entry for payload in payloads for entry in payload.get("otari_tool_calls", [])]
+    assert [entry["status"] for entry in entries] == ["in_progress", "completed"]
+    assert entries[0]["id"] == entries[1]["id"]
+    assert payloads[-1]["error"]["code"] == "provider_credential_rejected"
+
+
+def test_hybrid_mode_an_answer_reports_the_search_the_data_plane_ran(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """The tool loop runs on the data plane, so a hybrid answer carries ``otari_tool_calls`` like a standalone one."""
+    monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://searxng:8080")
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return _single_attempt_resolve_response(request_id="ws-report-req")
+        if url.endswith("/gateway/web-search/resolve"):
+            return httpx.Response(200, json={"enabled": True, "authorized_tools": ["web_search"]})
+        return httpx.Response(204)
+
+    rounds = iter(
+        [
+            ChatCompletionMessage(
+                role="assistant",
+                content=None,
+                tool_calls=cast(
+                    Any,
+                    [
+                        ChatCompletionMessageFunctionToolCall(
+                            id="call_1",
+                            type="function",
+                            function=Function(name="web_search", arguments='{"query": "otari"}'),
+                        )
+                    ],
+                ),
+            ),
+            ChatCompletionMessage(role="assistant", content="answer"),
+        ]
+    )
+
+    async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
+        message = next(rounds)
+        return ChatCompletion(
+            id="cmpl-ws-report",
+            object="chat.completion",
+            created=0,
+            model="openai:gpt-4o-mini",
+            choices=[Choice(finish_reason="tool_calls" if message.tool_calls else "stop", index=0, message=message)],
+            usage=CompletionUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
+        )
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_retrieval_backend", _CappedSearchBackend)
+    monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "otari_web_search"}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 200, response.text
+    [entry] = response.json()["otari_tool_calls"]
+    assert entry["query"] == "otari"
+    assert entry["status"] == "completed"
+    assert entry["sources"] == [{"url": "https://a", "title": "A", "published_date": None}]
 
 
 def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
@@ -1866,6 +2090,148 @@ def test_hybrid_mode_tool_loop_streaming_falls_through_pre_lock_in(
     assert "hello" in response.text
 
 
+class _FakeMcpSession:
+    """Enough of an MCP ``ClientSession`` to list one tool and run it."""
+
+    def __init__(self, *args: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> "_FakeMcpSession":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def initialize(self) -> None:
+        return None
+
+    async def list_tools(self) -> ListToolsResult:
+        return ListToolsResult(tools=[Tool(name="remote_search", inputSchema={"type": "object"})])
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        return CallToolResult(content=[TextContent(type="text", text="tool ran")])
+
+
+@pytest.mark.parametrize("close_error", [None, RuntimeError("the MCP server hung up")], ids=["closes", "close-fails"])
+def test_hybrid_mode_tool_loop_streaming_ends_the_stream_and_reports_usage(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+    mcp_task_group_transport: TaskGroupMcpTransport,
+    close_error: Exception | None,
+) -> None:
+    """A streamed MCP tool loop ends with its usage and ``[DONE]``, and bills every round.
+
+    Each round ends as OpenAI streams it: a finish chunk, then a usage chunk with no choices.
+    A pool that fails to close must not change what the caller receives.
+    """
+    usage_reports: list[dict[str, Any]] = []
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "tool-stream-usage-req",
+                    "fallback_enabled": False,
+                    "attempts": [
+                        {
+                            "attempt_id": "tool-stream-usage-att",
+                            "position": 0,
+                            "provider": "openai",
+                            "model": "gpt-4o-mini",
+                            "api_key": "sk-openai-real",
+                            "managed": False,
+                        }
+                    ],
+                },
+            )
+        usage_reports.append(body)
+        return httpx.Response(204)
+
+    def _chunk(payload: dict[str, Any]) -> ChatCompletionChunk:
+        return ChatCompletionChunk.model_validate(
+            {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": "gpt-4o-mini", **payload}
+        )
+
+    def _delta(delta: dict[str, Any], finish: str | None = None) -> ChatCompletionChunk:
+        return _chunk({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+
+    def _usage(prompt: int, completion: int) -> ChatCompletionChunk:
+        usage = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+        return _chunk({"choices": [], "usage": usage})
+
+    rounds = 0
+
+    async def fake_loop_acompletion(**kwargs: Any) -> AsyncIterator[ChatCompletionChunk]:
+        nonlocal rounds
+        rounds += 1
+        first_round = rounds == 1
+
+        async def _stream() -> AsyncIterator[ChatCompletionChunk]:
+            yield _delta({"role": "assistant"})
+            if first_round:
+                yield _delta(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "remote_search", "arguments": ""},
+                            }
+                        ]
+                    }
+                )
+                yield _delta({"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]})
+                yield _delta({}, "tool_calls")
+                yield _usage(10, 2)
+            else:
+                yield _delta({"content": "hybrid-"})
+                yield _delta({"content": "smoke-ok"})
+                yield _delta({}, "stop")
+                yield _usage(20, 3)
+
+        return _stream()
+
+    transport = mcp_task_group_transport
+    transport.close_error = close_error
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.services.mcp_client.ClientSession", _FakeMcpSession)
+    monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "mcp_servers": [{"name": "test", "url": "https://93.184.216.34/mcp"}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 200
+    payloads = [line.removeprefix("data: ") for line in response.text.splitlines() if line.startswith("data: ")]
+    assert payloads[-1] == "[DONE]", response.text
+    frames = [json.loads(payload) for payload in payloads[:-1]]
+    assert not [frame for frame in frames if "error" in frame], response.text
+    choices = [choice for frame in frames for choice in frame["choices"]]
+    assert "".join(choice["delta"].get("content") or "" for choice in choices) == "hybrid-smoke-ok"
+    assert [choice["finish_reason"] for choice in choices if choice["finish_reason"]] == ["stop"]
+    assert not [choice for choice in choices if choice["delta"].get("tool_calls")]
+    usage_frames = [frame["usage"] for frame in frames if not frame["choices"]]
+    assert [(usage["prompt_tokens"], usage["completion_tokens"]) for usage in usage_frames] == [(30, 5)]
+    assert transport.exited_in == [transport.entered_in]
+    successes = [report for report in usage_reports if report.get("status") == "success"]
+    assert len(successes) == 1, usage_reports
+    assert successes[0]["correlation_id"] == "tool-stream-usage-att"
+    assert successes[0]["usage"]["prompt_tokens"] == 30
+    assert successes[0]["usage"]["completion_tokens"] == 5
+
+
 # ---------------------------------------------------------------------------
 # Web-search platform policy resolution
 # ---------------------------------------------------------------------------
@@ -1882,6 +2248,7 @@ class _FakeWebSearchBackend:
 
     last_tool_entry: dict[str, Any] | None = None
     last_auth_token: str | None = None
+    last_credential: Any = None
 
     def __init__(
         self,
@@ -1895,6 +2262,7 @@ class _FakeWebSearchBackend:
     ) -> None:
         type(self).last_tool_entry = dict(search_tool_entry or {})
         type(self).last_auth_token = auth_token
+        type(self).last_credential = _kwargs.get("credential")
         # The real backend records each call on the request's tally; accept it so
         # the constructor contract matches, even though this double runs no search.
         self._tally = tally
@@ -2294,6 +2662,108 @@ def test_hybrid_mode_web_search_forwards_token_to_platform_backend(
     assert _FakeWebSearchBackend.last_auth_token == "gw_test_token"
 
 
+def _search_with_web_search_answer(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+    answer: dict[str, Any],
+) -> Any:
+    """One chat completion declaring web search, with the control plane answering its resolve with ``answer``."""
+    monkeypatch.setenv("OTARI_WEB_SEARCH_URL", "http://searxng:8080")
+    _FakeWebSearchBackend.last_credential = None
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return _single_attempt_resolve_response(request_id="ws-req-credential")
+        if url.endswith("/gateway/web-search/resolve"):
+            return httpx.Response(200, json=answer)
+        return httpx.Response(204)
+
+    async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
+        return ChatCompletion(
+            id="cmpl-ws-cred",
+            object="chat.completion",
+            created=0,
+            model="openai:gpt-4o-mini",
+            choices=[
+                Choice(finish_reason="stop", index=0, message=ChatCompletionMessage(role="assistant", content="ok"))
+            ],
+            usage=CompletionUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
+        )
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes._pipeline._build_web_retrieval_backend", _FakeWebSearchBackend)
+    monkeypatch.setattr("gateway.services.mcp_loop.acompletion", fake_loop_acompletion)
+    return platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "otari_web_search"}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+
+def test_hybrid_mode_searches_with_the_workspace_key_the_control_plane_returns(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    response = _search_with_web_search_answer(
+        platform_client,
+        monkeypatch,
+        control_plane_transport,
+        {"enabled": True, "credential": {"provider": "tavily", "api_key": "tvly-workspace"}},
+    )
+
+    assert response.status_code == 200, response.text
+    credential = _FakeWebSearchBackend.last_credential
+    assert (credential.provider, credential.api_key) == ("tavily", "tvly-workspace")
+    assert "tvly-workspace" not in repr(credential)
+
+
+@pytest.mark.parametrize("credential", [{"provider": "tavily"}, {"provider": "tavily", "api_key": "tvly-key\n"}])
+def test_hybrid_mode_refuses_a_malformed_workspace_key(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+    credential: dict[str, str],
+) -> None:
+    """Read strictly, like the rest of the answer, so a malformed one fails closed.
+
+    A key that cannot go in a header is malformed too: sending it would quote it in the client's error.
+    """
+    response = _search_with_web_search_answer(
+        platform_client,
+        monkeypatch,
+        control_plane_transport,
+        {"enabled": True, "credential": credential},
+    )
+
+    assert response.status_code == 502, response.text
+    assert _FakeWebSearchBackend.last_credential is None
+
+
+def test_hybrid_mode_ignores_a_key_for_a_provider_it_cannot_call(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    """A newer peer may name a provider this gateway does not know; it searches with its own instead."""
+    response = _search_with_web_search_answer(
+        platform_client,
+        monkeypatch,
+        control_plane_transport,
+        {"enabled": True, "credential": {"provider": "exa", "api_key": "exa-key"}},
+    )
+
+    assert response.status_code == 200, response.text
+    assert _FakeWebSearchBackend.last_credential is None
+
+
 def test_hybrid_mode_web_search_empty_request_list_keeps_workspace_policy(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -2482,8 +2952,8 @@ def test_hybrid_mode_streaming_falls_through_on_provider_400(
         headers={"Authorization": "Bearer user_test_token"},
     )
 
-    assert response.status_code == 502
-    assert response.json() == {"detail": "All upstream providers failed"}
+    assert response.status_code == 400
+    assert response.json() == {"detail": all_attempts_rejected_detail(2), "code": ALL_CANDIDATES_REJECTED}
     assert len(calls) == 2
     assert sorted((r["correlation_id"], r["is_final_attempt"], r.get("error_class")) for r in usage_reports) == [
         ("att-a", False, "http_400"),
@@ -2504,6 +2974,7 @@ class _FakeSandboxBackend:
     last_purpose_hint: str | None = None
     last_image: str | None = None
     last_allowed_tools: frozenset[str] | None = None
+    last_timeout_s: float | None = None
 
     def __init__(
         self,
@@ -2516,6 +2987,7 @@ class _FakeSandboxBackend:
         image: str | None = None,
         allowed_tools: frozenset[str] | None = None,
         tally: Any = None,
+        trace: Any = None,
         files: Any = None,
         files_base_url: str | None = None,
         container: Any = None,
@@ -2525,6 +2997,7 @@ class _FakeSandboxBackend:
         type(self).last_purpose_hint = purpose_hint
         type(self).last_image = image
         type(self).last_allowed_tools = allowed_tools
+        type(self).last_timeout_s = timeout_s
         self._tally = tally
 
     async def __aenter__(self) -> "_FakeSandboxBackend":
@@ -2594,6 +3067,58 @@ def test_platform_mode_sandbox_403_when_disabled(
     assert response.json() == {"detail": "code execution is not enabled for this workspace"}
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"enabled": "yes"},
+        {"enabled": True, "max_iterations": "4"},
+        {"enabled": True, "exec_timeout_s": 0},
+        {"enabled": True, "tools": "code_execution"},
+        {"enabled": True, "executor": "sometimes"},
+    ],
+)
+def test_platform_mode_sandbox_502_when_the_policy_is_malformed(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+    answer: dict[str, Any],
+) -> None:
+    """A malformed field is a contract break, so no code runs and nothing reaches the provider."""
+    monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
+    provider_called = False
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return _single_attempt_resolve_response(request_id="sbx-malformed")
+        if url.endswith("/gateway/code-execution/resolve"):
+            return httpx.Response(200, json=answer)
+        return httpx.Response(204)
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        nonlocal provider_called
+        provider_called = True
+        raise AssertionError("a request with a malformed policy reached the provider")
+
+    control_plane_transport(fake_post_platform)
+    monkeypatch.setattr("gateway.api.routes.chat.acompletion", fake_acompletion)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "otari_code_execution"}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Authorization service returned a malformed code-execution policy"}
+    assert provider_called is False
+
+
 def test_platform_mode_sandbox_applies_workspace_default_purpose_hint(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -2634,23 +3159,20 @@ def test_platform_mode_sandbox_applies_workspace_default_purpose_hint(
     assert _FakeSandboxBackend.last_purpose_hint == "workspace hint"
 
 
-def test_platform_mode_sandbox_uses_the_deployments_own_image_and_no_tool_allow_list(
+def test_platform_mode_sandbox_applies_the_workspace_tools_and_timeout(
     platform_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     control_plane_transport: InstallControlPlane,
 ) -> None:
-    """Hybrid keeps its own arrangement for the two columns #740 added.
+    """The tool list and timeout are ceilings, as on a data plane with its own rows.
 
-    ``image`` still comes from this gateway's config, because a hybrid gateway
-    may be pointed at a sandbox of its own and the platform's resolve carries no
-    image. ``tools`` comes back on that resolve but is deliberately *not*
-    enforced here: the /v1/sandbox proxy re-enforces the allow-list, and
-    enforcing it twice would let this gateway refuse a tool the platform admits.
+    The image stays the deployment's, because the resolve carries no image.
     """
     monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
     monkeypatch.setenv("OTARI_SANDBOX_SESSION_IMAGE", "mzdotai/otari-sandbox-container:latest")
     _FakeSandboxBackend.last_image = None
-    _FakeSandboxBackend.last_allowed_tools = frozenset()
+    _FakeSandboxBackend.last_allowed_tools = None
+    _FakeSandboxBackend.last_timeout_s = None
 
     async def fake_post_platform(
         url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
@@ -2658,7 +3180,7 @@ def test_platform_mode_sandbox_uses_the_deployments_own_image_and_no_tool_allow_
         if url.endswith("/gateway/provider-keys/resolve"):
             return _single_attempt_resolve_response(request_id="sbx-image")
         if url.endswith("/gateway/code-execution/resolve"):
-            return httpx.Response(200, json={"enabled": True, "tools": ["code_execution"]})
+            return httpx.Response(200, json={"enabled": True, "tools": ["code_execution"], "exec_timeout_s": 7})
         return httpx.Response(204)
 
     async def fake_loop_acompletion(**kwargs: Any) -> ChatCompletion:
@@ -2680,7 +3202,40 @@ def test_platform_mode_sandbox_uses_the_deployments_own_image_and_no_tool_allow_
 
     assert response.status_code == 200
     assert _FakeSandboxBackend.last_image == "mzdotai/otari-sandbox-container:latest"
-    assert _FakeSandboxBackend.last_allowed_tools is None
+    assert _FakeSandboxBackend.last_allowed_tools == frozenset({"code_execution"})
+    assert _FakeSandboxBackend.last_timeout_s == 7
+
+
+def test_platform_mode_sandbox_403_when_the_workspace_tools_leave_nothing_to_run(
+    platform_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    control_plane_transport: InstallControlPlane,
+) -> None:
+    monkeypatch.setenv("OTARI_SANDBOX_URL", "http://sandbox:8080")
+
+    async def fake_post_platform(
+        url: str, headers: dict[str, str], body: dict[str, Any], timeout_seconds: float
+    ) -> httpx.Response:
+        if url.endswith("/gateway/provider-keys/resolve"):
+            return _single_attempt_resolve_response(request_id="sbx-no-tools")
+        if url.endswith("/gateway/code-execution/resolve"):
+            return httpx.Response(200, json={"enabled": True, "tools": ["bash_code_execution"]})
+        return httpx.Response(204)
+
+    control_plane_transport(fake_post_platform)
+
+    response = platform_client.post(
+        f"{API_ROOT}/chat/completions",
+        json={
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "otari_code_execution"}],
+        },
+        headers={"Authorization": "Bearer user_test_token"},
+    )
+
+    assert response.status_code == 403
+    assert "excludes every tool kind" in response.json()["detail"]
 
 
 def test_platform_mode_streaming_sandbox_gets_the_same_image(
